@@ -217,3 +217,46 @@ class VideoAnalyzer:
 
         diff = np.abs(frame_a_rgb.astype(np.float32) - frame_b_rgb.astype(np.float32))
         return float(np.mean(diff))
+
+    @staticmethod
+    def calculate_histogram_difference(frame_a_rgb, frame_b_rgb):
+        """
+        Calculate histogram correlation difference between two frames.
+
+        Returns:
+            float: 0.0 = identical, 100.0 = completely different (scaled for threshold UI).
+        """
+        if frame_a_rgb is None or frame_b_rgb is None:
+            return 0.0
+        if frame_a_rgb.shape != frame_b_rgb.shape:
+            return 100.0
+
+        score = 0.0
+        for ch in range(3):
+            hist_a = cv2.calcHist([frame_a_rgb], [ch], None, [256], [0, 256])
+            hist_b = cv2.calcHist([frame_b_rgb], [ch], None, [256], [0, 256])
+            cv2.normalize(hist_a, hist_a)
+            cv2.normalize(hist_b, hist_b)
+            corr = cv2.compareHist(hist_a, hist_b, cv2.HISTCMP_CORREL)
+            score += (1.0 - corr)  # 0=same, 1=different per channel
+        # Average across 3 channels, scale to 0-100
+        return float(score / 3.0 * 100.0)
+
+    @staticmethod
+    def calculate_ssim_difference(frame_a_rgb, frame_b_rgb):
+        """
+        Calculate SSIM-based difference between two frames.
+
+        Returns:
+            float: 0.0 = identical, 100.0 = completely different (scaled for threshold UI).
+        """
+        if frame_a_rgb is None or frame_b_rgb is None:
+            return 0.0
+        if frame_a_rgb.shape != frame_b_rgb.shape:
+            return 100.0
+
+        gray_a = cv2.cvtColor(frame_a_rgb, cv2.COLOR_RGB2GRAY)
+        gray_b = cv2.cvtColor(frame_b_rgb, cv2.COLOR_RGB2GRAY)
+        score = ssim(gray_a, gray_b)
+        # SSIM: 1.0=identical, 0.0=different → invert and scale to 0-100
+        return float((1.0 - score) * 100.0)

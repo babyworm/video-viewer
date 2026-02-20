@@ -777,7 +777,14 @@ class MainWindow(QMainWindow):
         # Create central widget
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
-        layout = QHBoxLayout(main_widget)
+        outer_layout = QVBoxLayout(main_widget)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        # Top area: canvas + sidebar side-by-side
+        top_widget = QWidget()
+        layout = QHBoxLayout(top_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
 
         # Create canvas and navigation toolbar area
         canvas_area = QWidget()
@@ -818,6 +825,39 @@ class MainWindow(QMainWindow):
         # Right sidebar (250px fixed width)
         sidebar_widget = self.create_sidebar()
         layout.addWidget(sidebar_widget)
+
+        outer_layout.addWidget(top_widget, stretch=1)
+
+        # Console panel between content and status bar (full width, 2 lines)
+        console_widget = QWidget()
+        console_layout = QHBoxLayout(console_widget)
+        console_layout.setContentsMargins(4, 0, 0, 0)
+        console_layout.setSpacing(2)
+        self.lbl_console = QLabel("")
+        self.lbl_console.setFixedHeight(30)
+        self.lbl_console.setWordWrap(True)
+        self.lbl_console.setStyleSheet("color: #aaccff; font-size: 11px; background-color: #2b2b2b;")
+        self.lbl_console.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        console_layout.addWidget(self.lbl_console, stretch=1)
+        btn_console_up = QPushButton("\u25b2")
+        btn_console_up.setFixedSize(18, 14)
+        btn_console_up.setStyleSheet("font-size: 8px; padding: 0px; background-color: #3c3f41; color: #aaa; border: none;")
+        btn_console_up.clicked.connect(self._console_scroll_up)
+        btn_console_down = QPushButton("\u25bc")
+        btn_console_down.setFixedSize(18, 14)
+        btn_console_down.setStyleSheet("font-size: 8px; padding: 0px; background-color: #3c3f41; color: #aaa; border: none;")
+        btn_console_down.clicked.connect(self._console_scroll_down)
+        btn_col = QVBoxLayout()
+        btn_col.setContentsMargins(0, 0, 2, 0)
+        btn_col.setSpacing(1)
+        btn_col.addWidget(btn_console_up)
+        btn_col.addWidget(btn_console_down)
+        console_layout.addLayout(btn_col)
+        console_widget.setFixedHeight(34)
+        console_widget.setStyleSheet("background-color: #2b2b2b;")
+        self._console_history = []
+        self._console_view_idx = -1  # -1 = latest
+        outer_layout.addWidget(console_widget)
 
         # Create status bar
         self.create_status_bar()
@@ -1193,15 +1233,48 @@ class MainWindow(QMainWindow):
         p.end()
         return QIcon(pixmap)
 
+    def show_console_message(self, msg):
+        """Show a message in the console panel. Persists until next message."""
+        self._console_history.append(msg)
+        if len(self._console_history) > 200:
+            self._console_history = self._console_history[-200:]
+        self._console_view_idx = -1
+        self.lbl_console.setText(msg)
+
+    def _console_scroll_up(self):
+        if not self._console_history:
+            return
+        if self._console_view_idx == -1:
+            self._console_view_idx = len(self._console_history) - 1
+        if self._console_view_idx > 0:
+            self._console_view_idx -= 1
+        self.lbl_console.setText(self._console_history[self._console_view_idx])
+
+    def _console_scroll_down(self):
+        if not self._console_history:
+            return
+        if self._console_view_idx == -1:
+            return
+        if self._console_view_idx < len(self._console_history) - 1:
+            self._console_view_idx += 1
+            self.lbl_console.setText(self._console_history[self._console_view_idx])
+        else:
+            self._console_view_idx = -1
+            self.lbl_console.setText(self._console_history[-1])
+
     def _toggle_grid(self):
         """Toggle grid through sizes (for toolbar button)."""
         self.current_grid_idx = (self.current_grid_idx + 1) % len(self.grid_sizes)
-        self.canvas.set_grid(self.grid_sizes[self.current_grid_idx])
+        size = self.grid_sizes[self.current_grid_idx]
+        self.canvas.set_grid(size)
+        self.show_console_message(f"Grid: {size}x{size}" if size > 0 else "Grid: Off")
 
     def _toggle_sub_grid(self):
         """Toggle sub-grid through sizes (for toolbar button)."""
         self.current_sub_grid_idx = (self.current_sub_grid_idx + 1) % len(self.sub_grid_sizes)
-        self.canvas.set_sub_grid(self.sub_grid_sizes[self.current_sub_grid_idx])
+        size = self.sub_grid_sizes[self.current_sub_grid_idx]
+        self.canvas.set_sub_grid(size)
+        self.show_console_message(f"Sub-grid: {size}x{size}" if size > 0 else "Sub-grid: Off")
 
     def create_navigation_toolbar(self):
         """Create the navigation toolbar below the canvas."""
@@ -1569,7 +1642,9 @@ class MainWindow(QMainWindow):
         """Set component view index."""
         self.current_component = index
         comp_names = {0: "Full", 1: "Y/R", 2: "U/G", 3: "V/B", 4: "Split"}
-        self.status_bar.showMessage(f"Component: {comp_names.get(index, '?')}", 2000)
+        name = comp_names.get(index, '?')
+        self.status_bar.showMessage(f"Component: {name}", 2000)
+        self.show_console_message(f"Component view: {name}")
         self.update_frame()
 
     # Keyboard shortcuts
@@ -1818,9 +1893,15 @@ class MainWindow(QMainWindow):
             if len(self._tab_states) == 0:
                 self._add_tab_for_current()
 
+            fname = os.path.basename(self.current_file_path)
+            self.show_console_message(
+                f"Opened: {fname} ({self.current_width}x{self.current_height}, "
+                f"{self.current_format}, {self.reader.total_frames} frames)")
+
         except Exception as e:
             logger.error(f"Error loading video: {e}", exc_info=True)
             self.status_bar.showMessage(f"Error loading video: {e}", 3000)
+            self.show_console_message(f"Error: {e}")
 
     def update_file_info(self):
         """Update file info in sidebar."""
@@ -2002,6 +2083,7 @@ class MainWindow(QMainWindow):
                                                    "PNG Files (*.png);;BMP Files (*.bmp);;All Files (*)")
         if file_path:
             self.canvas.image.save(file_path)
+            self.show_console_message(f"Frame saved: {os.path.basename(file_path)}")
 
     def export_clip_with_settings(self, start_frame, end_frame, target_fourcc):
         """Export clip with given settings."""
@@ -2411,9 +2493,11 @@ class MainWindow(QMainWindow):
         if idx in self.bookmarks:
             self.bookmarks.discard(idx)
             self.status_bar.showMessage(f"Bookmark removed: frame {idx}", 2000)
+            self.show_console_message(f"Bookmark removed: frame {idx}")
         else:
             self.bookmarks.add(idx)
             self.status_bar.showMessage(f"Bookmark added: frame {idx}", 2000)
+            self.show_console_message(f"Bookmark added: frame {idx} (total: {len(self.bookmarks) + 1})")
         self._refresh_bookmark_list()
 
     def _refresh_bookmark_list(self):
@@ -2492,27 +2576,70 @@ class MainWindow(QMainWindow):
             self.slider_frame.setValue(max(self.bookmarks))
 
     # ── Scene Change Detection ──
+    _SCENE_ALGORITHMS = [
+        ("Mean Pixel Difference (MAD)", 45.0),
+        ("Histogram Comparison", 30.0),
+        ("SSIM (Structural Similarity)", 40.0),
+    ]
+
     def detect_scene_changes(self):
         if not self.reader or self.reader.total_frames < 2:
             self.status_bar.showMessage("Need a loaded video with 2+ frames", 2000)
             return
 
-        from PySide6.QtWidgets import QInputDialog
-        threshold, ok = QInputDialog.getDouble(
-            self, "Scene Detection",
-            "Threshold (mean pixel difference, 0-255):",
-            value=45.0, min=1.0, max=255.0, decimals=1)
-        if not ok:
+        # Settings dialog: algorithm + threshold in one window
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Scene Detection Settings")
+        form = QFormLayout(dlg)
+
+        combo_algo = QComboBox()
+        algo_names = [a[0] for a in self._SCENE_ALGORITHMS]
+        combo_algo.addItems(algo_names)
+        form.addRow("Algorithm:", combo_algo)
+
+        from PySide6.QtWidgets import QDoubleSpinBox
+        spin_thresh = QDoubleSpinBox()
+        spin_thresh.setRange(0.1, 255.0)
+        spin_thresh.setDecimals(1)
+        spin_thresh.setValue(self._SCENE_ALGORITHMS[0][1])
+        form.addRow("Threshold:", spin_thresh)
+
+        # Update threshold default when algorithm changes
+        def on_algo_changed(idx):
+            spin_thresh.setValue(self._SCENE_ALGORITHMS[idx][1])
+        combo_algo.currentIndexChanged.connect(on_algo_changed)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btn_box.accepted.connect(dlg.accept)
+        btn_box.rejected.connect(dlg.reject)
+        form.addRow(btn_box)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
+        algo_idx = combo_algo.currentIndex()
+        algo_name = algo_names[algo_idx]
+        threshold = spin_thresh.value()
+
+        # Clear old markers before detection
+        self._scene_changes = []
+        self.slider_frame.set_scene_markers([])
+
         total = self.reader.total_frames
-        progress = QProgressDialog("Detecting scene changes...", "Cancel", 0, total - 1, self)
+        progress = QProgressDialog(f"Detecting scene changes ({algo_name})...", "Cancel", 0, total - 1, self)
         progress.setWindowTitle("Scene Detection")
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
         progress.setValue(0)
 
-        self._scene_changes = []
+        # Select comparison function
+        if algo_idx == 0:
+            compare_fn = VideoAnalyzer.calculate_frame_difference
+        elif algo_idx == 1:
+            compare_fn = VideoAnalyzer.calculate_histogram_difference
+        else:
+            compare_fn = VideoAnalyzer.calculate_ssim_difference
+
         prev_rgb = self.reader.convert_to_rgb(self.reader.seek_frame(0))
 
         for i in range(1, total):
@@ -2523,7 +2650,7 @@ class MainWindow(QMainWindow):
             raw = self.reader.seek_frame(i)
             cur_rgb = self.reader.convert_to_rgb(raw)
             if prev_rgb is not None and cur_rgb is not None:
-                diff = VideoAnalyzer.calculate_frame_difference(prev_rgb, cur_rgb)
+                diff = compare_fn(prev_rgb, cur_rgb)
                 if diff > threshold:
                     self._scene_changes.append(i)
             prev_rgb = cur_rgb
@@ -2531,8 +2658,14 @@ class MainWindow(QMainWindow):
         progress.setValue(total - 1)
         progress.close()
         self.slider_frame.set_scene_markers(self._scene_changes)
-        self.status_bar.showMessage(
-            f"Found {len(self._scene_changes)} scene changes", 3000)
+
+        count = len(self._scene_changes)
+        if count > 0:
+            msg = f"[{algo_name}] Found {count} scene changes (threshold={threshold})"
+        else:
+            msg = f"[{algo_name}] No scene changes found (threshold={threshold}). Try lowering the threshold."
+        self.status_bar.showMessage(msg, 5000)
+        self.show_console_message(msg)
 
     def next_scene_change(self):
         if not self._scene_changes:

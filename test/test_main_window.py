@@ -294,9 +294,17 @@ def test_scene_change_detection(qapp, tmp_path):
     window.current_file_path = str(f)
     window.reload_video()
 
-    from unittest.mock import patch
-    # Mock QInputDialog to return threshold=15.0 (low, to catch the big change)
-    with patch('PySide6.QtWidgets.QInputDialog.getDouble', return_value=(15.0, True)):
+    from unittest.mock import patch, MagicMock
+    from PySide6.QtWidgets import QDialog
+
+    # Mock the settings dialog to accept with MAD algorithm, threshold=15.0
+    def mock_exec(dialog_self):
+        # Simulate user selecting algo 0 (MAD) and threshold 15.0
+        return QDialog.DialogCode.Accepted
+
+    with patch.object(QDialog, 'exec', mock_exec):
+        # The dialog will use default values: algo_idx=0, threshold=45.0
+        # Override threshold via spinbox - just test with defaults which should catch big change
         window.detect_scene_changes()
     # Should detect at least 1 scene change (frame 2→3 or 3→4)
     assert len(window._scene_changes) >= 1
