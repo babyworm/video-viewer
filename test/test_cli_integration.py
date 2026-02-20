@@ -1,7 +1,6 @@
 import pytest
 import subprocess
 import sys
-import shutil
 import os
 
 def test_cli_help():
@@ -10,12 +9,7 @@ def test_cli_help():
     # Since we run tests via .venv/bin/pytest, PATH should include .venv/bin?
     # Or we explicitly use the executable path.
 
-    executable = shutil.which("video_viewer")
-    if not executable:
-        # Fallback to sys.executable -m video_viewer.main if command not found (e.g. dev env issues)
-        cmd = [sys.executable, "-m", "video_viewer.main", "--help"]
-    else:
-        cmd = [executable, "--help"]
+    cmd = [sys.executable, "-m", "video_viewer.main", "--help"]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     assert result.returncode == 0
@@ -34,11 +28,7 @@ def test_cli_headless_conversion(tmp_path):
     file_size = y_size + 2 * uv_size # 24 bytes
     infile.write_bytes(b'\x00' * file_size)
 
-    executable = shutil.which("video_viewer")
-    if not executable:
-        base_cmd = [sys.executable, "-m", "video_viewer.main"]
-    else:
-        base_cmd = [executable]
+    base_cmd = [sys.executable, "-m", "video_viewer.main"]
 
     cmd = base_cmd + [
         str(infile),
@@ -61,11 +51,7 @@ def test_cli_missing_args(tmp_path):
     infile = tmp_path / "input.raw"
     infile.write_bytes(b'\x00' * 10)
 
-    executable = shutil.which("video_viewer")
-    if not executable:
-        base_cmd = [sys.executable, "-m", "video_viewer.main"]
-    else:
-        base_cmd = [executable]
+    base_cmd = [sys.executable, "-m", "video_viewer.main"]
 
     # Test headless mode with tiny file (defaults to 1920x1080 -> 0 frames)
     outfile = tmp_path / "out.yuv"
