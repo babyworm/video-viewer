@@ -3,7 +3,7 @@ Test the ComparisonView module
 """
 import pytest
 import numpy as np
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication
 from video_viewer.comparison_view import ComparisonCanvas, ComparisonWindow, ComparisonMode
 from video_viewer.video_reader import VideoReader
 from video_viewer.format_manager import FormatManager

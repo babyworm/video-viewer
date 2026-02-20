@@ -1,6 +1,6 @@
 import os
 import logging
-from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QComboBox, QPushButton, QSlider,
                              QFileDialog, QGroupBox, QMenuBar, QStatusBar,
                              QDialog, QDialogButtonBox, QFormLayout, QMenu,
@@ -8,8 +8,8 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QTableWidgetItem, QHeaderView, QProgressDialog,
                              QSpinBox, QCheckBox, QListWidget, QListWidgetItem,
                              QSizePolicy, QTabWidget)
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSettings, QMimeData, QUrl
-from PyQt6.QtGui import (QImage, QPixmap, QPainter, QColor, QPen, QMouseEvent,
+from PySide6.QtCore import Qt, QTimer, Signal, QSettings, QMimeData, QUrl
+from PySide6.QtGui import (QImage, QPixmap, QPainter, QColor, QPen, QMouseEvent,
                           QAction, QKeySequence, QDragEnterEvent, QDropEvent,
                           QClipboard)
 import numpy as np
@@ -43,8 +43,8 @@ COMMON_GUESS_FORMATS = ["I420", "NV12", "YUYV", "RGB24"]
 
 
 class ImageCanvas(QWidget):
-    mouse_moved = pyqtSignal(int, int) # Signal for coordinates
-    roi_selected = pyqtSignal(int, int, int, int)  # x, y, w, h in image coords
+    mouse_moved = Signal(int, int) # Signal for coordinates
+    roi_selected = Signal(int, int, int, int)  # x, y, w, h in image coords
 
     def __init__(self):
         super().__init__()
@@ -1236,7 +1236,7 @@ class MainWindow(QMainWindow):
         self.status_bar.addWidget(self.status_framesize)
 
     def create_analysis_dock(self):
-        from PyQt6.QtWidgets import QDockWidget, QTabWidget
+        from PySide6.QtWidgets import QDockWidget, QTabWidget
 
         self.dock_analysis = QDockWidget("Analysis", self)
         self.dock_analysis.setAllowedAreas(Qt.DockWidgetArea.RightDockWidgetArea | Qt.DockWidgetArea.BottomDockWidgetArea)
@@ -1331,7 +1331,7 @@ class MainWindow(QMainWindow):
 
     def show_about(self):
         """Show about dialog."""
-        from PyQt6.QtWidgets import QMessageBox
+        from PySide6.QtWidgets import QMessageBox
         QMessageBox.about(self, "About YUV/RAW Video Viewer",
                          "YUV/RAW Video Viewer v2.0\n\n"
                          "A professional tool for viewing and analyzing raw video formats.\n\n"
@@ -1340,7 +1340,7 @@ class MainWindow(QMainWindow):
     def show_comparison_window(self):
         """Open the A/B comparison window."""
         if not self.reader:
-            from PyQt6.QtWidgets import QMessageBox
+            from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "No Video", "Load a video first before comparing.")
             return
         self._comparison_window = ComparisonWindow(self.reader, self)
@@ -1349,7 +1349,7 @@ class MainWindow(QMainWindow):
     def show_convert_dialog(self):
         """Open the format conversion dialog."""
         if not self.reader:
-            from PyQt6.QtWidgets import QMessageBox
+            from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "No Video", "Load a video first before converting.")
             return
 
@@ -1370,11 +1370,11 @@ class MainWindow(QMainWindow):
                                       self.current_width, self.current_height,
                                       self.current_format,
                                       output_path, output_fmt)
-                    from PyQt6.QtWidgets import QMessageBox
+                    from PySide6.QtWidgets import QMessageBox
                     QMessageBox.information(self, "Convert Complete",
                                             f"Converted to:\n{output_path}")
                 except Exception as e:
-                    from PyQt6.QtWidgets import QMessageBox
+                    from PySide6.QtWidgets import QMessageBox
                     QMessageBox.critical(self, "Convert Error", str(e))
 
     def toggle_analysis_dock(self):

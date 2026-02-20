@@ -1,12 +1,12 @@
-from PyQt6.QtOpenGLWidgets import QOpenGLWidget
-from PyQt6.QtOpenGL import QOpenGLTexture, QOpenGLShader, QOpenGLShaderProgram, QOpenGLBuffer, QOpenGLVertexArrayObject, QOpenGLVersionProfile, QOpenGLVersionFunctionsFactory
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QMouseEvent, QSurfaceFormat, QPainter, QColor
+from PySide6.QtOpenGLWidgets import QOpenGLWidget
+from PySide6.QtOpenGL import QOpenGLTexture, QOpenGLShader, QOpenGLShaderProgram, QOpenGLBuffer, QOpenGLVertexArrayObject, QOpenGLVersionProfile, QOpenGLVersionFunctionsFactory
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QMouseEvent, QSurfaceFormat, QPainter, QColor
 import numpy as np
 import ctypes
 
 class GLCanvas(QOpenGLWidget):
-    mouse_moved = pyqtSignal(int, int)
+    mouse_moved = Signal(int, int)
 
     # Vertex Shader: Pass-through positions and texture coordinates
     VERTEX_SHADER = """

@@ -5,7 +5,7 @@ Ensures canvas is created before menu bar to prevent AttributeError.
 import pytest
 import sys
 import os
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication
 
 @pytest.fixture
 def qapp():
@@ -488,8 +488,8 @@ def test_split_view_component(qapp, tmp_path):
 def test_component_keyboard_shortcuts(qapp, tmp_path):
     """Test that keys 0-4 switch component view."""
     from video_viewer.main_window import MainWindow
-    from PyQt6.QtCore import Qt
-    from PyQt6.QtGui import QKeyEvent
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QKeyEvent
 
     window = MainWindow()
     width, height = 4, 4

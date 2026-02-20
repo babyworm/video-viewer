@@ -8,9 +8,9 @@ from typing import Optional
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt, QPoint, QRect, pyqtSignal
-from PyQt6.QtGui import QPainter, QImage, QPixmap, QPen, QColor, QWheelEvent, QMouseEvent
-from PyQt6.QtWidgets import (
+from PySide6.QtCore import Qt, QPoint, QRect, Signal
+from PySide6.QtGui import QPainter, QImage, QPixmap, QPen, QColor, QWheelEvent, QMouseEvent
+from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QComboBox, QSlider, QLabel, QPushButton, QFileDialog,
     QMessageBox, QToolBar, QStatusBar

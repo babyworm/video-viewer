@@ -7,7 +7,7 @@ setup(
     install_requires=[
         "numpy",
         "opencv-python",
-        "PyQt6",
+        "PySide6",
     ],
     entry_points={
         'console_scripts': [
