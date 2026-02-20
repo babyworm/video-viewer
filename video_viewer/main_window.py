@@ -1091,6 +1091,7 @@ class MainWindow(QMainWindow):
     def create_icon_toolbar(self):
         """Create icon toolbar with common actions."""
         toolbar = QToolBar("Main Toolbar")
+        toolbar.setObjectName("MainToolBar")
         toolbar.setMovable(False)
         style = self.style()
 
@@ -1448,6 +1449,7 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QDockWidget, QTabWidget
 
         self.dock_analysis = QDockWidget("Analysis", self)
+        self.dock_analysis.setObjectName("AnalysisDock")
         self.dock_analysis.setAllowedAreas(Qt.DockWidgetArea.RightDockWidgetArea | Qt.DockWidgetArea.BottomDockWidgetArea)
         self.dock_analysis.setVisible(False)
 
