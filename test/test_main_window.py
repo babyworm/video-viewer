@@ -294,7 +294,10 @@ def test_scene_change_detection(qapp, tmp_path):
     window.current_file_path = str(f)
     window.reload_video()
 
-    window.detect_scene_changes()
+    from unittest.mock import patch
+    # Mock QInputDialog to return threshold=15.0 (low, to catch the big change)
+    with patch('PySide6.QtWidgets.QInputDialog.getDouble', return_value=(15.0, True)):
+        window.detect_scene_changes()
     # Should detect at least 1 scene change (frame 2→3 or 3→4)
     assert len(window._scene_changes) >= 1
 

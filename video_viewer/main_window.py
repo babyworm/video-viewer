@@ -42,6 +42,53 @@ COMMON_RESOLUTIONS = [
 COMMON_GUESS_FORMATS = ["I420", "NV12", "YUYV", "RGB24"]
 
 
+class MarkerSlider(QSlider):
+    """QSlider with colored marker lines for scene changes and bookmarks."""
+
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        self._scene_markers = []   # list of frame indices
+        self._bookmark_markers = []  # list of frame indices
+
+    def set_scene_markers(self, markers):
+        self._scene_markers = list(markers)
+        self.update()
+
+    def set_bookmark_markers(self, markers):
+        self._bookmark_markers = list(markers)
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.maximum() == 0:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Calculate groove geometry
+        handle_width = 14
+        groove_start = handle_width // 2
+        groove_width = self.width() - handle_width
+        max_val = self.maximum()
+
+        # Draw scene change markers (red)
+        if self._scene_markers:
+            painter.setPen(QPen(QColor(255, 60, 60, 200), 2))
+            for idx in self._scene_markers:
+                x = groove_start + int(idx / max_val * groove_width)
+                painter.drawLine(x, 0, x, self.height())
+
+        # Draw bookmark markers (cyan)
+        if self._bookmark_markers:
+            painter.setPen(QPen(QColor(0, 200, 255, 200), 2))
+            for idx in self._bookmark_markers:
+                x = groove_start + int(idx / max_val * groove_width)
+                painter.drawLine(x, 0, x, self.height())
+
+        painter.end()
+
+
 class ImageCanvas(QWidget):
     mouse_moved = Signal(int, int) # Signal for coordinates
     roi_selected = Signal(int, int, int, int)  # x, y, w, h in image coords
@@ -1193,7 +1240,7 @@ class MainWindow(QMainWindow):
         nav_layout.addWidget(self.btn_last)
 
         # Frame slider
-        self.slider_frame = QSlider(Qt.Orientation.Horizontal)
+        self.slider_frame = MarkerSlider(Qt.Orientation.Horizontal)
         self.slider_frame.valueChanged.connect(self.seek_frame)
         nav_layout.addWidget(self.slider_frame, stretch=1)
 
@@ -2373,6 +2420,7 @@ class MainWindow(QMainWindow):
         self.list_bookmarks.clear()
         for bm in sorted(self.bookmarks):
             self.list_bookmarks.addItem(f"Frame {bm}")
+        self.slider_frame.set_bookmark_markers(sorted(self.bookmarks))
 
     def show_bookmark_dialog(self):
         """Show bookmark list in a separate dialog."""
@@ -2449,21 +2497,28 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("Need a loaded video with 2+ frames", 2000)
             return
 
+        from PySide6.QtWidgets import QInputDialog
+        threshold, ok = QInputDialog.getDouble(
+            self, "Scene Detection",
+            "Threshold (mean pixel difference, 0-255):",
+            value=45.0, min=1.0, max=255.0, decimals=1)
+        if not ok:
+            return
+
         total = self.reader.total_frames
         progress = QProgressDialog("Detecting scene changes...", "Cancel", 0, total - 1, self)
         progress.setWindowTitle("Scene Detection")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
+        progress.setValue(0)
 
         self._scene_changes = []
-        threshold = 15.0  # Mean pixel difference threshold
         prev_rgb = self.reader.convert_to_rgb(self.reader.seek_frame(0))
 
         for i in range(1, total):
             if progress.wasCanceled():
                 break
             progress.setValue(i)
-            if i % 10 == 0:
-                QApplication.processEvents()
 
             raw = self.reader.seek_frame(i)
             cur_rgb = self.reader.convert_to_rgb(raw)
@@ -2474,6 +2529,8 @@ class MainWindow(QMainWindow):
             prev_rgb = cur_rgb
 
         progress.setValue(total - 1)
+        progress.close()
+        self.slider_frame.set_scene_markers(self._scene_changes)
         self.status_bar.showMessage(
             f"Found {len(self._scene_changes)} scene changes", 3000)
 
