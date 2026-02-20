@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
 from PySide6.QtCore import Qt, QTimer, Signal, QSettings, QMimeData, QUrl
 from PySide6.QtGui import (QImage, QPixmap, QPainter, QColor, QPen, QMouseEvent,
                           QAction, QKeySequence, QDragEnterEvent, QDropEvent,
-                          QClipboard)
+                          QClipboard, QIcon)
 import numpy as np
 import cv2
 
@@ -53,6 +53,7 @@ class ImageCanvas(QWidget):
         self.offset_x = 0
         self.offset_y = 0
         self.grid_size = 0  # 0 means no grid
+        self.sub_grid_size = 0  # 0=none, 2/3/4 = pixel interval
         self.setMinimumSize(400, 300)
         self.setMouseTracking(True)
         self.last_mouse_pos = None
@@ -213,6 +214,10 @@ class ImageCanvas(QWidget):
         self.grid_size = size
         self.update()
 
+    def set_sub_grid(self, size):
+        self.sub_grid_size = size
+        self.update()
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), Qt.GlobalColor.black)
@@ -244,6 +249,17 @@ class ImageCanvas(QWidget):
                 for y in range(0, h, self.grid_size):
                     painter.drawLine(0, y, w, y)
                 painter.drawLine(0, h, w, h) # Last line
+
+            # Draw Sub-grid
+            if self.sub_grid_size > 0:
+                pen = QPen(QColor(255, 255, 0, 128), 1 / self.scale_factor, Qt.PenStyle.DotLine)
+                painter.setPen(pen)
+                w = self.image.width()
+                h = self.image.height()
+                for x in range(0, w + 1, self.sub_grid_size):
+                    painter.drawLine(x, 0, x, h)
+                for y in range(0, h + 1, self.sub_grid_size):
+                    painter.drawLine(0, y, w, y)
 
             # Draw ROI rectangle
             if self.roi_rect:
@@ -673,6 +689,10 @@ class MainWindow(QMainWindow):
         self.grid_sizes = [0, 16, 32, 64, 128]
         self.current_grid_idx = 0
 
+        # Sub-grid state for keyboard toggle (Shift+G)
+        self.sub_grid_sizes = [0, 4, 8, 16]
+        self.current_sub_grid_idx = 0
+
         # Playback state (Phase 2)
         self.is_playing = False
         self.loop_playback = True
@@ -846,6 +866,24 @@ class MainWindow(QMainWindow):
         grid_128_action.triggered.connect(lambda: self.set_grid_from_menu(128))
         grid_menu.addAction(grid_128_action)
 
+        grid_menu.addSeparator()
+
+        sub_grid_none_action = QAction("Sub-grid None", self)
+        sub_grid_none_action.triggered.connect(lambda: self.set_sub_grid_from_menu(0))
+        grid_menu.addAction(sub_grid_none_action)
+
+        sub_grid_4_action = QAction("Sub-grid 4x4", self)
+        sub_grid_4_action.triggered.connect(lambda: self.set_sub_grid_from_menu(4))
+        grid_menu.addAction(sub_grid_4_action)
+
+        sub_grid_8_action = QAction("Sub-grid 8x8", self)
+        sub_grid_8_action.triggered.connect(lambda: self.set_sub_grid_from_menu(8))
+        grid_menu.addAction(sub_grid_8_action)
+
+        sub_grid_16_action = QAction("Sub-grid 16x16", self)
+        sub_grid_16_action.triggered.connect(lambda: self.set_sub_grid_from_menu(16))
+        grid_menu.addAction(sub_grid_16_action)
+
         view_menu.addMenu(grid_menu)
 
         # Component submenu
@@ -878,6 +916,10 @@ class MainWindow(QMainWindow):
         show_analysis_action = QAction("Show Analysis Dock", self)
         show_analysis_action.triggered.connect(self.toggle_analysis_dock)
         view_menu.addAction(show_analysis_action)
+
+        show_bookmarks_action = QAction("Bookmarks... (B)", self)
+        show_bookmarks_action.triggered.connect(self.show_bookmark_dialog)
+        view_menu.addAction(show_bookmarks_action)
 
         view_menu.addSeparator()
 
@@ -1017,11 +1059,27 @@ class MainWindow(QMainWindow):
         act_fit.setToolTip("Fit to View (F)")
         act_fit.triggered.connect(self.canvas.fit_to_view)
 
+        # Zoom 1:1 (100%)
+        act_zoom_100 = toolbar.addAction(self._create_zoom_icon("1:1"), "1:1")
+        act_zoom_100.setToolTip("Zoom 100% (1:1)")
+        act_zoom_100.triggered.connect(lambda: self.canvas.set_scale(1.0))
+
+        # Zoom 2:1 (200%)
+        act_zoom_200 = toolbar.addAction(self._create_zoom_icon("2:1"), "2:1")
+        act_zoom_200.setToolTip("Zoom 200% (2:1)")
+        act_zoom_200.triggered.connect(lambda: self.canvas.set_scale(2.0))
+
         # Grid Toggle
         act_grid = toolbar.addAction(
             style.standardIcon(QStyle.StandardPixmap.SP_FileDialogListView), "Grid")
         act_grid.setToolTip("Toggle Grid (G)")
         act_grid.triggered.connect(self._toggle_grid)
+
+        # Sub-grid Toggle
+        act_sub_grid = toolbar.addAction(
+            self._create_sub_grid_icon(), "Sub")
+        act_sub_grid.setToolTip("Toggle Sub-grid (Shift+G)")
+        act_sub_grid.triggered.connect(self._toggle_sub_grid)
 
         toolbar.addSeparator()
 
@@ -1045,10 +1103,58 @@ class MainWindow(QMainWindow):
 
         self.addToolBar(toolbar)
 
+    def _create_zoom_icon(self, label):
+        """Create a custom zoom icon with text label (e.g. '1:1', '2:1')."""
+        size = 24
+        pixmap = QPixmap(size, size)
+        pixmap.fill(QColor(60, 63, 65))
+        p = QPainter(pixmap)
+        # Draw magnifier circle
+        p.setPen(QPen(QColor(180, 200, 220), 1.5))
+        p.drawEllipse(2, 2, 16, 16)
+        # Draw handle
+        p.setPen(QPen(QColor(140, 160, 180), 2))
+        p.drawLine(16, 16, 22, 22)
+        # Draw label text
+        font = p.font()
+        font.setPixelSize(8)
+        font.setBold(True)
+        p.setFont(font)
+        p.setPen(QColor(255, 255, 100))
+        p.drawText(1, 3, 18, 15, Qt.AlignmentFlag.AlignCenter, label)
+        p.end()
+        return QIcon(pixmap)
+
+    def _create_sub_grid_icon(self):
+        """Create a custom sub-grid icon: small yellow dotted grid on dark background."""
+        size = 24
+        pixmap = QPixmap(size, size)
+        pixmap.fill(QColor(60, 63, 65))
+        p = QPainter(pixmap)
+        # Outer border (green, like main grid)
+        p.setPen(QPen(QColor(0, 200, 0, 180), 1))
+        p.drawRect(1, 1, size - 3, size - 3)
+        # Inner sub-grid lines (yellow dotted)
+        pen = QPen(QColor(255, 220, 0, 200), 1, Qt.PenStyle.DotLine)
+        p.setPen(pen)
+        step = (size - 4) // 4
+        for i in range(1, 4):
+            x = 2 + i * step
+            p.drawLine(x, 2, x, size - 3)
+            y = 2 + i * step
+            p.drawLine(2, y, size - 3, y)
+        p.end()
+        return QIcon(pixmap)
+
     def _toggle_grid(self):
         """Toggle grid through sizes (for toolbar button)."""
         self.current_grid_idx = (self.current_grid_idx + 1) % len(self.grid_sizes)
         self.canvas.set_grid(self.grid_sizes[self.current_grid_idx])
+
+    def _toggle_sub_grid(self):
+        """Toggle sub-grid through sizes (for toolbar button)."""
+        self.current_sub_grid_idx = (self.current_sub_grid_idx + 1) % len(self.sub_grid_sizes)
+        self.canvas.set_sub_grid(self.sub_grid_sizes[self.current_sub_grid_idx])
 
     def create_navigation_toolbar(self):
         """Create the navigation toolbar below the canvas."""
@@ -1184,26 +1290,9 @@ class MainWindow(QMainWindow):
         grp_magnifier.setLayout(mag_layout)
         sidebar_layout.addWidget(grp_magnifier)
 
-        # Bookmark list group
-        grp_bookmarks = QGroupBox("Bookmarks")
-        bm_layout = QVBoxLayout()
+        # Bookmark list (hidden, used by bookmark dialog)
         self.list_bookmarks = QListWidget()
-        self.list_bookmarks.setMaximumHeight(100)
-        self.list_bookmarks.itemDoubleClicked.connect(self._jump_to_bookmark)
-        bm_layout.addWidget(self.list_bookmarks)
-        bm_btn_row = QHBoxLayout()
-        btn_bm_add = QPushButton("+")
-        btn_bm_add.setFixedWidth(30)
-        btn_bm_add.clicked.connect(self.toggle_bookmark)
-        btn_bm_del = QPushButton("-")
-        btn_bm_del.setFixedWidth(30)
-        btn_bm_del.clicked.connect(self._remove_selected_bookmark)
-        bm_btn_row.addWidget(btn_bm_add)
-        bm_btn_row.addWidget(btn_bm_del)
-        bm_btn_row.addStretch()
-        bm_layout.addLayout(bm_btn_row)
-        grp_bookmarks.setLayout(bm_layout)
-        sidebar_layout.addWidget(grp_bookmarks)
+        self._bookmark_dialog = None
 
         sidebar_layout.addStretch()
 
@@ -1332,10 +1421,11 @@ class MainWindow(QMainWindow):
     def show_about(self):
         """Show about dialog."""
         from PySide6.QtWidgets import QMessageBox
-        QMessageBox.about(self, "About YUV/RAW Video Viewer",
-                         "YUV/RAW Video Viewer v2.0\n\n"
+        from . import __version__
+        QMessageBox.about(self, "About YUV/Raw Video Viewer",
+                         f"YUV/Raw Video Viewer v{__version__}\n\n"
                          "A professional tool for viewing and analyzing raw video formats.\n\n"
-                         "Phase 1: UI Restructuring Complete")
+                         "Copyright (c) babyworm (Hyun-Gyu Kim)")
 
     def show_comparison_window(self):
         """Open the A/B comparison window."""
@@ -1394,6 +1484,12 @@ class MainWindow(QMainWindow):
         if size in self.grid_sizes:
             self.current_grid_idx = self.grid_sizes.index(size)
 
+    def set_sub_grid_from_menu(self, size):
+        """Set sub-grid size from menu action."""
+        self.canvas.set_sub_grid(size)
+        if size in self.sub_grid_sizes:
+            self.current_sub_grid_idx = self.sub_grid_sizes.index(size)
+
     def _colorize_channel(self, gray, name):
         """Convert single-channel data to false color RGB.
 
@@ -1447,6 +1543,9 @@ class MainWindow(QMainWindow):
             self.prev_frame()
         elif key == Qt.Key.Key_Right:
             self.next_frame()
+        elif key == Qt.Key.Key_G and shift:
+            self.current_sub_grid_idx = (self.current_sub_grid_idx + 1) % len(self.sub_grid_sizes)
+            self.canvas.set_sub_grid(self.sub_grid_sizes[self.current_sub_grid_idx])
         elif key == Qt.Key.Key_G:
             self.current_grid_idx = (self.current_grid_idx + 1) % len(self.grid_sizes)
             self.canvas.set_grid(self.grid_sizes[self.current_grid_idx])
@@ -1913,7 +2012,8 @@ class MainWindow(QMainWindow):
              if not hasattr(self, 'current_raw_frame'):
                  self.current_raw_frame = self.reader.seek_frame(self.current_frame_idx)
 
-             info = self.reader.get_pixel_info(self.current_raw_frame, x, y)
+             sub_gs = self.canvas.sub_grid_size
+             info = self.reader.get_pixel_info(self.current_raw_frame, x, y, sub_grid_size=sub_gs)
              if info:
                  self.lbl_coord.setText(f"X: {x} Y: {y}")
 
@@ -1924,17 +2024,30 @@ class MainWindow(QMainWindow):
                  self.lbl_comps.setText("Comp: " + ", ".join(comps))
 
                  nb = info['neighborhood']
+                 if sub_gs > 0:
+                     cell_x = (x // sub_gs) * sub_gs
+                     cell_y = (y // sub_gs) * sub_gs
+                     cursor_row = y - cell_y + 1
+                     cursor_col = x - cell_x + 1
+                 else:
+                     cursor_row = 1
+                     cursor_col = 1
+
                  nb_html = '<span style="font-family:monospace;">Neighborhood:<br>'
                  for r_idx, row in enumerate(nb):
                      cells = []
                      for c_idx, val in enumerate(row):
-                         if r_idx == len(nb) // 2 and c_idx == len(row) // 2:
+                         if r_idx == cursor_row and c_idx == cursor_col:
                              cells.append(
                                  f'<span style="background-color:#ff4444;'
                                  f'color:white;font-weight:bold;'
-                                 f'padding:1px 3px;">{val:3}</span>')
+                                 f'padding:1px 3px;">{val}</span>')
+                         elif sub_gs > 0 and 1 <= r_idx <= sub_gs and 1 <= c_idx <= sub_gs:
+                             cells.append(
+                                 f'<span style="background-color:#334466;'
+                                 f'color:white;padding:1px 3px;">{val}</span>')
                          else:
-                             cells.append(f'{val:3}')
+                             cells.append(f'<span style="padding:1px 3px;">{val}</span>')
                      nb_html += ' '.join(cells) + '<br>'
                  nb_html += '</span>'
                  self.lbl_neighborhood.setText(nb_html)
@@ -2260,6 +2373,45 @@ class MainWindow(QMainWindow):
         self.list_bookmarks.clear()
         for bm in sorted(self.bookmarks):
             self.list_bookmarks.addItem(f"Frame {bm}")
+
+    def show_bookmark_dialog(self):
+        """Show bookmark list in a separate dialog."""
+        if not self.bookmarks:
+            self.status_bar.showMessage("No bookmarks set", 2000)
+            return
+        if self._bookmark_dialog and self._bookmark_dialog.isVisible():
+            self._bookmark_dialog.raise_()
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Bookmarks")
+        dlg.setMinimumSize(250, 200)
+        layout = QVBoxLayout(dlg)
+        bm_list = QListWidget()
+        for bm in sorted(self.bookmarks):
+            bm_list.addItem(f"Frame {bm}")
+        bm_list.itemDoubleClicked.connect(lambda item: self._jump_to_bookmark(item))
+        layout.addWidget(bm_list)
+        btn_row = QHBoxLayout()
+        btn_del = QPushButton("Remove Selected")
+        btn_del.clicked.connect(lambda: self._remove_bookmark_from_dialog(bm_list))
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(dlg.close)
+        btn_row.addWidget(btn_del)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+        self._bookmark_dialog = dlg
+        dlg.show()
+
+    def _remove_bookmark_from_dialog(self, bm_list):
+        item = bm_list.currentItem()
+        if item:
+            idx = int(item.text().replace("Frame ", ""))
+            self.bookmarks.discard(idx)
+            bm_list.takeItem(bm_list.row(item))
+            self._refresh_bookmark_list()
+            if not self.bookmarks and self._bookmark_dialog:
+                self._bookmark_dialog.close()
 
     def _jump_to_bookmark(self, item):
         text = item.text()

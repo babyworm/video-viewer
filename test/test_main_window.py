@@ -517,3 +517,66 @@ def test_component_keyboard_shortcuts(qapp, tmp_path):
         event = QKeyEvent(QKeyEvent.Type.KeyPress, key_val, Qt.KeyboardModifier.NoModifier)
         window.keyPressEvent(event)
         assert window.current_component == expected_comp, f"Key {key_val} should set component to {expected_comp}"
+
+
+def test_sub_grid_toggle(qapp):
+    """Test Shift+G cycles sub-grid sizes (0→2→3→4→0)."""
+    from video_viewer.main_window import MainWindow
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QKeyEvent
+
+    window = MainWindow()
+    assert window.canvas.sub_grid_size == 0
+
+    expected = [4, 8, 16, 0]
+    for exp in expected:
+        event = QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_G, Qt.KeyboardModifier.ShiftModifier)
+        window.keyPressEvent(event)
+        assert window.canvas.sub_grid_size == exp, f"Expected sub_grid_size={exp}, got {window.canvas.sub_grid_size}"
+
+
+def test_sub_grid_neighborhood(qapp, tmp_path):
+    """Test sub_grid_size=4 produces 6x6 neighborhood."""
+    from video_viewer.video_reader import VideoReader
+    import numpy as np
+
+    width, height = 16, 16
+    y_size = width * height
+    uv_size = (width // 2) * (height // 2)
+    y_data = np.arange(y_size, dtype=np.uint8).tobytes()
+    uv_data = b'\x80' * (2 * uv_size)
+    frame_data = y_data + uv_data
+
+    f = tmp_path / "subgrid.yuv"
+    f.write_bytes(frame_data)
+
+    reader = VideoReader(str(f), width, height, "I420")
+    raw = reader.seek_frame(0)
+
+    # Pixel (6,6) with sub_grid_size=4 → cell origin (4,4), range (3,3)-(8,8) → 6x6
+    info = reader.get_pixel_info(raw, 6, 6, sub_grid_size=4)
+    nb = info['neighborhood']
+    assert len(nb) == 6, f"Expected 6 rows, got {len(nb)}"
+    assert len(nb[0]) == 6, f"Expected 6 cols, got {len(nb[0])}"
+
+    # Without sub-grid → default 3x3
+    info_default = reader.get_pixel_info(raw, 6, 6)
+    nb_default = info_default['neighborhood']
+    assert len(nb_default) == 3
+    assert len(nb_default[0]) == 3
+
+    reader.close()
+
+
+def test_sub_grid_paint(qapp):
+    """Test sub_grid_size property on ImageCanvas."""
+    from video_viewer.main_window import ImageCanvas
+
+    canvas = ImageCanvas()
+    assert canvas.sub_grid_size == 0
+
+    canvas.set_sub_grid(3)
+    assert canvas.sub_grid_size == 3
+
+    canvas.set_sub_grid(0)
+    assert canvas.sub_grid_size == 0

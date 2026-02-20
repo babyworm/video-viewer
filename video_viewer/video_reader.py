@@ -386,7 +386,7 @@ class VideoReader:
 
         return None
 
-    def get_pixel_info(self, frame_data, x, y):
+    def get_pixel_info(self, frame_data, x, y, sub_grid_size=0):
         """Returns info about the pixel at x, y"""
         if x < 0 or x >= self.width or y < 0 or y >= self.height:
             return None
@@ -434,18 +434,40 @@ class VideoReader:
                      return [frame_data[offset], frame_data[offset+1]]
              return []
 
-        # Populate Neighborhood (3x3)
-        nb = []
-        for dy in [-1, 0, 1]:
-            row = []
-            for dx in [-1, 0, 1]:
-                raw = get_raw_bytes(x + dx, y + dy)
-                if raw:
-                    hex_s = " ".join([f"{b:02X}" for b in raw])
-                    row.append(hex_s)
-                else:
-                    row.append("--")
-            nb.append(row)
+        # Populate Neighborhood
+        if sub_grid_size > 0:
+            # Sub-grid cell origin
+            cell_x = (x // sub_grid_size) * sub_grid_size
+            cell_y = (y // sub_grid_size) * sub_grid_size
+            # Range with 1-pixel padding
+            x_start = cell_x - 1
+            y_start = cell_y - 1
+            x_end = cell_x + sub_grid_size  # inclusive via range
+            y_end = cell_y + sub_grid_size
+            nb = []
+            for py in range(y_start, y_end + 1):
+                row = []
+                for px in range(x_start, x_end + 1):
+                    raw = get_raw_bytes(px, py)
+                    if raw:
+                        hex_s = " ".join([f"{b:02X}" for b in raw])
+                        row.append(hex_s)
+                    else:
+                        row.append("--")
+                nb.append(row)
+        else:
+            # Default 3x3
+            nb = []
+            for dy in [-1, 0, 1]:
+                row = []
+                for dx in [-1, 0, 1]:
+                    raw = get_raw_bytes(x + dx, y + dy)
+                    if raw:
+                        hex_s = " ".join([f"{b:02X}" for b in raw])
+                        row.append(hex_s)
+                    else:
+                        row.append("--")
+                nb.append(row)
         info["neighborhood"] = nb
 
         # 2. Extract Components
