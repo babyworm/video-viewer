@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Test/Cache
+.pytest_cache/
+
+# Large media files
+*.y4m
+*.yuv
+*.raw
+
+# Firebase
+firebase-debug.log
+
+# Shared lib (local build artifact)
+libqxcb.so
+
+# OMC state
+.omc/
