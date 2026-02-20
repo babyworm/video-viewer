@@ -11,6 +11,7 @@
 - **MINOR**: Increment when adding new features (e.g., new UI panel, new analysis tool, new format support).
 - **PATCH**: Increment for bug fixes, small UI tweaks, refactoring without new features.
 - Always update `video_viewer/__init__.py` when the version changes.
+- **Every commit that adds features or fixes bugs must bump the version.**
 - The About dialog reads `__version__` automatically.
 
 ## Project Structure
