@@ -17,12 +17,17 @@
 ## Project Structure
 
 - `video_viewer/` - Main package
-  - `main_window.py` - ImageCanvas, MainWindow (UI, toolbar, menus, shortcuts)
-  - `video_reader.py` - VideoReader, FrameCache (format decoding, pixel inspection)
-  - `format_manager.py` - FormatManager, FormatType (YUV/RGB/Bayer format definitions)
-  - `analysis.py` - VideoAnalyzer (PSNR, SSIM, histogram)
-  - `comparison_view.py` - ComparisonWindow (A/B compare)
   - `__init__.py` - Package version (`__version__`)
+  - `main.py` - CLI entry point (argparse, headless conversion)
+  - `main_window.py` - ImageCanvas, MainWindow (UI, toolbar, menus, shortcuts)
+  - `video_reader.py` - VideoReader, FrameCache, parse_filename_hints (format decoding, pixel inspection, filename metadata extraction)
+  - `format_manager.py` - FormatManager, FormatType (YUV/RGB/Bayer format definitions)
+  - `constants.py` - Shared constants (resolutions, FPS options, theme, defaults)
+  - `dialogs.py` - ParametersDialog, ExportDialog, ConvertDialog, SettingsDialog, etc.
+  - `analysis.py` - VideoAnalyzer (PSNR, SSIM, histogram, waveform, vectorscope)
+  - `comparison_view.py` - ComparisonWindow (A/B compare)
+  - `video_converter.py` - VideoConverter (format conversion engine)
+  - `log_config.py` - Logging configuration
 - `test/` - pytest test suite
 
 ## Testing

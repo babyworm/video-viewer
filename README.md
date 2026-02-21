@@ -7,15 +7,18 @@ Raw/YUV/RGB video viewer built with PySide6 (Qt6). Supports 30+ pixel formats fo
 - **30+ pixel formats**: YUV (I420, NV12, NV21, YUY2, UYVY, ...), RGB (RGB24, BGR24, RGB565, ...), Bayer, grayscale
 - **Channel separation**: View individual Y/U/V or R/G/B channels with false color display
 - **Split view**: 2x2 grid showing Full + 3 channels simultaneously (key `4`)
+- **Multi-tab**: Open multiple files in separate tabs for quick switching
 - **Keyboard shortcuts**: `0`-`4` for channel switching, `Space` for play/pause, arrow keys for navigation
 - **A/B comparison**: Side-by-side, overlay, and diff modes for comparing two videos
 - **Analysis tools**: Histogram, waveform, vectorscope
 - **Pixel inspector**: Hover to see pixel values in all color spaces
 - **Bookmarks & scene detection**: Mark frames and auto-detect scene changes
-- **Y4M support**: Auto-detect parameters from Y4M headers
-- **Resolution guessing**: Auto-detect resolution from file size
+- **Y4M support**: Auto-detect parameters from Y4M headers (resolution, format, fps)
+- **Smart auto-detection**: Resolution guessing from file size, filename metadata extraction (resolution, format, fps patterns)
+- **Format conversion**: Convert between formats (single file or batch)
 - **Frame export**: Save frames as PNG/BMP, export clips with format conversion
 - **BT.601 / BT.709**: Selectable YUV-RGB color matrix
+- **Grid & sub-grid overlay**: Macroblock boundaries and sub-grid inspection
 - **Dark/Light theme**: Toggle with menu
 
 ## Installation

@@ -1,52 +1,88 @@
 # YUV/RAW Video Viewer Walkthrough
 
-I have implemented a standalone GUI tool for viewing raw YUV and Bayer video files.
+A standalone GUI tool for viewing and analyzing raw YUV, RGB, and Bayer video files, built with PySide6 (Qt6).
 
 ## Features
 - **Supported Formats**:
-    - **YUV**: I420, NV12, NV21, YUYV, UYVY, YV12
-    - **Bayer**: RGGB, BGGR, GBRG, GRBG (8-bit)
-    - **RGB**: RGB888, ARGB, RGB565
+    - **YUV Planar**: I420, YV12, YUV422P, YUV444P, NV12, NV21, NV16, NV61, NV24, NV42, P010, P016
+    - **YUV Packed**: YUYV, UYVY, YVYU, VYUY, AYUV, VUYA, Y210
+    - **Bayer**: RGGB, BGGR, GBRG, GRBG (8/10/12/16-bit)
+    - **RGB**: RGB24, BGR24, ARGB32, RGBA32, RGB565, RGB555, RGB332, and more
+    - **Grayscale**: 8/10/12/16-bit
+    - **Y4M**: Full header parsing (resolution, format, fps, interlace, PAR)
 - **Visualization**:
-    - Frame-by-frame navigation.
-    - Component view (Y, U, V or R, G, B separate channels).
-    - Grid overlay (16x16, 32x32, 64x64, 128x128).
-    - Zooming (via window resize).
-- **Conversion**:
-    - Save current frame as PNG or BMP.
+    - Frame-by-frame navigation with playback
+    - Channel separation (Y/U/V or R/G/B) with false color display
+    - Split view (2x2 grid: Full + 3 channels)
+    - Grid and sub-grid overlay for macroblock inspection
+    - Pixel inspector with raw hex values and neighborhood display
+    - Zooming (scroll wheel, Ctrl+/-)
+- **Analysis**:
+    - Histogram, waveform, vectorscope
+    - PSNR, SSIM metrics
+    - Scene change detection
+- **Auto-detection**:
+    - Y4M header parsing (resolution, format, fps)
+    - Resolution guessing from file size
+    - Filename metadata extraction (resolution, format, fps patterns)
+- **Multi-tab**: Open multiple files in separate tabs
+- **A/B Comparison**: Side-by-side, overlay, and diff modes
+- **Conversion**: Single file and batch format conversion
+- **Export**: Save frames as PNG/BMP, export clips
+- **BT.601 / BT.709**: Selectable color matrix
+- **Dark/Light theme**
 
 ## Setup
-The tool requires `numpy`, `opencv-python`, and `PyQt6`. I have set up a virtual environment in `.venv`.
 
-**To run the application:**
+Requires Python 3.10+ with `numpy`, `opencv-python`, `PySide6`, `pyqtgraph`, and `scikit-image`.
 
 ```bash
-.venv/bin/python main.py
+pip install -r requirements.txt
+pip install -e .
 ```
 
-## Usage Guide
-1.  **Launch the App**: Run the command above.
-2.  **Open File**: Click "Open File" and select your `.yuv` or raw file.
-3.  **Set Parameters**:
-    - Enter the **Width** and **Height** (e.g., 1920 1080).
-    - Select the **Format** from the dropdown.
-    - Click **Apply Resolution** to reload the video with new settings.
-4.  **Navigation**:
-    - Use the slider or `<` `>` buttons to move between frames.
-5.  **View Options**:
-    - **Grid Overlay**: Select a grid size to check macroblocks.
-    - **Component**: Switch between "Full" color (converted RGB) or individual raw components (Y, U, V).
-6.  **Save**:
-    - Click "Save Frame" to export the current view to an image file.
+## Usage
 
-## Verification
-I have verified the core logic using a test script `test_video_reader.py` which:
-1.  Generates a synthetic I420 YUV file (Solid Red).
-2.  Reads the file using the `VideoReader` class.
-3.  Verifies the converted RGB values match expected Red.
-4.  Verifies the extracted Y, U, V channels match expected raw values.
+### GUI mode
 
-You can run the verification script yourself:
 ```bash
-.venv/bin/python test_video_reader.py
+# Auto-detect parameters (Y4M)
+video_viewer input.y4m
+
+# Specify parameters (raw YUV)
+video_viewer input.yuv --width 1920 --height 1080 --format I420
+
+# Filename hints are extracted automatically
+# e.g. foreman_qcif_15fps_nv12.yuv → 176x144, NV12, 15fps
+```
+
+### Headless conversion
+
+```bash
+video_viewer input.yuv --width 1920 --height 1080 -vi I420 -vo NV12 -o output.nv12
+```
+
+## Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `Space` | Play / Pause |
+| `Left` / `Right` | Previous / Next frame |
+| `Ctrl+Left` / `Ctrl+Right` | Previous / Next scene change |
+| `0` | Full (all channels) |
+| `1` | Channel 1 (Y/R) |
+| `2` | Channel 2 (U/G) |
+| `3` | Channel 3 (V/B) |
+| `4` | Split view (2x2) |
+| `G` | Toggle grid overlay |
+| `Shift+G` | Toggle sub-grid overlay |
+| `B` | Toggle bookmark |
+| `Ctrl+B` | Next bookmark |
+| `Ctrl+Shift+B` | Previous bookmark |
+| `Ctrl+C` | Copy frame to clipboard |
+
+## Running Tests
+
+```bash
+pytest test/ -v
 ```
