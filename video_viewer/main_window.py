@@ -439,36 +439,19 @@ class MainWindow(QMainWindow):
 
         outer_layout.addWidget(top_widget, stretch=1)
 
-        # Console panel between content and status bar (full width, 2 lines)
-        console_widget = QWidget()
-        console_layout = QHBoxLayout(console_widget)
-        console_layout.setContentsMargins(4, 0, 0, 0)
-        console_layout.setSpacing(2)
-        self.lbl_console = QLabel("")
-        self.lbl_console.setFixedHeight(46)
-        self.lbl_console.setWordWrap(True)
-        self.lbl_console.setStyleSheet("color: #aaccff; font-size: 11px; background-color: #2b2b2b;")
-        self.lbl_console.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        console_layout.addWidget(self.lbl_console, stretch=1)
-        btn_console_up = QPushButton("\u25b2")
-        btn_console_up.setFixedSize(18, 14)
-        btn_console_up.setStyleSheet("font-size: 8px; padding: 0px; background-color: #3c3f41; color: #aaa; border: none;")
-        btn_console_up.clicked.connect(self._console_scroll_up)
-        btn_console_down = QPushButton("\u25bc")
-        btn_console_down.setFixedSize(18, 14)
-        btn_console_down.setStyleSheet("font-size: 8px; padding: 0px; background-color: #3c3f41; color: #aaa; border: none;")
-        btn_console_down.clicked.connect(self._console_scroll_down)
-        btn_col = QVBoxLayout()
-        btn_col.setContentsMargins(0, 0, 2, 0)
-        btn_col.setSpacing(1)
-        btn_col.addWidget(btn_console_up)
-        btn_col.addWidget(btn_console_down)
-        console_layout.addLayout(btn_col)
-        console_widget.setFixedHeight(50)
-        console_widget.setStyleSheet("background-color: #2b2b2b;")
-        self._console_history = []
-        self._console_view_idx = -1  # -1 = latest
-        outer_layout.addWidget(console_widget)
+        # Console panel between content and status bar (full width, scrollable)
+        from PySide6.QtWidgets import QPlainTextEdit
+        self.console_text = QPlainTextEdit()
+        self.console_text.setReadOnly(True)
+        self.console_text.setFixedHeight(60)
+        self.console_text.setStyleSheet(
+            "color: #aaccff; font-size: 11px; background-color: #2b2b2b;"
+            "border: none; padding: 2px 4px;"
+        )
+        self.console_text.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.console_text.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.console_text.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        outer_layout.addWidget(self.console_text)
 
         # Create status bar
         self.create_status_bar()
@@ -1004,33 +987,11 @@ class MainWindow(QMainWindow):
         self._act_comp_split.setIcon(self._create_split_icon())
 
     def show_console_message(self, msg):
-        """Show a message in the console panel. Persists until next message."""
-        self._console_history.append(msg)
-        if len(self._console_history) > 200:
-            self._console_history = self._console_history[-200:]
-        self._console_view_idx = -1
-        self.lbl_console.setText(msg)
-
-    def _console_scroll_up(self):
-        if not self._console_history:
-            return
-        if self._console_view_idx == -1:
-            self._console_view_idx = len(self._console_history) - 1
-        if self._console_view_idx > 0:
-            self._console_view_idx -= 1
-        self.lbl_console.setText(self._console_history[self._console_view_idx])
-
-    def _console_scroll_down(self):
-        if not self._console_history:
-            return
-        if self._console_view_idx == -1:
-            return
-        if self._console_view_idx < len(self._console_history) - 1:
-            self._console_view_idx += 1
-            self.lbl_console.setText(self._console_history[self._console_view_idx])
-        else:
-            self._console_view_idx = -1
-            self.lbl_console.setText(self._console_history[-1])
+        """Append a message to the console panel and auto-scroll to bottom."""
+        self.console_text.appendPlainText(msg)
+        self.console_text.verticalScrollBar().setValue(
+            self.console_text.verticalScrollBar().maximum()
+        )
 
     def _toggle_grid(self):
         """Toggle grid through sizes (for toolbar button)."""
