@@ -389,12 +389,14 @@ class MainWindow(QMainWindow):
         QApplication.instance().focusChanged.connect(self._on_focus_changed)
 
     def _on_focus_changed(self, old, new):
-        """Hide any open QComboBox popup when focus leaves the combo's view."""
-        if isinstance(old, QComboBox):
-            QTimer.singleShot(0, old.hidePopup)
-        # Also check if old widget's parent is a QComboBox (popup view)
-        elif old is not None and isinstance(old.parent(), QComboBox):
-            QTimer.singleShot(0, old.parent().hidePopup)
+        """Hide QComboBox popup when focus moves to an unrelated widget."""
+        if not isinstance(old, QComboBox):
+            return
+        # Don't close if focus moved to the combo's own popup view
+        view = old.view()
+        if new is view or new is view.viewport():
+            return
+        QTimer.singleShot(0, old.hidePopup)
 
     def init_ui(self):
         # Create central widget
