@@ -1038,6 +1038,7 @@ class MainWindow(QMainWindow):
         size = self.grid_sizes[self.current_grid_idx]
         self.canvas.set_grid(size)
         self.show_console_message(f"Grid: {size}x{size}" if size > 0 else "Grid: Off")
+        self._update_grid_status()
 
     def _toggle_sub_grid(self):
         """Toggle sub-grid through sizes (for toolbar button)."""
@@ -1045,6 +1046,7 @@ class MainWindow(QMainWindow):
         size = self.sub_grid_sizes[self.current_sub_grid_idx]
         self.canvas.set_sub_grid(size)
         self.show_console_message(f"Sub-grid: {size}x{size}" if size > 0 else "Sub-grid: Off")
+        self._update_grid_status()
 
     def create_navigation_toolbar(self):
         """Create the navigation toolbar below the canvas."""
@@ -1218,6 +1220,20 @@ class MainWindow(QMainWindow):
         self.status_bar.addWidget(self.status_filesize)
         self.status_bar.addWidget(QLabel("|"))
         self.status_bar.addWidget(self.status_framesize)
+
+        # Right-aligned: grid/subgrid info
+        self.status_grid = QLabel("")
+        self.status_bar.addPermanentWidget(self.status_grid)
+        self._update_grid_status()
+
+    def _update_grid_status(self):
+        """Update the grid/subgrid label in the status bar."""
+        g = self.canvas.grid_size
+        sg = self.canvas.sub_grid_size
+        parts = []
+        parts.append(f"Grid: {g}x{g}" if g > 0 else "Grid: Off")
+        parts.append(f"Sub: {sg}x{sg}" if sg > 0 else "Sub: Off")
+        self.status_grid.setText(" | ".join(parts))
 
     def create_analysis_dock(self):
         from PySide6.QtWidgets import QDockWidget, QTabWidget
@@ -1410,12 +1426,14 @@ class MainWindow(QMainWindow):
         # Update current grid index for keyboard toggle
         if size in self.grid_sizes:
             self.current_grid_idx = self.grid_sizes.index(size)
+        self._update_grid_status()
 
     def set_sub_grid_from_menu(self, size):
         """Set sub-grid size from menu action."""
         self.canvas.set_sub_grid(size)
         if size in self.sub_grid_sizes:
             self.current_sub_grid_idx = self.sub_grid_sizes.index(size)
+        self._update_grid_status()
 
     def _colorize_channel(self, gray, name):
         """Convert single-channel data to false color RGB.
@@ -1475,9 +1493,11 @@ class MainWindow(QMainWindow):
         elif key == Qt.Key.Key_G and shift:
             self.current_sub_grid_idx = (self.current_sub_grid_idx + 1) % len(self.sub_grid_sizes)
             self.canvas.set_sub_grid(self.sub_grid_sizes[self.current_sub_grid_idx])
+            self._update_grid_status()
         elif key == Qt.Key.Key_G:
             self.current_grid_idx = (self.current_grid_idx + 1) % len(self.grid_sizes)
             self.canvas.set_grid(self.grid_sizes[self.current_grid_idx])
+            self._update_grid_status()
         elif key == Qt.Key.Key_C and ctrl:
             self.copy_frame_to_clipboard()
         elif key == Qt.Key.Key_B and ctrl and shift:
