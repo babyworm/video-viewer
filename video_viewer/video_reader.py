@@ -1,4 +1,5 @@
 import logging
+import re
 import threading
 import numpy as np
 import cv2
@@ -10,6 +11,100 @@ from .format_manager import FormatType, FormatManager
 from .constants import DEFAULT_CACHE_MAX_FRAMES, DEFAULT_CACHE_MAX_MEMORY_MB, DEFAULT_COLOR_MATRIX
 
 logger = logging.getLogger(__name__)
+
+# Named resolution aliases (case-insensitive matching)
+_NAMED_RESOLUTIONS = {
+    'qcif': (176, 144),
+    'cif': (352, 288),
+    'qvga': (320, 240),
+    'vga': (640, 480),
+    'wvga': (800, 480),
+    'svga': (800, 600),
+    'xga': (1024, 768),
+    'hd': (1280, 720),
+    '720p': (1280, 720),
+    '1080p': (1920, 1080),
+    '2k': (2560, 1440),
+    '4k': (3840, 2160),
+    'sd': (720, 576),
+    'pal': (720, 576),
+    'ntsc': (720, 480),
+}
+
+# Format aliases mapping filename tokens to FormatManager lookup keys
+_FORMAT_ALIASES = {
+    'i420': 'I420', 'yuv420p': 'I420', 'yuv420': 'I420',
+    'yv12': 'YV12',
+    'nv12': 'NV12', 'nv21': 'NV21',
+    'nv16': 'NV16', 'nv61': 'NV61',
+    'yuv422p': '422P', 'yuv422': '422P',
+    'yuv444p': '444P', 'yuv444': '444P',
+    'yuyv': 'YUYV', 'yuy2': 'YUYV',
+    'uyvy': 'UYVY', 'yvyu': 'YVYU',
+    'rgb24': 'RGB3', 'rgb': 'RGB3',
+    'bgr24': 'BGR3', 'bgr': 'BGR3',
+    'grey': 'GREY', 'gray': 'GREY',
+}
+
+# Regex: explicit WxH (e.g. 1920x1080, 176X144)
+_RE_RESOLUTION = re.compile(r'(?:^|[_.\-/\\])(\d{2,5})[xX](\d{2,5})(?:[_.\-]|$)')
+# Regex: fps (e.g. 15fps, 29.97fps, _30_ as common fps between separators)
+_RE_FPS_SUFFIX = re.compile(r'(\d+(?:\.\d+)?)fps', re.IGNORECASE)
+_RE_FPS_BARE = re.compile(r'(?:^|[_.\-])(\d+(?:\.\d+)?)(?=[_.\-]|$)')
+_COMMON_FPS_VALUES = {1, 5, 10, 15, 24, 25, 29.97, 30, 50, 59.94, 60, 120}
+
+
+def parse_filename_hints(filename):
+    """Extract resolution, format, and fps hints from a filename.
+
+    Returns a dict with optional keys: 'width', 'height', 'format', 'fps'.
+    """
+    hints = {}
+    basename = os.path.basename(filename)
+    name_lower = basename.lower()
+    # Strip extension for matching
+    name_no_ext = os.path.splitext(name_lower)[0]
+
+    # --- Resolution ---
+    # 1. Explicit WxH
+    m = _RE_RESOLUTION.search(basename)
+    if m:
+        w, h = int(m.group(1)), int(m.group(2))
+        if 16 <= w <= 8192 and 16 <= h <= 8192:
+            hints['width'] = w
+            hints['height'] = h
+
+    # 2. Named resolution (only if no explicit WxH found)
+    if 'width' not in hints:
+        tokens = re.split(r'[_.\-/\\]', name_no_ext)
+        for token in tokens:
+            if token in _NAMED_RESOLUTIONS:
+                hints['width'], hints['height'] = _NAMED_RESOLUTIONS[token]
+                break
+
+    # --- Format ---
+    tokens = re.split(r'[_.\-/\\]', name_no_ext)
+    for token in tokens:
+        if token in _FORMAT_ALIASES:
+            hints['format'] = _FORMAT_ALIASES[token]
+            break
+
+    # --- FPS ---
+    # 1. Explicit "Nfps" pattern
+    m = _RE_FPS_SUFFIX.search(name_no_ext)
+    if m:
+        fps_val = float(m.group(1))
+        if 0.1 <= fps_val <= 240:
+            hints['fps'] = fps_val
+    else:
+        # 2. Bare number between separators that matches common fps values
+        for m in _RE_FPS_BARE.finditer(name_no_ext):
+            val = float(m.group(1))
+            if val in _COMMON_FPS_VALUES:
+                hints['fps'] = val
+                break
+
+    return hints
 
 
 class FrameCache:

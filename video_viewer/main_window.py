@@ -19,7 +19,7 @@ import cv2
 logger = logging.getLogger(__name__)
 
 
-from .video_reader import VideoReader, FrameDecodeWorker
+from .video_reader import VideoReader, FrameDecodeWorker, parse_filename_hints
 from .format_manager import FormatManager
 from .analysis import VideoAnalyzer
 from .comparison_view import ComparisonWindow
@@ -1623,13 +1623,7 @@ class MainWindow(QMainWindow):
                 # Y4M: header contains W/H/C → skip dialog
                 self.reload_video()
             else:
-                # Raw: guess resolution and show dialog with pre-filled values
-                guess = self._guess_resolution(file_path)
-                guess_info = None
-                if guess:
-                    self.current_width, self.current_height, self.current_format = guess[:3]
-                    fmt_short = guess[2].split(' [')[0]
-                    guess_info = f"추정: {guess[0]}x{guess[1]} {fmt_short} ({guess[3]} frames) - 확인 후 OK를 눌러주세요"
+                guess_info = self._apply_file_hints(file_path)
                 self.show_parameters_dialog(guess_info=guess_info)
             return
 
@@ -1642,19 +1636,64 @@ class MainWindow(QMainWindow):
             self.reload_video()
             self._add_tab_for_current()
         else:
-            # Raw: guess resolution and show dialog
-            guess = self._guess_resolution(file_path)
-            guess_info = None
-            if guess:
-                self.current_width, self.current_height, self.current_format = guess[:3]
-                fmt_short = guess[2].split(' [')[0]
-                guess_info = f"추정: {guess[0]}x{guess[1]} {fmt_short} ({guess[3]} frames) - 확인 후 OK를 눌러주세요"
+            guess_info = self._apply_file_hints(file_path)
             accepted = self.show_parameters_dialog(guess_info=guess_info)
             if not accepted:
                 # User cancelled → restore previous tab state
                 self._restore_tab_state(self._current_tab_idx)
                 return
             self._add_tab_for_current()
+
+    def _apply_file_hints(self, file_path):
+        """Apply file-size guess and filename hints, return info string for dialog.
+
+        Priority: file-size guess > filename hints.
+        Also sets combo_fps if a fps hint is found.
+        """
+        guess = self._guess_resolution(file_path)
+        fn_hints = parse_filename_hints(file_path)
+        info_parts = []
+
+        if guess:
+            # File-size guess takes priority
+            self.current_width, self.current_height, self.current_format = guess[:3]
+            fmt_short = guess[2].split(' [')[0]
+            info_parts.append(f"File-size guess: {guess[0]}x{guess[1]} {fmt_short} ({guess[3]} frames)")
+        else:
+            # Fall back to filename hints for resolution/format
+            if 'width' in fn_hints and 'height' in fn_hints:
+                self.current_width = fn_hints['width']
+                self.current_height = fn_hints['height']
+            if 'format' in fn_hints:
+                # Find display name for this format key
+                fmt_obj = self.format_manager.get_format(fn_hints['format'])
+                if fmt_obj:
+                    for display_name, f in self.format_manager.formats.items():
+                        if f is fmt_obj:
+                            self.current_format = display_name
+                            break
+
+            if 'width' in fn_hints or 'format' in fn_hints:
+                parts = []
+                if 'width' in fn_hints:
+                    parts.append(f"{fn_hints['width']}x{fn_hints['height']}")
+                if 'format' in fn_hints:
+                    parts.append(fn_hints['format'])
+                info_parts.append(f"Filename hint: {' '.join(parts)}")
+
+        # FPS hint from filename (applied regardless of resolution source)
+        if 'fps' in fn_hints:
+            fps_str = str(int(fn_hints['fps'])) if fn_hints['fps'] == int(fn_hints['fps']) else str(fn_hints['fps'])
+            idx = self.combo_fps.findText(fps_str)
+            if idx >= 0:
+                self.combo_fps.setCurrentIndex(idx)
+            else:
+                self.combo_fps.setCurrentText(fps_str)
+            info_parts.append(f"FPS: {fps_str}")
+
+        if info_parts:
+            return ' | '.join(info_parts) + " - verify and press OK"
+        return None
 
     def _guess_resolution(self, file_path):
         """Guess resolution and format from file size.
@@ -1709,6 +1748,26 @@ class MainWindow(QMainWindow):
                 self.current_height = self.reader.height
                 if self.reader.format:
                     self.current_format = self.reader.format.name
+                # Apply Y4M fps to playback combo box
+                if self.reader.y4m_fps and self.reader.y4m_fps > 0:
+                    fps_val = self.reader.y4m_fps
+                    fps_str = str(int(fps_val)) if fps_val == int(fps_val) else f"{fps_val:.2f}"
+                    idx = self.combo_fps.findText(fps_str)
+                    if idx >= 0:
+                        self.combo_fps.setCurrentIndex(idx)
+                    else:
+                        # Find closest match in existing options
+                        best_idx, best_diff = 0, float('inf')
+                        for i in range(self.combo_fps.count()):
+                            try:
+                                diff = abs(float(self.combo_fps.itemText(i)) - fps_val)
+                                if diff < best_diff:
+                                    best_diff = diff
+                                    best_idx = i
+                            except ValueError:
+                                continue
+                        self.combo_fps.setCurrentIndex(best_idx)
+                    self.show_console_message(f"Y4M FPS: {fps_str}")
 
             self.slider_frame.setMaximum(max(0, self.reader.total_frames - 1))
             self.current_frame_idx = 0
