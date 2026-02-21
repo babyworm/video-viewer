@@ -59,6 +59,9 @@ QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 3px; }
 QLabel { color: #dcdcdc; }
 QLineEdit, QComboBox, QSpinBox { background-color: #45494a; color: #dcdcdc;
     border: 1px solid #646464; border-radius: 3px; padding: 2px; }
+QComboBox QAbstractItemView { background-color: #45494a; color: #dcdcdc;
+    selection-background-color: #4b6eaf; selection-color: white;
+    border: 1px solid #646464; outline: none; }
 QPushButton { background-color: #4b6eaf; color: white; border: none;
     border-radius: 3px; padding: 4px 12px; }
 QPushButton:hover { background-color: #5a7fbf; }

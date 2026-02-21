@@ -1061,6 +1061,7 @@ class MainWindow(QMainWindow):
         self.combo_fps.setCurrentText("30")
         self.combo_fps.setFixedWidth(60)
         self.combo_fps.currentTextChanged.connect(self._update_playback_fps)
+        self.combo_fps.activated.connect(lambda: self.combo_fps.hidePopup())
         nav_layout.addWidget(QLabel("FPS:"))
         nav_layout.addWidget(self.combo_fps)
 
@@ -2562,6 +2563,7 @@ class MainWindow(QMainWindow):
         combo_algo = QComboBox()
         algo_names = [a[0] for a in self._SCENE_ALGORITHMS]
         combo_algo.addItems(algo_names)
+        combo_algo.activated.connect(lambda: combo_algo.hidePopup())
         form.addRow("Algorithm:", combo_algo)
 
         from PySide6.QtWidgets import QDoubleSpinBox

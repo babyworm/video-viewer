@@ -42,6 +42,7 @@ class ParametersDialog(QDialog):
         # Format
         self.combo_format = QComboBox()
         self.combo_format.addItems(self.format_manager.get_supported_formats())
+        self.combo_format.activated.connect(lambda: self.combo_format.hidePopup())
         if current_format in self.format_manager.get_supported_formats():
             self.combo_format.setCurrentText(current_format)
         layout.addRow("Format:", self.combo_format)
@@ -90,6 +91,7 @@ class ExportDialog(QDialog):
             "BGR24 (24-bit) [BGR3]"
         ]
         self.combo_export_fmt.addItems(self.exportable_formats)
+        self.combo_export_fmt.activated.connect(lambda: self.combo_export_fmt.hidePopup())
         layout.addRow("Export Format:", self.combo_export_fmt)
 
         # Buttons
@@ -137,6 +139,7 @@ class ConvertDialog(QDialog):
         # Output format
         self.combo_output_fmt = QComboBox()
         self.combo_output_fmt.addItems(self.format_manager.get_supported_formats())
+        self.combo_output_fmt.activated.connect(lambda: self.combo_output_fmt.hidePopup())
         layout.addRow("Output Format:", self.combo_output_fmt)
 
         # Output path
@@ -254,9 +257,11 @@ class BatchConvertDialog(QDialog):
         form.addRow("Height:", self.txt_height)
         self.combo_input_fmt = QComboBox()
         self.combo_input_fmt.addItems(self.format_manager.get_supported_formats())
+        self.combo_input_fmt.activated.connect(lambda: self.combo_input_fmt.hidePopup())
         form.addRow("Input Format:", self.combo_input_fmt)
         self.combo_output_fmt = QComboBox()
         self.combo_output_fmt.addItems(self.format_manager.get_supported_formats())
+        self.combo_output_fmt.activated.connect(lambda: self.combo_output_fmt.hidePopup())
         form.addRow("Output Format:", self.combo_output_fmt)
         layout.addLayout(form)
 
@@ -402,8 +407,10 @@ class SettingsDialog(QDialog):
         defaults_layout = QFormLayout()
         self.fps_combo = QComboBox()
         self.fps_combo.addItems(DEFAULT_FPS_OPTIONS)
+        self.fps_combo.activated.connect(lambda: self.fps_combo.hidePopup())
         self.color_matrix_combo = QComboBox()
         self.color_matrix_combo.addItems(["BT.601", "BT.709"])
+        self.color_matrix_combo.activated.connect(lambda: self.color_matrix_combo.hidePopup())
         self.default_width_spin = QSpinBox()
         self.default_width_spin.setRange(1, 7680)
         self.default_height_spin = QSpinBox()
