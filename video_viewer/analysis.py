@@ -1,6 +1,9 @@
+import logging
 import cv2
 import numpy as np
 from skimage.metrics import structural_similarity as ssim
+
+logger = logging.getLogger(__name__)
 
 class VideoAnalyzer:
     """
@@ -126,6 +129,7 @@ class VideoAnalyzer:
         if img1.shape != img2.shape:
             return 0.0
 
+        logger.debug("Computing PSNR for images of shape %s", img1.shape)
         return cv2.PSNR(img1, img2)
 
     @staticmethod
@@ -137,6 +141,8 @@ class VideoAnalyzer:
             return 0.0
         if img1.shape != img2.shape:
             return 0.0
+
+        logger.debug("Computing SSIM for images of shape %s", img1.shape)
 
         # SSIM needs grayscale usually, or we average channel SSIMs
         # skimage ssim supports multichannel

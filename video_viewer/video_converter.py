@@ -1,15 +1,25 @@
+import logging
 import cv2
 import numpy as np
 import os
 from .video_reader import VideoReader
 from .format_manager import FormatManager, FormatType
 
+logger = logging.getLogger(__name__)
+
 
 class VideoConverter:
     def __init__(self):
         self.format_manager = FormatManager()
 
-    def convert(self, input_path, width, height, input_fmt, output_path, output_fmt):
+    def convert(self, input_path, width, height, input_fmt, output_path, output_fmt,
+                frame_callback=None):
+        """Convert a video file from input_fmt to output_fmt.
+
+        Args:
+            frame_callback: Optional callable(frame_index, total_frames) called after
+                each frame is written. If it returns False, conversion is cancelled.
+        """
         reader = VideoReader(input_path, width, height, input_fmt)
         out_fmt_obj = self.format_manager.get_format(output_fmt)
 
@@ -17,8 +27,11 @@ class VideoConverter:
             raise ValueError(f"Unsupported output format: {output_fmt}")
 
         can_direct = self._can_direct_convert(reader.format, out_fmt_obj)
+        logger.debug("Conversion start: %s -> %s (%dx%d), direct=%s, frames=%d",
+                     input_fmt, output_fmt, width, height, can_direct, reader.total_frames)
 
         converted = 0
+        cancelled = False
         with open(output_path, "wb") as out_f:
             for i in range(reader.total_frames):
                 raw = reader.seek_frame(i)
@@ -47,7 +60,13 @@ class VideoConverter:
                         else:
                             break
 
-        return converted
+                if frame_callback is not None:
+                    if frame_callback(i, reader.total_frames) is False:
+                        cancelled = True
+                        break
+
+        logger.info("Conversion complete: %d frames, %s -> %s", converted, input_fmt, output_fmt)
+        return converted, cancelled
 
     @staticmethod
     def _can_direct_convert(src_fmt, dst_fmt):
@@ -200,6 +219,7 @@ class VideoConverter:
 
     def _direct_convert(self, raw_data, width, height, src_fmt, dst_fmt):
         """Convert raw frame directly between YUV formats via plane manipulation."""
+        logger.debug("Direct convert: %s -> %s (%dx%d)", src_fmt.fourcc, dst_fmt.fourcc, width, height)
         y, u, v = self._extract_yuv_planes(raw_data, width, height, src_fmt)
         if y is None:
             return None
@@ -207,4 +227,6 @@ class VideoConverter:
         # Resample chroma if subsampling differs (e.g., 4:2:0 → 4:2:2)
         u, v = self._resample_chroma(u, v, src_fmt.subsampling, dst_fmt.subsampling)
 
-        return self._pack_yuv(y, u, v, dst_fmt, width, height)
+        result = self._pack_yuv(y, u, v, dst_fmt, width, height)
+        logger.debug("Direct convert done: %s -> %s", src_fmt.fourcc, dst_fmt.fourcc)
+        return result

@@ -1,5 +1,8 @@
+import logging
 import numpy as np
 from enum import Enum, auto
+
+logger = logging.getLogger(__name__)
 
 class FormatType(Enum):
     YUV_PLANAR = auto()
@@ -206,20 +209,24 @@ class FormatManager:
     def get_format(self, key):
         # 1. Exact match
         if key in self.formats:
+            logger.debug("Format lookup '%s': exact match", key)
             return self.formats[key]
 
         # 2. Fuzzy match by FourCC (content inside [])
         # Iterate keys: "Name [FOURCC]"
         for k, v in self.formats.items():
             if f"[{key}]" in k: # e.g. input "YU12" matches "... [YU12]"
+                logger.debug("Format lookup '%s': matched by FourCC -> %s", key, k)
                 return v
 
         # 3. Fuzzy match by Name (start)
         for k, v in self.formats.items():
              # Check if key starts with input "I420" -> "I420 (4:2:0) [YU12]"
              if k.startswith(key + " ") or k == key:
+                 logger.debug("Format lookup '%s': matched by name -> %s", key, k)
                  return v
 
+        logger.warning("Format not found: '%s'", key)
         return None
 
     def get_supported_formats(self):

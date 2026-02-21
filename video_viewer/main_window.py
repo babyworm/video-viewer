@@ -1,5 +1,6 @@
 import os
 import logging
+import time
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QComboBox, QPushButton, QSlider,
                              QFileDialog, QGroupBox, QMenuBar, QStatusBar,
@@ -7,7 +8,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QToolBar, QStyle, QApplication, QTableWidget,
                              QTableWidgetItem, QHeaderView, QProgressDialog,
                              QSpinBox, QCheckBox, QListWidget, QListWidgetItem,
-                             QSizePolicy, QTabWidget)
+                             QSizePolicy, QTabWidget, QMessageBox)
 from PySide6.QtCore import Qt, QTimer, Signal, QSettings, QMimeData, QUrl, QRect
 from PySide6.QtGui import (QImage, QPixmap, QPainter, QColor, QPen, QMouseEvent,
                           QAction, QKeySequence, QDragEnterEvent, QDropEvent,
@@ -17,29 +18,22 @@ import cv2
 
 logger = logging.getLogger(__name__)
 
-from .video_reader import VideoReader
+from .video_reader import VideoReader, FrameDecodeWorker
 from .format_manager import FormatManager
 from .analysis import VideoAnalyzer
 from .comparison_view import ComparisonWindow
+from .constants import (COMMON_RESOLUTIONS, COMMON_GUESS_FORMATS, DARK_STYLE,
+                         ZOOM_MIN, ZOOM_MAX, DEFAULT_FPS_OPTIONS,
+                         DEFAULT_GRID_SIZES, DEFAULT_SUB_GRID_SIZES,
+                         DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT,
+                         DEFAULT_RESOLUTION_WIDTH, DEFAULT_RESOLUTION_HEIGHT,
+                         DEFAULT_SCENE_THRESHOLD, DEFAULT_CACHE_MAX_MEMORY_MB,
+                         DEFAULT_COLOR_MATRIX)
+from .dialogs import (ParametersDialog, ExportDialog, ConvertDialog,
+                      ShortcutsDialog, BatchConvertDialog, PngExportDialog,
+                      SettingsDialog)
 
 import pyqtgraph as pg
-
-# Common resolutions for raw file size guessing (most likely first)
-COMMON_RESOLUTIONS = [
-    (3840, 2160),  # 4K UHD
-    (2560, 1440),  # QHD
-    (1920, 1080),  # FHD
-    (1280, 720),   # HD
-    (720, 576),    # PAL SD
-    (720, 480),    # NTSC SD
-    (640, 480),    # VGA
-    (352, 288),    # CIF
-    (320, 240),    # QVGA
-    (176, 144),    # QCIF
-]
-
-# Format short names to try when guessing (most common first)
-COMMON_GUESS_FORMATS = ["I420", "NV12", "YUYV", "RGB24"]
 
 
 class MarkerSlider(QSlider):
@@ -101,6 +95,8 @@ class ImageCanvas(QWidget):
         self.offset_y = 0
         self.grid_size = 0  # 0 means no grid
         self.sub_grid_size = 0  # 0=none, 2/3/4 = pixel interval
+        self.zoom_min = ZOOM_MIN
+        self.zoom_max = ZOOM_MAX
         self.setMinimumSize(400, 300)
         self.setMouseTracking(True)
         self.last_mouse_pos = None
@@ -121,8 +117,8 @@ class ImageCanvas(QWidget):
         new_scale = old_scale * scale_mult
 
         # Limit zoom? Maybe reasonable bounds
-        if new_scale < 0.1: new_scale = 0.1
-        if new_scale > 50.0: new_scale = 50.0
+        if new_scale < self.zoom_min: new_scale = self.zoom_min
+        if new_scale > self.zoom_max: new_scale = self.zoom_max
 
         self.scale_factor = new_scale
 
@@ -326,396 +322,11 @@ class ImageCanvas(QWidget):
             painter.restore()
 
 
-class ParametersDialog(QDialog):
-    """Dialog for setting width, height, and format parameters."""
-
-    def __init__(self, parent=None, format_manager=None, current_width=1920, current_height=1080, current_format="I420", guess_info=None):
-        super().__init__(parent)
-        self.setWindowTitle("Video Parameters")
-        self.format_manager = format_manager or FormatManager()
-
-        layout = QFormLayout(self)
-
-        # Guess info hint
-        if guess_info:
-            self.lbl_guess = QLabel(guess_info)
-            self.lbl_guess.setStyleSheet("color: #2196F3; font-weight: bold; padding: 4px;")
-            self.lbl_guess.setWordWrap(True)
-            layout.addRow(self.lbl_guess)
-
-        # Width
-        self.txt_width = QLineEdit(str(current_width))
-        layout.addRow("Width:", self.txt_width)
-
-        # Height
-        self.txt_height = QLineEdit(str(current_height))
-        layout.addRow("Height:", self.txt_height)
-
-        # Format
-        self.combo_format = QComboBox()
-        self.combo_format.addItems(self.format_manager.get_supported_formats())
-        if current_format in self.format_manager.get_supported_formats():
-            self.combo_format.setCurrentText(current_format)
-        layout.addRow("Format:", self.combo_format)
-
-        # Buttons
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
-
-    def get_parameters(self):
-        """Returns (width, height, format_name)"""
-        try:
-            width = int(self.txt_width.text())
-            height = int(self.txt_height.text())
-            format_name = self.combo_format.currentText()
-            return width, height, format_name
-        except ValueError:
-            return None, None, None
-
-
-class ExportDialog(QDialog):
-    """Dialog for exporting video clips."""
-
-    def __init__(self, parent=None, total_frames=0, current_frame=0):
-        super().__init__(parent)
-        self.setWindowTitle("Export Clip")
-
-        layout = QFormLayout(self)
-
-        # Start frame
-        self.txt_start = QLineEdit(str(current_frame))
-        layout.addRow("Start Frame:", self.txt_start)
-
-        # End frame
-        self.txt_end = QLineEdit(str(min(current_frame + 100, total_frames - 1)))
-        layout.addRow("End Frame:", self.txt_end)
-
-        # Export format
-        self.combo_export_fmt = QComboBox()
-        self.exportable_formats = [
-            "I420 (4:2:0) [YU12]",
-            "NV12 (4:2:0) [NV12]",
-            "YUYV (4:2:2) [YUYV]",
-            "RGB24 (24-bit) [RGB3]",
-            "BGR24 (24-bit) [BGR3]"
-        ]
-        self.combo_export_fmt.addItems(self.exportable_formats)
-        layout.addRow("Export Format:", self.combo_export_fmt)
-
-        # Buttons
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
-
-    def get_export_settings(self):
-        """Returns (start_frame, end_frame, fourcc) or (None, None, None)"""
-        try:
-            start = int(self.txt_start.text())
-            end = int(self.txt_end.text())
-            fmt_str = self.combo_export_fmt.currentText()
-
-            # Extract FourCC
-            if "[" in fmt_str and "]" in fmt_str:
-                fourcc = fmt_str.split("[")[1].replace("]", "")
-            else:
-                return None, None, None
-
-            return start, end, fourcc
-        except ValueError:
-            return None, None, None
-
-
-class ConvertDialog(QDialog):
-    """Dialog for converting video format."""
-
-    def __init__(self, parent=None, format_manager=None, current_width=1920,
-                 current_height=1080, current_format="I420"):
-        super().__init__(parent)
-        self.setWindowTitle("Convert Format")
-        self.format_manager = format_manager or FormatManager()
-
-        layout = QFormLayout(self)
-
-        # Input info (read-only)
-        self.lbl_input = QLabel("(no file loaded)")
-        layout.addRow("Input:", self.lbl_input)
-
-        self.lbl_input_fmt = QLabel(f"{current_width}x{current_height} {current_format}")
-        layout.addRow("Source:", self.lbl_input_fmt)
-
-        # Output format
-        self.combo_output_fmt = QComboBox()
-        self.combo_output_fmt.addItems(self.format_manager.get_supported_formats())
-        layout.addRow("Output Format:", self.combo_output_fmt)
-
-        # Output path
-        output_row = QHBoxLayout()
-        self.txt_output = QLineEdit()
-        self.txt_output.setPlaceholderText("Select output file...")
-        btn_browse = QPushButton("Browse...")
-        btn_browse.clicked.connect(self._browse_output)
-        output_row.addWidget(self.txt_output, stretch=1)
-        output_row.addWidget(btn_browse)
-        layout.addRow("Output File:", output_row)
-
-        # Buttons
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
-
-    def set_input_info(self, file_path, width, height, fmt_name):
-        self.lbl_input.setText(os.path.basename(file_path))
-        self.lbl_input_fmt.setText(f"{width}x{height} {fmt_name}")
-
-    def _browse_output(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save Converted File", "",
-            "Raw Video (*.yuv *.raw *.rgb);;All Files (*)")
-        if path:
-            self.txt_output.setText(path)
-
-    def get_settings(self):
-        """Returns (output_path, output_format) or (None, None)."""
-        output_path = self.txt_output.text().strip()
-        output_fmt = self.combo_output_fmt.currentText()
-        if output_path:
-            return output_path, output_fmt
-        return None, None
-
-
-class ShortcutsDialog(QDialog):
-    """Dialog showing all keyboard shortcuts."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Keyboard Shortcuts")
-        self.resize(450, 400)
-
-        layout = QVBoxLayout(self)
-        table = QTableWidget()
-        shortcuts = [
-            ("Space", "Play / Pause"),
-            ("Left", "Previous frame"),
-            ("Right", "Next frame"),
-            ("Ctrl+C", "Copy frame to clipboard"),
-            ("Ctrl+O", "Open file"),
-            ("Ctrl+S", "Save frame"),
-            ("Ctrl+E", "Export clip"),
-            ("Ctrl+Q", "Exit"),
-            ("F", "Fit to view"),
-            ("1", "Zoom 1:1"),
-            ("G", "Toggle grid"),
-            ("B", "Toggle bookmark"),
-            ("Ctrl+Right", "Next scene change"),
-            ("Ctrl+Left", "Prev scene change"),
-            ("Ctrl+B", "Next bookmark"),
-            ("Ctrl+Shift+B", "Prev bookmark"),
-            ("Right-click drag", "Select ROI"),
-        ]
-        table.setRowCount(len(shortcuts))
-        table.setColumnCount(2)
-        table.setHorizontalHeaderLabels(["Shortcut", "Action"])
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        for i, (key, desc) in enumerate(shortcuts):
-            table.setItem(i, 0, QTableWidgetItem(key))
-            table.setItem(i, 1, QTableWidgetItem(desc))
-        layout.addWidget(table)
-
-        btn = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
-        btn.accepted.connect(self.accept)
-        layout.addWidget(btn)
-
-
-class BatchConvertDialog(QDialog):
-    """Dialog for batch format conversion."""
-
-    def __init__(self, parent=None, format_manager=None):
-        super().__init__(parent)
-        self.setWindowTitle("Batch Convert")
-        self.resize(500, 400)
-        self.format_manager = format_manager or FormatManager()
-        self.file_list = []
-
-        layout = QVBoxLayout(self)
-
-        # File list
-        layout.addWidget(QLabel("Input Files:"))
-        self.list_widget = QListWidget()
-        layout.addWidget(self.list_widget)
-
-        btn_row = QHBoxLayout()
-        btn_add = QPushButton("Add Files...")
-        btn_add.clicked.connect(self._add_files)
-        btn_clear = QPushButton("Clear")
-        btn_clear.clicked.connect(self._clear_files)
-        btn_row.addWidget(btn_add)
-        btn_row.addWidget(btn_clear)
-        layout.addLayout(btn_row)
-
-        # Parameters
-        form = QFormLayout()
-        self.txt_width = QLineEdit("1920")
-        form.addRow("Width:", self.txt_width)
-        self.txt_height = QLineEdit("1080")
-        form.addRow("Height:", self.txt_height)
-        self.combo_input_fmt = QComboBox()
-        self.combo_input_fmt.addItems(self.format_manager.get_supported_formats())
-        form.addRow("Input Format:", self.combo_input_fmt)
-        self.combo_output_fmt = QComboBox()
-        self.combo_output_fmt.addItems(self.format_manager.get_supported_formats())
-        form.addRow("Output Format:", self.combo_output_fmt)
-        layout.addLayout(form)
-
-        # Output dir
-        dir_row = QHBoxLayout()
-        self.txt_output_dir = QLineEdit()
-        self.txt_output_dir.setPlaceholderText("Output directory...")
-        btn_dir = QPushButton("Browse...")
-        btn_dir.clicked.connect(self._browse_dir)
-        dir_row.addWidget(self.txt_output_dir, stretch=1)
-        dir_row.addWidget(btn_dir)
-        form.addRow("Output Dir:", dir_row)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def _add_files(self):
-        files, _ = QFileDialog.getOpenFileNames(
-            self, "Select Video Files", "",
-            "Raw Video (*.yuv *.raw *.rgb *.y4m);;All Files (*)")
-        for f in files:
-            self.file_list.append(f)
-            self.list_widget.addItem(os.path.basename(f))
-
-    def _clear_files(self):
-        self.file_list.clear()
-        self.list_widget.clear()
-
-    def _browse_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "Select Output Directory")
-        if d:
-            self.txt_output_dir.setText(d)
-
-    def get_settings(self):
-        try:
-            w = int(self.txt_width.text())
-            h = int(self.txt_height.text())
-        except ValueError:
-            return None
-        return {
-            "files": self.file_list,
-            "width": w, "height": h,
-            "input_fmt": self.combo_input_fmt.currentText(),
-            "output_fmt": self.combo_output_fmt.currentText(),
-            "output_dir": self.txt_output_dir.text().strip(),
-        }
-
-
-class PngExportDialog(QDialog):
-    """Dialog for PNG sequence export."""
-
-    def __init__(self, parent=None, total_frames=0, current_frame=0):
-        super().__init__(parent)
-        self.setWindowTitle("Export PNG Sequence")
-
-        layout = QFormLayout(self)
-        self.spin_start = QSpinBox()
-        self.spin_start.setRange(0, max(0, total_frames - 1))
-        self.spin_start.setValue(current_frame)
-        layout.addRow("Start Frame:", self.spin_start)
-
-        self.spin_end = QSpinBox()
-        self.spin_end.setRange(0, max(0, total_frames - 1))
-        self.spin_end.setValue(min(current_frame + 30, total_frames - 1))
-        layout.addRow("End Frame:", self.spin_end)
-
-        dir_row = QHBoxLayout()
-        self.txt_dir = QLineEdit()
-        self.txt_dir.setPlaceholderText("Output directory...")
-        btn = QPushButton("Browse...")
-        btn.clicked.connect(self._browse)
-        dir_row.addWidget(self.txt_dir, stretch=1)
-        dir_row.addWidget(btn)
-        layout.addRow("Directory:", dir_row)
-
-        self.txt_prefix = QLineEdit("frame")
-        layout.addRow("Prefix:", self.txt_prefix)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
-
-    def _browse(self):
-        d = QFileDialog.getExistingDirectory(self, "Select Output Directory")
-        if d:
-            self.txt_dir.setText(d)
-
-    def get_settings(self):
-        d = self.txt_dir.text().strip()
-        if not d:
-            return None
-        return {
-            "start": self.spin_start.value(),
-            "end": self.spin_end.value(),
-            "directory": d,
-            "prefix": self.txt_prefix.text() or "frame",
-        }
-
-
-# Dark theme stylesheet
-DARK_STYLE = """
-QMainWindow, QDialog { background-color: #2b2b2b; color: #dcdcdc; }
-QWidget { background-color: #2b2b2b; color: #dcdcdc; }
-QMenuBar { background-color: #3c3f41; color: #dcdcdc; }
-QMenuBar::item:selected { background-color: #4b6eaf; }
-QMenu { background-color: #3c3f41; color: #dcdcdc; border: 1px solid #555; }
-QMenu::item:selected { background-color: #4b6eaf; }
-QToolBar { background-color: #3c3f41; border: none; spacing: 3px; }
-QStatusBar { background-color: #3c3f41; color: #dcdcdc; }
-QGroupBox { border: 1px solid #555; border-radius: 4px; margin-top: 8px;
-            padding-top: 8px; color: #dcdcdc; }
-QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 3px; }
-QLabel { color: #dcdcdc; }
-QLineEdit, QComboBox, QSpinBox { background-color: #45494a; color: #dcdcdc;
-    border: 1px solid #646464; border-radius: 3px; padding: 2px; }
-QPushButton { background-color: #4b6eaf; color: white; border: none;
-    border-radius: 3px; padding: 4px 12px; }
-QPushButton:hover { background-color: #5a7fbf; }
-QPushButton:pressed { background-color: #3d5a8f; }
-QSlider::groove:horizontal { background: #555; height: 6px; border-radius: 3px; }
-QSlider::handle:horizontal { background: #4b6eaf; width: 14px; margin: -4px 0;
-    border-radius: 7px; }
-QDockWidget { titlebar-close-icon: none; color: #dcdcdc; }
-QDockWidget::title { background-color: #3c3f41; padding: 4px; }
-QTabWidget::pane { border: 1px solid #555; }
-QTabBar::tab { background-color: #3c3f41; color: #dcdcdc; padding: 6px 12px; }
-QTabBar::tab:selected { background-color: #4b6eaf; }
-QTableWidget { background-color: #2b2b2b; color: #dcdcdc; gridline-color: #555; }
-QHeaderView::section { background-color: #3c3f41; color: #dcdcdc; border: 1px solid #555; }
-QListWidget { background-color: #2b2b2b; color: #dcdcdc; }
-QScrollBar:vertical { background: #2b2b2b; width: 12px; }
-QScrollBar::handle:vertical { background: #555; border-radius: 6px; }
-QScrollBar:horizontal { background: #2b2b2b; height: 12px; }
-QScrollBar::handle:horizontal { background: #555; border-radius: 6px; }
-"""
-
-
 class MainWindow(QMainWindow):
-    def __init__(self, file_path=None, width=1920, height=1080, fmt="I420"):
+    def __init__(self, file_path=None, width=DEFAULT_RESOLUTION_WIDTH, height=DEFAULT_RESOLUTION_HEIGHT, fmt="I420"):
         super().__init__()
         self.setWindowTitle("YUV/RAW Video Viewer")
-        self.resize(1200, 800)
+        self.resize(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
 
         self.reader = None
         self.current_frame_idx = 0
@@ -733,11 +344,11 @@ class MainWindow(QMainWindow):
         self.current_format = fmt
 
         # Grid state for keyboard toggle
-        self.grid_sizes = [0, 16, 32, 64, 128]
+        self.grid_sizes = list(DEFAULT_GRID_SIZES)
         self.current_grid_idx = 0
 
         # Sub-grid state for keyboard toggle (Shift+G)
-        self.sub_grid_sizes = [0, 4, 8, 16]
+        self.sub_grid_sizes = list(DEFAULT_SUB_GRID_SIZES)
         self.current_sub_grid_idx = 0
 
         # Playback state (Phase 2)
@@ -1056,12 +667,28 @@ class MainWindow(QMainWindow):
         scene_detect_action.triggered.connect(self.detect_scene_changes)
         tools_menu.addAction(scene_detect_action)
 
+        self._save_scene_action = QAction("Save Scene List...", self)
+        self._save_scene_action.triggered.connect(self._save_scene_list)
+        self._save_scene_action.setEnabled(False)
+        tools_menu.addAction(self._save_scene_action)
+
+        self._load_scene_action = QAction("Load Scene List...", self)
+        self._load_scene_action.triggered.connect(self._load_scene_list)
+        self._load_scene_action.setEnabled(False)
+        tools_menu.addAction(self._load_scene_action)
+
         tools_menu.addSeparator()
 
         # Parameters
         params_action = QAction("Parameters", self)
         params_action.triggered.connect(self.show_parameters_dialog)
         tools_menu.addAction(params_action)
+
+        tools_menu.addSeparator()
+
+        settings_action = QAction("Settings...", self)
+        settings_action.triggered.connect(self._open_settings)
+        tools_menu.addAction(settings_action)
 
         # Color Matrix submenu
         color_menu = QMenu("Color Matrix", self)
@@ -1148,14 +775,14 @@ class MainWindow(QMainWindow):
         act_fit.triggered.connect(self.canvas.fit_to_view)
 
         # Zoom 1:1 (100%)
-        act_zoom_100 = toolbar.addAction(self._create_zoom_icon("1:1"), "1:1")
-        act_zoom_100.setToolTip("Zoom 100% (1:1)")
-        act_zoom_100.triggered.connect(lambda: self.canvas.set_scale(1.0))
+        self._act_zoom_100 = toolbar.addAction(self._create_zoom_icon("1:1"), "1:1")
+        self._act_zoom_100.setToolTip("Zoom 100% (1:1)")
+        self._act_zoom_100.triggered.connect(lambda: self.canvas.set_scale(1.0))
 
         # Zoom 2:1 (200%)
-        act_zoom_200 = toolbar.addAction(self._create_zoom_icon("2:1"), "2:1")
-        act_zoom_200.setToolTip("Zoom 200% (2:1)")
-        act_zoom_200.triggered.connect(lambda: self.canvas.set_scale(2.0))
+        self._act_zoom_200 = toolbar.addAction(self._create_zoom_icon("2:1"), "2:1")
+        self._act_zoom_200.setToolTip("Zoom 200% (2:1)")
+        self._act_zoom_200.triggered.connect(lambda: self.canvas.set_scale(2.0))
 
         # Grid Toggle
         act_grid = toolbar.addAction(
@@ -1164,18 +791,46 @@ class MainWindow(QMainWindow):
         act_grid.triggered.connect(self._toggle_grid)
 
         # Sub-grid Toggle
-        act_sub_grid = toolbar.addAction(
+        self._act_sub_grid = toolbar.addAction(
             self._create_sub_grid_icon(), "Sub")
-        act_sub_grid.setToolTip("Toggle Sub-grid (Shift+G)")
-        act_sub_grid.triggered.connect(self._toggle_sub_grid)
+        self._act_sub_grid.setToolTip("Toggle Sub-grid (Shift+G)")
+        self._act_sub_grid.triggered.connect(self._toggle_sub_grid)
+
+        toolbar.addSeparator()
+
+        # Component view buttons
+        self._act_comp_full = toolbar.addAction(
+            self._create_component_icon("RGB", None), "Full")
+        self._act_comp_full.setToolTip("Full RGB (0)")
+        self._act_comp_full.triggered.connect(lambda: self.set_component(0))
+
+        self._act_comp_y = toolbar.addAction(
+            self._create_component_icon("Y", QColor(255, 80, 80)), "Y/R")
+        self._act_comp_y.setToolTip("Channel Y/R (1)")
+        self._act_comp_y.triggered.connect(lambda: self.set_component(1))
+
+        self._act_comp_u = toolbar.addAction(
+            self._create_component_icon("U", QColor(80, 200, 80)), "U/G")
+        self._act_comp_u.setToolTip("Channel U/G (2)")
+        self._act_comp_u.triggered.connect(lambda: self.set_component(2))
+
+        self._act_comp_v = toolbar.addAction(
+            self._create_component_icon("V", QColor(80, 130, 255)), "V/B")
+        self._act_comp_v.setToolTip("Channel V/B (3)")
+        self._act_comp_v.triggered.connect(lambda: self.set_component(3))
+
+        self._act_comp_split = toolbar.addAction(
+            self._create_split_icon(), "Split")
+        self._act_comp_split.setToolTip("Split 2x2 View (4)")
+        self._act_comp_split.triggered.connect(lambda: self.set_component(4))
 
         toolbar.addSeparator()
 
         # Compare
-        act_compare = toolbar.addAction(
+        self._act_compare = toolbar.addAction(
             self._create_ab_icon(), "Compare")
-        act_compare.setToolTip("A/B Compare View")
-        act_compare.triggered.connect(self.show_comparison_window)
+        self._act_compare.setToolTip("A/B Compare View")
+        self._act_compare.triggered.connect(self.show_comparison_window)
 
         # Convert
         act_convert = toolbar.addAction(
@@ -1199,14 +854,19 @@ class MainWindow(QMainWindow):
 
         self.addToolBar(toolbar)
 
+    def _is_dark_theme(self):
+        """Check if dark theme is currently active."""
+        return self._dark_theme
+
     def _create_ab_icon(self):
         """Create a custom A|B comparison icon."""
+        dark = self._is_dark_theme()
         size = 24
         pixmap = QPixmap(size, size)
-        pixmap.fill(QColor(60, 63, 65))
+        pixmap.fill(QColor(60, 63, 65) if dark else QColor(240, 240, 240))
         p = QPainter(pixmap)
         # Left half - blue "A"
-        p.setPen(QColor(100, 160, 255))
+        p.setPen(QColor(100, 160, 255) if dark else QColor(30, 90, 200))
         p.setFont(p.font())
         font = p.font()
         font.setBold(True)
@@ -1214,47 +874,49 @@ class MainWindow(QMainWindow):
         p.setFont(font)
         p.drawText(QRect(0, 0, 12, size), Qt.AlignmentFlag.AlignCenter, "A")
         # Divider
-        p.setPen(QPen(QColor(200, 200, 0), 1))
+        p.setPen(QPen(QColor(200, 200, 0) if dark else QColor(140, 140, 0), 1))
         p.drawLine(12, 2, 12, size - 2)
         # Right half - green "B"
-        p.setPen(QColor(100, 255, 160))
+        p.setPen(QColor(100, 255, 160) if dark else QColor(0, 160, 80))
         p.drawText(QRect(12, 0, 12, size), Qt.AlignmentFlag.AlignCenter, "B")
         p.end()
         return QIcon(pixmap)
 
     def _create_zoom_icon(self, label):
         """Create a custom zoom icon with text label (e.g. '1:1', '2:1')."""
+        dark = self._is_dark_theme()
         size = 24
         pixmap = QPixmap(size, size)
-        pixmap.fill(QColor(60, 63, 65))
+        pixmap.fill(QColor(60, 63, 65) if dark else QColor(240, 240, 240))
         p = QPainter(pixmap)
         # Draw magnifier circle
-        p.setPen(QPen(QColor(180, 200, 220), 1.5))
+        p.setPen(QPen(QColor(180, 200, 220) if dark else QColor(60, 80, 120), 1.5))
         p.drawEllipse(2, 2, 16, 16)
         # Draw handle
-        p.setPen(QPen(QColor(140, 160, 180), 2))
+        p.setPen(QPen(QColor(140, 160, 180) if dark else QColor(60, 60, 60), 2))
         p.drawLine(16, 16, 22, 22)
         # Draw label text
         font = p.font()
         font.setPixelSize(8)
         font.setBold(True)
         p.setFont(font)
-        p.setPen(QColor(255, 255, 100))
+        p.setPen(QColor(255, 255, 100) if dark else QColor(120, 100, 0))
         p.drawText(1, 3, 18, 15, Qt.AlignmentFlag.AlignCenter, label)
         p.end()
         return QIcon(pixmap)
 
     def _create_sub_grid_icon(self):
-        """Create a custom sub-grid icon: small yellow dotted grid on dark background."""
+        """Create a custom sub-grid icon: small yellow dotted grid on dark/light background."""
+        dark = self._is_dark_theme()
         size = 24
         pixmap = QPixmap(size, size)
-        pixmap.fill(QColor(60, 63, 65))
+        pixmap.fill(QColor(60, 63, 65) if dark else QColor(240, 240, 240))
         p = QPainter(pixmap)
         # Outer border (green, like main grid)
-        p.setPen(QPen(QColor(0, 200, 0, 180), 1))
+        p.setPen(QPen(QColor(0, 200, 0, 180) if dark else QColor(0, 140, 0, 200), 1))
         p.drawRect(1, 1, size - 3, size - 3)
         # Inner sub-grid lines (yellow dotted)
-        pen = QPen(QColor(255, 220, 0, 200), 1, Qt.PenStyle.DotLine)
+        pen = QPen(QColor(255, 220, 0, 200) if dark else QColor(160, 120, 0, 220), 1, Qt.PenStyle.DotLine)
         p.setPen(pen)
         step = (size - 4) // 4
         for i in range(1, 4):
@@ -1264,6 +926,82 @@ class MainWindow(QMainWindow):
             p.drawLine(2, y, size - 3, y)
         p.end()
         return QIcon(pixmap)
+
+    def _create_component_icon(self, label, color):
+        """Create a component channel icon with colored label."""
+        dark = self._is_dark_theme()
+        size = 24
+        pixmap = QPixmap(size, size)
+        bg = QColor(60, 63, 65) if dark else QColor(240, 240, 240)
+        pixmap.fill(bg)
+        p = QPainter(pixmap)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        font = p.font()
+        font.setBold(True)
+        font.setPixelSize(13)
+        p.setFont(font)
+        if color is None:
+            # RGB full - draw with three colors
+            p.setPen(QColor(255, 80, 80))
+            p.drawText(QRect(0, 0, 10, size), Qt.AlignmentFlag.AlignCenter, "R")
+            p.setPen(QColor(80, 200, 80))
+            p.drawText(QRect(7, 0, 10, size), Qt.AlignmentFlag.AlignCenter, "G")
+            p.setPen(QColor(80, 130, 255))
+            p.drawText(QRect(14, 0, 10, size), Qt.AlignmentFlag.AlignCenter, "B")
+        else:
+            # Single channel
+            fg = color if dark else color.darker(130)
+            p.setPen(fg)
+            p.drawText(QRect(0, 0, size, size), Qt.AlignmentFlag.AlignCenter, label)
+        p.end()
+        return QIcon(pixmap)
+
+    def _create_split_icon(self):
+        """Create a 2x2 split view icon."""
+        dark = self._is_dark_theme()
+        size = 24
+        pixmap = QPixmap(size, size)
+        bg = QColor(60, 63, 65) if dark else QColor(240, 240, 240)
+        pixmap.fill(bg)
+        p = QPainter(pixmap)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        line_color = QColor(180, 180, 180) if dark else QColor(100, 100, 100)
+        p.setPen(QPen(line_color, 1.5))
+        m = 3  # margin
+        # Outer rect
+        p.drawRect(m, m, size - 2 * m, size - 2 * m)
+        # Cross dividers
+        mid = size // 2
+        p.drawLine(mid, m, mid, size - m)
+        p.drawLine(m, mid, size - m, mid)
+        # Color each quadrant label
+        font = p.font()
+        font.setBold(True)
+        font.setPixelSize(8)
+        p.setFont(font)
+        half = size // 2
+        p.setPen(QColor(255, 80, 80))
+        p.drawText(QRect(m, m, half - m, half - m), Qt.AlignmentFlag.AlignCenter, "Y")
+        p.setPen(QColor(80, 200, 80))
+        p.drawText(QRect(half, m, half - m, half - m), Qt.AlignmentFlag.AlignCenter, "U")
+        p.setPen(QColor(80, 130, 255))
+        p.drawText(QRect(m, half, half - m, half - m), Qt.AlignmentFlag.AlignCenter, "V")
+        p.setPen(QColor(200, 200, 200) if dark else QColor(80, 80, 80))
+        p.drawText(QRect(half, half, half - m, half - m), Qt.AlignmentFlag.AlignCenter, "A")
+        p.end()
+        return QIcon(pixmap)
+
+    def _refresh_custom_icons(self):
+        """Recreate custom toolbar icons for the current theme."""
+        self._act_zoom_100.setIcon(self._create_zoom_icon("1:1"))
+        self._act_zoom_200.setIcon(self._create_zoom_icon("2:1"))
+        self._act_sub_grid.setIcon(self._create_sub_grid_icon())
+        self._act_compare.setIcon(self._create_ab_icon())
+        self._act_comp_full.setIcon(self._create_component_icon("RGB", None))
+        self._act_comp_y.setIcon(self._create_component_icon("Y", QColor(255, 80, 80)))
+        self._act_comp_u.setIcon(self._create_component_icon("U", QColor(80, 200, 80)))
+        self._act_comp_v.setIcon(self._create_component_icon("V", QColor(80, 130, 255)))
+        self._act_comp_split.setIcon(self._create_split_icon())
 
     def show_console_message(self, msg):
         """Show a message in the console panel. Persists until next message."""
@@ -1356,7 +1094,7 @@ class MainWindow(QMainWindow):
 
         # FPS dropdown (for Phase 2)
         self.combo_fps = QComboBox()
-        self.combo_fps.addItems(["1", "5", "10", "15", "24", "25", "30", "60"])
+        self.combo_fps.addItems(DEFAULT_FPS_OPTIONS)
         self.combo_fps.setCurrentText("30")
         self.combo_fps.setFixedWidth(60)
         self.combo_fps.currentTextChanged.connect(self._update_playback_fps)
@@ -1366,6 +1104,11 @@ class MainWindow(QMainWindow):
         # Initialize playback timer (Phase 2)
         self.playback_timer = QTimer()
         self.playback_timer.timeout.connect(self._on_playback_tick)
+
+        # Background decode worker for threaded playback
+        self._decode_worker = FrameDecodeWorker(self)
+        self._decode_worker.frame_ready.connect(self._on_frame_decoded)
+        self._playback_generation = 0  # Generation counter to ignore stale frames
 
         return nav_widget
 
@@ -1638,7 +1381,7 @@ class MainWindow(QMainWindow):
                 try:
                     from .video_converter import VideoConverter
                     converter = VideoConverter()
-                    count = converter.convert(self.current_file_path,
+                    count, _cancelled = converter.convert(self.current_file_path,
                                       self.current_width, self.current_height,
                                       self.current_format,
                                       output_path, output_fmt)
@@ -1785,6 +1528,8 @@ class MainWindow(QMainWindow):
         if not self.is_playing:
             # Start playback
             self.is_playing = True
+            self._playback_generation += 1
+            self._decode_worker.set_reader(self.reader)
             self.btn_play.setText("❚❚")
             self.act_play.setIcon(
                 style.standardIcon(QStyle.StandardPixmap.SP_MediaPause))
@@ -1797,13 +1542,14 @@ class MainWindow(QMainWindow):
         else:
             # Pause playback
             self.is_playing = False
+            self._playback_generation += 1
             self.btn_play.setText("▶")
             self.act_play.setIcon(
                 style.standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
             self.playback_timer.stop()
 
     def _on_playback_tick(self):
-        """Handle playback timer tick - advance to next frame."""
+        """Handle playback timer tick - request next frame decode in background."""
         if not self.reader:
             self.playback_timer.stop()
             return
@@ -1820,10 +1566,28 @@ class MainWindow(QMainWindow):
                 self.toggle_playback()
                 return
 
-        # Use programmatic flag to avoid pausing on slider change
+        # Request decode from worker; skip this tick if worker is busy (drop frame)
+        if not self._decode_worker.request_frame(next_idx, self._playback_generation):
+            return
+
+        # Update frame index and slider immediately (display will follow via signal)
+        self.current_frame_idx = next_idx
         self._programmatic_slider_change = True
         self.slider_frame.setValue(next_idx)
         self._programmatic_slider_change = False
+
+    def _on_frame_decoded(self, generation, frame_idx, rgb):
+        """Slot called when background decode worker finishes a frame."""
+        # Ignore stale frames from a previous playback session or different video
+        if generation != self._playback_generation:
+            return
+
+        if rgb is not None:
+            if not rgb.flags['C_CONTIGUOUS']:
+                rgb = np.ascontiguousarray(rgb)
+            self.canvas.set_image(rgb)
+            self.current_rgb_frame = rgb
+            self.update_status_bar()
 
     def _update_playback_fps(self):
         """Update playback timer interval when FPS changes."""
@@ -1929,8 +1693,14 @@ class MainWindow(QMainWindow):
             return
 
         try:
+            # Stop playback and wait for worker before switching reader
+            if self.is_playing:
+                self.toggle_playback()
+            self._decode_worker.stop_worker()
+
             self.reader = VideoReader(self.current_file_path, self.current_width,
                                      self.current_height, self.current_format)
+            self._decode_worker.set_reader(self.reader)
 
             # Update parameters if reader detected different properties (e.g. Y4M)
             if self.reader.is_y4m:
@@ -1944,6 +1714,8 @@ class MainWindow(QMainWindow):
             self.bookmarks = set()
             self._scene_changes = []
             self.slider_frame.setValue(0)
+            self._save_scene_action.setEnabled(False)
+            self._load_scene_action.setEnabled(True)
 
             # Update sidebar file info
             self.update_file_info()
@@ -2499,6 +2271,7 @@ class MainWindow(QMainWindow):
         else:
             app.setStyleSheet("")
         self._settings.setValue("dark_theme", enable)
+        self._refresh_custom_icons()
 
     def toggle_theme(self):
         self.apply_dark_theme(not self._dark_theme)
@@ -2516,6 +2289,11 @@ class MainWindow(QMainWindow):
         self.dock_analysis.setVisible(False)
 
     def closeEvent(self, event):
+        # Stop playback and decode worker
+        if self.is_playing:
+            self.toggle_playback()
+        self._decode_worker.stop_worker()
+
         self._settings.setValue("geometry", self.saveGeometry())
         self._settings.setValue("windowState", self.saveState())
         # Close all tab readers
@@ -2552,31 +2330,104 @@ class MainWindow(QMainWindow):
 
     def _run_batch_convert(self, settings):
         from .video_converter import VideoConverter
+        from .video_reader import VideoReader
+
         converter = VideoConverter()
-        total = len(settings["files"])
-        progress = QProgressDialog("Converting...", "Cancel", 0, total, self)
+        files = settings["files"]
+        file_count = len(files)
+
+        # Calculate total frames across all files up front
+        total_frames = 0
+        frame_counts = []
+        for fpath in files:
+            try:
+                r = VideoReader(fpath, settings["width"], settings["height"],
+                                settings["input_fmt"])
+                fc = r.total_frames
+            except Exception:
+                fc = 0
+            frame_counts.append(fc)
+            total_frames += fc
+
+        progress = QProgressDialog("Preparing...", "Cancel", 0, max(total_frames, 1), self)
         progress.setWindowTitle("Batch Convert")
         progress.setMinimumDuration(0)
+        progress.setValue(0)
+        QApplication.processEvents()
 
-        for i, fpath in enumerate(settings["files"]):
+        errors = []
+        frames_done = 0
+        start_time = time.time()
+        cancelled = False
+
+        for file_idx, fpath in enumerate(files):
             if progress.wasCanceled():
+                cancelled = True
                 break
-            progress.setValue(i)
-            progress.setLabelText(f"Converting {os.path.basename(fpath)}...")
-            QApplication.processEvents()
 
-            base = os.path.splitext(os.path.basename(fpath))[0]
+            fname = os.path.basename(fpath)
+            file_total_frames = frame_counts[file_idx]
+            file_frame_offset = frames_done
+
+            def make_callback(file_i, _fname, file_total, file_offset):
+                def frame_callback(frame_i, _total):
+                    nonlocal frames_done
+                    frames_done = file_offset + frame_i + 1
+                    elapsed = time.time() - start_time
+                    if frames_done > 0 and elapsed > 0:
+                        fps_rate = frames_done / elapsed
+                        remaining_frames = total_frames - frames_done
+                        eta_secs = remaining_frames / fps_rate if fps_rate > 0 else 0
+                        elapsed_str = f"{int(elapsed // 60)}:{int(elapsed % 60):02d}"
+                        eta_str = f"{int(eta_secs // 60)}:{int(eta_secs % 60):02d}"
+                        time_line = f"Elapsed: {elapsed_str} | Remaining: ~{eta_str}"
+                    else:
+                        time_line = "Elapsed: 0:00 | Remaining: ~?"
+                    label = (
+                        f"Converting {_fname} (File {file_i + 1}/{file_count})"
+                        f" - Frame {frame_i + 1}/{file_total}\n{time_line}"
+                    )
+                    progress.setLabelText(label)
+                    progress.setValue(frames_done)
+                    QApplication.processEvents()
+                    if progress.wasCanceled():
+                        return False
+                    return True
+                return frame_callback
+
+            cb = make_callback(file_idx, fname, file_total_frames, file_frame_offset)
+
+            base = os.path.splitext(fname)[0]
             out_path = os.path.join(settings["output_dir"], f"{base}_converted.yuv")
             try:
-                converter.convert(fpath, settings["width"], settings["height"],
-                                  settings["input_fmt"], out_path, settings["output_fmt"])
+                _converted, file_cancelled = converter.convert(
+                    fpath, settings["width"], settings["height"],
+                    settings["input_fmt"], out_path, settings["output_fmt"],
+                    frame_callback=cb)
+                if file_cancelled:
+                    cancelled = True
+                    break
+                frames_done = sum(frame_counts[:file_idx + 1])
             except Exception as e:
                 logger.error(f"Batch convert error for {fpath}: {e}")
+                errors.append((fname, str(e)))
+                frames_done = sum(frame_counts[:file_idx + 1])
 
-        progress.setValue(total)
-        self.show_console_message(
-            f"Batch convert complete: {total} files, "
-            f"{settings['input_fmt']} → {settings['output_fmt']}")
+        progress.setValue(total_frames)
+
+        summary = (
+            f"Batch convert {'cancelled' if cancelled else 'complete'}: "
+            f"{file_count} files, "
+            f"{settings['input_fmt']} → {settings['output_fmt']}"
+        )
+        self.show_console_message(summary)
+
+        if errors:
+            error_text = "\n".join(f"  {fname}: {msg}" for fname, msg in errors)
+            QMessageBox.warning(
+                self, "Batch Convert Errors",
+                f"{len(errors)} file(s) failed:\n\n{error_text}"
+            )
 
     # ── PNG Sequence Export ──
     def show_png_export_dialog(self):
@@ -2708,7 +2559,7 @@ class MainWindow(QMainWindow):
 
     # ── Scene Change Detection ──
     _SCENE_ALGORITHMS = [
-        ("Mean Pixel Difference (MAD)", 45.0),
+        ("Mean Pixel Difference (MAD)", DEFAULT_SCENE_THRESHOLD),
         ("Histogram Comparison", 30.0),
         ("SSIM (Structural Similarity)", 40.0),
     ]
@@ -2789,6 +2640,9 @@ class MainWindow(QMainWindow):
         progress.setValue(total - 1)
         progress.close()
         self.slider_frame.set_scene_markers(self._scene_changes)
+        self._last_scene_algorithm = algo_name
+        self._last_scene_threshold = threshold
+        self._save_scene_action.setEnabled(bool(self._scene_changes))
 
         count = len(self._scene_changes)
         if count > 0:
@@ -2811,6 +2665,79 @@ class MainWindow(QMainWindow):
         lower = [s for s in self._scene_changes if s < self.current_frame_idx]
         if lower:
             self.slider_frame.setValue(lower[-1])
+
+    def _save_scene_list(self):
+        """Export scene changes to JSON file."""
+        if not self._scene_changes:
+            return
+
+        import json
+        default_name = ""
+        if hasattr(self, 'current_file_path') and self.current_file_path:
+            base = os.path.splitext(os.path.basename(self.current_file_path))[0]
+            default_name = f"{base}_scenes.json"
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Scene List", default_name, "JSON Files (*.json)")
+        if not path:
+            return
+
+        data = {
+            "version": 1,
+            "source_file": os.path.basename(self.current_file_path) if hasattr(self, 'current_file_path') and self.current_file_path else "",
+            "width": self.reader.width if self.reader else 0,
+            "height": self.reader.height if self.reader else 0,
+            "format": self.current_format if hasattr(self, 'current_format') else "",
+            "total_frames": self.reader.total_frames if self.reader else 0,
+            "algorithm": self._last_scene_algorithm if hasattr(self, '_last_scene_algorithm') else "",
+            "threshold": self._last_scene_threshold if hasattr(self, '_last_scene_threshold') else 0,
+            "scene_changes": sorted(self._scene_changes),
+        }
+
+        with open(path, 'w') as f:
+            json.dump(data, f, indent=2)
+
+        self.status_bar.showMessage(f"Saved {len(self._scene_changes)} scene changes to {os.path.basename(path)}", 3000)
+
+    def _load_scene_list(self):
+        """Import scene changes from JSON file."""
+        import json
+
+        if not self.reader:
+            QMessageBox.warning(self, "Error", "No video is currently open.")
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Scene List", "", "JSON Files (*.json)")
+        if not path:
+            return
+
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to read file:\n{e}")
+            return
+
+        if "scene_changes" not in data:
+            QMessageBox.warning(self, "Error", "Invalid scene list file.")
+            return
+
+        if "total_frames" in data and data["total_frames"] != self.reader.total_frames:
+            ret = QMessageBox.warning(
+                self, "Frame Count Mismatch",
+                f"Scene list has {data['total_frames']} frames but current video has {self.reader.total_frames} frames.\nProceed anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+
+        self._scene_changes = sorted(data["scene_changes"])
+        self.slider_frame.set_scene_markers(self._scene_changes)
+        self._save_scene_action.setEnabled(bool(self._scene_changes))
+
+        count = len(self._scene_changes)
+        self.status_bar.showMessage(f"Loaded {count} scene changes from {os.path.basename(path)}", 3000)
+        self.show_console_message(f"Loaded {count} scene changes from {os.path.basename(path)}")
 
     # ── ROI ──
     def _on_roi_selected(self, x, y, w, h):
@@ -2927,12 +2854,21 @@ class MainWindow(QMainWindow):
         if index == self._current_tab_idx:
             return
 
+        # Pause playback before switching tabs
+        if self.is_playing:
+            self.toggle_playback()
+        # Wait for any in-progress decode to finish
+        self._decode_worker.stop_worker()
+
         # Save old tab state
         self._save_current_tab_state()
 
         # Restore new tab state
         self._current_tab_idx = index
         self._restore_tab_state(index)
+
+        # Update worker with new reader
+        self._decode_worker.set_reader(self.reader)
 
     def _close_tab(self, index):
         """Close a tab and clean up its resources."""
@@ -2970,3 +2906,48 @@ class MainWindow(QMainWindow):
         # Hide tab bar when only 1 tab
         self.tab_bar.setVisible(len(self._tab_states) >= 2)
         self.status_bar.showMessage(f"Closed: {os.path.basename(state['file_path'])}", 2000)
+
+    # ── Settings ──
+    def _open_settings(self):
+        """Open the Settings dialog and apply changes on accept."""
+        dialog = SettingsDialog(self)
+        dialog.load_settings(self._settings)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            dialog.save_settings(self._settings)
+            self._apply_settings(self._settings)
+
+    def _apply_settings(self, settings: QSettings):
+        """Apply persisted settings to live application state."""
+        settings.beginGroup("preferences")
+
+        # Zoom bounds — update canvas instance attributes directly
+        zoom_min = settings.value("zoom_min", ZOOM_MIN, type=float)
+        zoom_max = settings.value("zoom_max", ZOOM_MAX, type=float)
+        self.canvas.zoom_min = zoom_min
+        self.canvas.zoom_max = zoom_max
+
+        # Cache memory — apply to live reader if available
+        cache_mb = settings.value("cache_max_memory_mb", DEFAULT_CACHE_MAX_MEMORY_MB, type=int)
+        if self.reader and hasattr(self.reader, '_cache'):
+            self.reader._cache.max_memory_mb = cache_mb
+            self.reader._cache.max_frames = None  # Will recompute on next put
+
+        # Dark theme
+        dark = settings.value("dark_theme", False, type=bool)
+        if dark != self._dark_theme:
+            self.apply_dark_theme(dark)
+            self.dark_theme_action.setChecked(dark)
+
+        # Default resolution for next file open
+        width = settings.value("default_width", DEFAULT_RESOLUTION_WIDTH, type=int)
+        height = settings.value("default_height", DEFAULT_RESOLUTION_HEIGHT, type=int)
+        if not self.reader:
+            self.current_width = width
+            self.current_height = height
+
+        # Color matrix for next file open (only when no file is loaded)
+        matrix = settings.value("color_matrix", DEFAULT_COLOR_MATRIX)
+        if not self.reader:
+            self._set_color_matrix(matrix)
+
+        settings.endGroup()

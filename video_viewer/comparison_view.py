@@ -3,10 +3,13 @@ A/B Comparison View for Video Viewer
 Provides side-by-side, overlay, and diff comparison modes for two videos.
 """
 
+import logging
 from enum import Enum
 from typing import Optional
 
 import cv2
+
+logger = logging.getLogger(__name__)
 import numpy as np
 from PySide6.QtCore import Qt, QPoint, QRect, Signal
 from PySide6.QtGui import QPainter, QImage, QPixmap, QPen, QColor, QWheelEvent, QMouseEvent
@@ -399,6 +402,9 @@ class ComparisonWindow(QMainWindow):
             # Validate dimensions match
             if (ref_reader.width != self.main_reader.width or
                 ref_reader.height != self.main_reader.height):
+                logger.warning("Dimension mismatch: reference %dx%d vs main %dx%d",
+                               ref_reader.width, ref_reader.height,
+                               self.main_reader.width, self.main_reader.height)
                 QMessageBox.warning(
                     self, "Dimension Mismatch",
                     f"Reference video dimensions ({ref_reader.width}x{ref_reader.height}) "
@@ -418,6 +424,9 @@ class ComparisonWindow(QMainWindow):
                     return
 
             self.ref_reader = ref_reader
+            logger.debug("Reference file loaded: %s (format=%s, %dx%d, frames=%d)",
+                         file_path, ref_reader.format.fourcc,
+                         ref_reader.width, ref_reader.height, ref_reader.total_frames)
 
             # Update slider range to minimum of both videos
             max_frame = min(self.main_reader.total_frames, self.ref_reader.total_frames) - 1
@@ -746,6 +755,7 @@ class ComparisonWindow(QMainWindow):
     def _on_mode_changed(self, index):
         """Handle mode change"""
         mode = self.mode_combo.currentData()
+        logger.debug("Comparison mode switched to: %s", mode.value if mode else mode)
         self.canvas.set_mode(mode)
 
         # Enable/disable opacity slider based on mode

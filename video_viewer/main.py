@@ -1,9 +1,11 @@
 import sys
 import os
 import argparse
+import logging
 from PySide6.QtWidgets import QApplication
 from .main_window import MainWindow
 from .video_converter import VideoConverter
+from .log_config import setup_logging
 
 def main():
     parser = argparse.ArgumentParser(description="YUV/RAW Video Viewer and Converter")
@@ -14,8 +16,10 @@ def main():
 
     parser.add_argument("-vo", "--output-format", dest="output_format", type=str, help="Output Pixel format (for conversion)")
     parser.add_argument("-o", "--output", dest="output_file", type=str, help="Output file path (triggers headless mode)")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose (DEBUG) logging")
 
     args = parser.parse_args()
+    setup_logging(logging.DEBUG if args.verbose else logging.WARNING)
 
     if args.output_file:
         # Headless mode
@@ -28,7 +32,7 @@ def main():
 
         converter = VideoConverter()
         try:
-             count = converter.convert(args.file, args.width, args.height, args.input_format, args.output_file, output_fmt)
+             count, _cancelled = converter.convert(args.file, args.width, args.height, args.input_format, args.output_file, output_fmt)
              print(f"Converted {count} frames: {args.input_format} → {output_fmt}, {os.path.basename(args.output_file)}")
         except Exception as e:
             print(f"Error converting video: {e}")

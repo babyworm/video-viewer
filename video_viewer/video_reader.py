@@ -1,43 +1,67 @@
+import logging
+import threading
 import numpy as np
 import cv2
 import os
 import mmap
 from collections import OrderedDict
+from PySide6.QtCore import QThread, Signal
 from .format_manager import FormatType, FormatManager
+from .constants import DEFAULT_CACHE_MAX_FRAMES, DEFAULT_CACHE_MAX_MEMORY_MB, DEFAULT_COLOR_MATRIX
+
+logger = logging.getLogger(__name__)
 
 
 class FrameCache:
-    def __init__(self, max_frames=16, max_memory_mb=512):
+    def __init__(self, max_memory_mb=DEFAULT_CACHE_MAX_MEMORY_MB):
+        self.max_memory_mb = max_memory_mb
+        self.max_frames = None  # Will be computed dynamically
         self._cache = OrderedDict()
-        self._max_frames = max_frames
-        self._max_memory = max_memory_mb * 1024 * 1024  # Convert to bytes
-        self._current_memory = 0
+        self._memory_usage = 0
+        self._lock = threading.Lock()
+
+    def _compute_max_frames(self, frame_size):
+        """Compute max frames based on frame size and memory budget."""
+        frame_size_mb = frame_size / (1024 * 1024)
+        if frame_size_mb > 0:
+            self.max_frames = max(4, min(256, int(self.max_memory_mb / frame_size_mb)))
+        else:
+            self.max_frames = 256
 
     def get(self, frame_idx):
-        if frame_idx in self._cache:
-            self._cache.move_to_end(frame_idx)
-            return self._cache[frame_idx]
-        return None
+        with self._lock:
+            if frame_idx in self._cache:
+                self._cache.move_to_end(frame_idx)
+                return self._cache[frame_idx]
+            return None
 
     def put(self, frame_idx, data):
-        if frame_idx in self._cache:
-            self._cache.move_to_end(frame_idx)
-            return
+        with self._lock:
+            if frame_idx in self._cache:
+                self._cache.move_to_end(frame_idx)
+                return
 
-        data_size = len(data)
+            data_size = len(data)
 
-        # Evict oldest entries if over limit
-        while (len(self._cache) >= self._max_frames or
-               self._current_memory + data_size > self._max_memory) and self._cache:
-            _, old_data = self._cache.popitem(last=False)
-            self._current_memory -= len(old_data)
+            # Compute max_frames dynamically on first frame
+            if self.max_frames is None:
+                self._compute_max_frames(data_size)
 
-        self._cache[frame_idx] = data
-        self._current_memory += data_size
+            max_memory_bytes = self.max_memory_mb * 1024 * 1024
+
+            # Evict oldest entries if over limit
+            while (len(self._cache) >= self.max_frames or
+                   self._memory_usage + data_size > max_memory_bytes) and self._cache:
+                _, old_data = self._cache.popitem(last=False)
+                self._memory_usage -= len(old_data)
+
+            self._cache[frame_idx] = data
+            self._memory_usage += data_size
 
     def clear(self):
-        self._cache.clear()
-        self._current_memory = 0
+        with self._lock:
+            self._cache.clear()
+            self._memory_usage = 0
 
     @property
     def size(self):
@@ -45,11 +69,11 @@ class FrameCache:
 
     @property
     def memory_usage(self):
-        return self._current_memory
+        return self._memory_usage
 
 
 class VideoReader:
-    def __init__(self, file_path, width, height, format_name, color_matrix="BT.601"):
+    def __init__(self, file_path, width, height, format_name, color_matrix=DEFAULT_COLOR_MATRIX):
         self.file_path = file_path
         self.is_y4m = file_path.lower().endswith('.y4m')
 
@@ -63,6 +87,10 @@ class VideoReader:
         self.format_manager = FormatManager()
         self.y4m_header_len = 0
         self.y4m_frame_header_len = 6 # "FRAME\n"
+        self.y4m_fps = None
+        self.y4m_interlace = "progressive"
+        self.y4m_par = (1, 1)
+        self.y4m_extensions = []
 
         if self.is_y4m:
             self.parse_y4m_header()
@@ -71,12 +99,15 @@ class VideoReader:
             self.frame_size = self.format.calculate_frame_size(width, height)
 
         self.file_size = os.path.getsize(file_path)
+        logger.debug("Opening file: %s (size=%d bytes)", file_path, self.file_size)
 
         # Initialize mmap and cache
         self._file = None
         self._mmap = None
-        self._cache = FrameCache(max_frames=16, max_memory_mb=512)
+        self._cache = FrameCache(max_memory_mb=DEFAULT_CACHE_MAX_MEMORY_MB)
         self._frame_offsets = []  # For Y4M variable frame headers
+
+        self._lock = threading.Lock()
 
         # Try to open mmap, fallback to regular file I/O if it fails
         self._use_mmap = False
@@ -85,6 +116,7 @@ class VideoReader:
                 self._file = open(file_path, 'rb')
                 self._mmap = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
                 self._use_mmap = True
+                logger.debug("Using mmap for file: %s", file_path)
             except (OSError, ValueError):
                 # mmap failed, clean up and fall back to regular I/O
                 if self._mmap:
@@ -94,6 +126,7 @@ class VideoReader:
                     self._file.close()
                     self._file = None
                 self._use_mmap = False
+                logger.warning("mmap failed for %s, falling back to regular file I/O", file_path)
 
         if self.is_y4m:
             if self._use_mmap:
@@ -132,7 +165,7 @@ class VideoReader:
     def parse_y4m_header(self):
         with open(self.file_path, "rb") as f:
             # Header is up to newline
-            # YUV4MPEG2 W720 H576 F25:1 Ip A0:0 C420mpeg2 XYSCSS=420JPEG
+            # YUV4MPEG2 W720 H576 F25:1 Ip A1:1 C420mpeg2 XYSCSS=420JPEG
             header = b""
             while True:
                 byte = f.read(1)
@@ -156,54 +189,86 @@ class VideoReader:
                     colorspace = part[1:]
                     # Map y4m colorspace to our formats
                     if colorspace.startswith("420"):
-                        self.format = self.format_manager.get_format("I420 (4:2:0) [YU12]") # Most Y4M is planar I420
+                        # Y4M 4:2:0 is always planar I420
+                        self.format = self.format_manager.get_format("I420 (4:2:0) [YU12]")
                     elif colorspace.startswith("422"):
-                         self.format = self.format_manager.get_format("UYVY (4:2:2) [UYVY]") # Fallback assumption
-                         pass
-                    elif colorspace == "mono":
-                        # Grey?
+                        # Y4M 4:2:2 is always planar, not packed
+                        self.format = self.format_manager.get_format("YUV422P (4:2:2) [422P]")
+                    elif colorspace.startswith("444"):
+                        self.format = self.format_manager.get_format("YUV444P (4:4:4) [444P]")
+                    elif colorspace.startswith("mono"):
+                        self.format = self.format_manager.get_format("Greyscale (8-bit) [GREY]")
+                    else:
+                        logger.warning("Unknown Y4M colorspace '%s', falling back to I420", colorspace)
+                elif part.startswith('F'):
+                    # Frame rate: F25:1 or F30000:1001
+                    try:
+                        num_str, den_str = part[1:].split(':')
+                        self.y4m_fps = int(num_str) / int(den_str)
+                    except (ValueError, ZeroDivisionError):
                         pass
+                elif part.startswith('I'):
+                    # Interlace: Ip=progressive, It=tff, Ib=bff, Im=mixed
+                    interlace_char = part[1:2]
+                    interlace_map = {'p': 'progressive', 't': 'tff', 'b': 'bff', 'm': 'mixed'}
+                    self.y4m_interlace = interlace_map.get(interlace_char, 'progressive')
+                elif part.startswith('A'):
+                    # Pixel aspect ratio: A1:1 or A10:11
+                    try:
+                        num_str, den_str = part[1:].split(':')
+                        self.y4m_par = (int(num_str), int(den_str))
+                    except ValueError:
+                        pass
+                elif part.startswith('X'):
+                    # Extension field: store as-is (informational)
+                    self.y4m_extensions.append(part[1:])
 
             if not getattr(self, 'format', None):
-                # Default to I420 if unknown or 420
+                # Default to I420 if colorspace unknown or unspecified
+                logger.warning("Y4M colorspace not recognized, defaulting to I420")
                 self.format = self.format_manager.get_format("I420 (4:2:0) [YU12]")
 
             self.frame_size = self.format.calculate_frame_size(self.width, self.height)
+            logger.debug("Y4M header parsed: %dx%d format=%s fps=%s interlace=%s",
+                         self.width, self.height, self.format.fourcc, self.y4m_fps, self.y4m_interlace)
 
     def seek_frame(self, frame_idx):
-        if frame_idx < 0 or frame_idx >= self.total_frames:
-            raise ValueError("Frame index out of bounds")
+        with self._lock:
+            if frame_idx < 0 or frame_idx >= self.total_frames:
+                raise ValueError("Frame index out of bounds")
 
-        # Check cache first
-        cached = self._cache.get(frame_idx)
-        if cached is not None:
-            return cached
+            # Check cache first
+            cached = self._cache.get(frame_idx)
+            if cached is not None:
+                logger.debug("Cache hit for frame %d", frame_idx)
+                return cached
+            logger.debug("Cache miss for frame %d", frame_idx)
 
-        # Read from mmap or file
-        if self._use_mmap:
-            if self.is_y4m:
-                if frame_idx < len(self._frame_offsets):
-                    offset = self._frame_offsets[frame_idx]
+            # Read from mmap or file
+            if self._use_mmap:
+                if self.is_y4m:
+                    if frame_idx < len(self._frame_offsets):
+                        offset = self._frame_offsets[frame_idx]
+                    else:
+                        raise ValueError("Frame index out of bounds")
                 else:
-                    raise ValueError("Frame index out of bounds")
+                    offset = frame_idx * self.frame_size
+
+                raw_data = bytes(self._mmap[offset:offset + self.frame_size])
             else:
-                offset = frame_idx * self.frame_size
+                # Fallback to regular file I/O
+                if self.is_y4m:
+                    offset = self.y4m_header_len + frame_idx * self.payload_size + self.y4m_frame_header_len
+                else:
+                    offset = frame_idx * self.frame_size
 
-            raw_data = bytes(self._mmap[offset:offset + self.frame_size])
-        else:
-            # Fallback to regular file I/O
-            if self.is_y4m:
-                offset = self.y4m_header_len + frame_idx * self.payload_size + self.y4m_frame_header_len
-            else:
-                offset = frame_idx * self.frame_size
+                with open(self.file_path, "rb") as f:
+                    f.seek(offset)
+                    raw_data = f.read(self.frame_size)
 
-            with open(self.file_path, "rb") as f:
-                f.seek(offset)
-                raw_data = f.read(self.frame_size)
-
-        # Cache the result
-        self._cache.put(frame_idx, raw_data)
-        return raw_data
+            # Cache the result
+            self._cache.put(frame_idx, raw_data)
+            return raw_data
 
     def _ycrcb_to_rgb(self, y, u, v):
         """Convert Y, U(Cb), V(Cr) planes to RGB using selected color matrix."""
@@ -719,5 +784,52 @@ class VideoReader:
         return {
             'size': self._cache.size,
             'memory_mb': self._cache.memory_usage / (1024 * 1024),
-            'max_frames': self._cache._max_frames,
+            'max_frames': self._cache.max_frames,
         }
+
+
+class FrameDecodeWorker(QThread):
+    """Background thread for frame decoding during playback."""
+    frame_ready = Signal(int, int, object)  # (generation, frame_index, rgb_ndarray)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._reader = None
+        self._frame_idx = -1
+        self._generation = 0
+        self._running = False
+
+    @property
+    def is_busy(self):
+        return self._running
+
+    def set_reader(self, reader):
+        """Set the video reader (call from main thread when video changes)."""
+        self._reader = reader
+
+    def request_frame(self, frame_idx, generation=0):
+        """Request decoding of a frame. Non-blocking. Returns False if busy."""
+        if self._running or self.isRunning():
+            return False
+        self._frame_idx = frame_idx
+        self._generation = generation
+        self._running = True
+        self.start()
+        return True
+
+    def run(self):
+        try:
+            if self._reader and self._frame_idx >= 0:
+                raw_data = self._reader.seek_frame(self._frame_idx)
+                if raw_data:
+                    rgb = self._reader.convert_to_rgb(raw_data)
+                    if rgb is not None:
+                        self.frame_ready.emit(self._generation, self._frame_idx, rgb)
+        except Exception:
+            pass
+        finally:
+            self._running = False
+
+    def stop_worker(self):
+        """Wait for the worker thread to finish."""
+        self.wait(2000)
