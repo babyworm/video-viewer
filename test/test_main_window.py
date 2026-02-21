@@ -591,3 +591,250 @@ def test_sub_grid_paint(qapp):
 
     canvas.set_sub_grid(0)
     assert canvas.sub_grid_size == 0
+
+
+# ── _apply_file_hints() integration tests ──────────────────────────
+
+
+def test_apply_file_hints_filesize_priority(qapp, tmp_path):
+    """File-size guess should take priority over filename resolution hints."""
+    from video_viewer.main_window import MainWindow
+
+    window = MainWindow()
+
+    # Create file exactly matching 1920x1080 I420 (1 frame)
+    width, height = 1920, 1080
+    frame_size = int(width * height * 1.5)
+    # Name suggests qcif, but file size matches 1080p
+    f = tmp_path / "video_qcif.yuv"
+    f.write_bytes(b'\x80' * frame_size)
+
+    result = window._apply_file_hints(str(f))
+    assert result is not None
+    assert "File-size guess" in result
+    assert window.current_width == 1920
+    assert window.current_height == 1080
+
+
+def test_apply_file_hints_filename_fallback(qapp, tmp_path):
+    """Filename hints used when file-size guess fails."""
+    from video_viewer.main_window import MainWindow
+
+    window = MainWindow()
+
+    # Odd file size that won't match any resolution guess
+    f = tmp_path / "foreman_qcif_nv12.yuv"
+    f.write_bytes(b'\x80' * 12345)
+
+    result = window._apply_file_hints(str(f))
+    assert result is not None
+    assert "Filename hint" in result
+    assert window.current_width == 176
+    assert window.current_height == 144
+
+
+def test_apply_file_hints_fps_sets_combo(qapp, tmp_path):
+    """FPS hint should set combo_fps correctly."""
+    from video_viewer.main_window import MainWindow
+
+    window = MainWindow()
+
+    f = tmp_path / "video_15fps.yuv"
+    f.write_bytes(b'\x80' * 12345)
+
+    window._apply_file_hints(str(f))
+    assert window.combo_fps.currentText() == "15"
+
+
+def test_apply_file_hints_no_hints(qapp, tmp_path):
+    """Returns None when no hints found."""
+    from video_viewer.main_window import MainWindow
+
+    window = MainWindow()
+
+    f = tmp_path / "video.yuv"
+    f.write_bytes(b'\x80' * 12345)
+
+    result = window._apply_file_hints(str(f))
+    assert result is None
+
+
+# ── Y4M fps combo box tests ────────────────────────────────────────
+
+
+def _make_y4m(tmp_path, name, header_params="W4 H4 F30:1 C420"):
+    """Helper: create minimal Y4M file."""
+    header = f"YUV4MPEG2 {header_params}\n".encode()
+    frame_marker = b"FRAME\n"
+    w, h = 4, 4
+    # Parse W/H from header_params for correct frame size
+    for token in header_params.split():
+        if token.startswith("W"):
+            w = int(token[1:])
+        elif token.startswith("H"):
+            h = int(token[1:])
+    frame_data = b'\x80' * int(w * h * 1.5)  # I420
+    f = tmp_path / name
+    f.write_bytes(header + frame_marker + frame_data)
+    return str(f)
+
+
+def test_y4m_fps_30(qapp, tmp_path):
+    """Y4M F30:1 sets combo_fps to '30'."""
+    from video_viewer.main_window import MainWindow
+
+    window = MainWindow()
+    path = _make_y4m(tmp_path, "test.y4m", "W4 H4 F30:1 C420")
+    window._open_file_in_tab(path)
+
+    assert window.combo_fps.currentText() == "30"
+
+
+def test_y4m_fps_25(qapp, tmp_path):
+    """Y4M F25:1 sets combo_fps to '25'."""
+    from video_viewer.main_window import MainWindow
+
+    window = MainWindow()
+    path = _make_y4m(tmp_path, "test.y4m", "W4 H4 F25:1 C420")
+    window._open_file_in_tab(path)
+
+    assert window.combo_fps.currentText() == "25"
+
+
+def test_y4m_fps_23976_closest_match(qapp, tmp_path):
+    """Y4M F24000:1001 (~23.976) should pick closest: '24'."""
+    from video_viewer.main_window import MainWindow
+
+    window = MainWindow()
+    path = _make_y4m(tmp_path, "test.y4m", "W4 H4 F24000:1001 C420")
+    window._open_file_in_tab(path)
+
+    assert window.combo_fps.currentText() == "24"
+
+
+def test_y4m_no_fps_keeps_default(qapp, tmp_path):
+    """Y4M without F tag should leave combo_fps at default '30'."""
+    from video_viewer.main_window import MainWindow
+
+    window = MainWindow()
+    assert window.combo_fps.currentText() == "30"
+
+    path = _make_y4m(tmp_path, "test.y4m", "W4 H4 C420")
+    window._open_file_in_tab(path)
+
+
+def test_apply_file_hints_format_from_filename(qapp, tmp_path):
+    """Filename format hint should set current_format when no file-size guess."""
+    from video_viewer.main_window import MainWindow
+
+    window = MainWindow()
+
+    # Odd file size + nv12 in name
+    f = tmp_path / "clip_nv12.yuv"
+    f.write_bytes(b'\x80' * 12345)
+
+    window._apply_file_hints(str(f))
+    assert "NV12" in window.current_format
+
+
+def test_apply_file_hints_filesize_guess_with_fps(qapp, tmp_path):
+    """File-size guess + fps hint should both apply."""
+    from video_viewer.main_window import MainWindow
+
+    window = MainWindow()
+
+    # Exact 640x480 I420 frame + 15fps in name
+    width, height = 640, 480
+    frame_size = int(width * height * 1.5)
+    f = tmp_path / "video_15fps.yuv"
+    f.write_bytes(b'\x80' * frame_size)
+
+    result = window._apply_file_hints(str(f))
+    assert "File-size guess" in result
+    assert window.current_width == 640
+    assert window.current_height == 480
+    assert window.combo_fps.currentText() == "15"
+
+
+def test_apply_file_hints_resolution_only(qapp, tmp_path):
+    """Filename with only resolution hint (no format)."""
+    from video_viewer.main_window import MainWindow
+
+    window = MainWindow()
+
+    f = tmp_path / "clip_720p.yuv"
+    f.write_bytes(b'\x80' * 12345)
+
+    result = window._apply_file_hints(str(f))
+    assert result is not None
+    assert "Filename hint" in result
+    assert window.current_width == 1280
+    assert window.current_height == 720
+
+
+def test_y4m_fps_60(qapp, tmp_path):
+    """Y4M F60:1 sets combo_fps to '60'."""
+    from video_viewer.main_window import MainWindow
+
+    window = MainWindow()
+    path = _make_y4m(tmp_path, "test60.y4m", "W4 H4 F60:1 C420")
+    window._open_file_in_tab(path)
+
+    assert window.combo_fps.currentText() == "60"
+
+
+def test_y4m_fps_50_closest_match(qapp, tmp_path):
+    """Y4M F50:1 — not in default list, should pick closest available."""
+    from video_viewer.main_window import MainWindow
+
+    window = MainWindow()
+    path = _make_y4m(tmp_path, "test50.y4m", "W4 H4 F50:1 C420")
+    window._open_file_in_tab(path)
+
+    # 50 is not in DEFAULT_FPS_OPTIONS, closest is 60
+    fps_val = float(window.combo_fps.currentText())
+    assert fps_val == 60.0
+
+
+def test_y4m_fps_30000_1001(qapp, tmp_path):
+    """Y4M F30000:1001 (~29.97) should pick closest: '30'."""
+    from video_viewer.main_window import MainWindow
+
+    window = MainWindow()
+    path = _make_y4m(tmp_path, "test2997.y4m", "W4 H4 F30000:1001 C420")
+    window._open_file_in_tab(path)
+
+    assert window.combo_fps.currentText() == "30"
+
+
+def test_y4m_422_colorspace(qapp, tmp_path):
+    """Y4M with C422 should load correctly."""
+    from video_viewer.main_window import MainWindow
+
+    window = MainWindow()
+    header = b"YUV4MPEG2 W4 H4 F25:1 C422\n"
+    frame_marker = b"FRAME\n"
+    # 422 planar: w*h + w*h/2 + w*h/2 = w*h*2
+    frame_data = b'\x80' * (4 * 4 * 2)
+    f = tmp_path / "test422.y4m"
+    f.write_bytes(header + frame_marker + frame_data)
+
+    window._open_file_in_tab(str(f))
+    assert window.reader is not None
+    assert window.combo_fps.currentText() == "25"
+
+
+def test_y4m_mono_colorspace(qapp, tmp_path):
+    """Y4M with Cmono should load as greyscale."""
+    from video_viewer.main_window import MainWindow
+
+    window = MainWindow()
+    header = b"YUV4MPEG2 W4 H4 F30:1 Cmono\n"
+    frame_marker = b"FRAME\n"
+    frame_data = b'\x80' * (4 * 4)  # greyscale: w*h only
+    f = tmp_path / "testmono.y4m"
+    f.write_bytes(header + frame_marker + frame_data)
+
+    window._open_file_in_tab(str(f))
+    assert window.reader is not None
+    assert window.combo_fps.currentText() == "30"
