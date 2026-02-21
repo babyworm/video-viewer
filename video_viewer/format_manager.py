@@ -90,14 +90,14 @@ class FormatManager:
         # Reference: https://docs.kernel.org/userspace-api/media/v4l/pixfmt.html
 
         # --- Packed YUV ---
-        self._add("YUYV (4:2:2)", FormatType.YUV_PACKED, "YUYV", v4l2_name="V4L2_PIX_FMT_YUYV")
-        self._add("UYVY (4:2:2)", FormatType.YUV_PACKED, "UYVY", v4l2_name="V4L2_PIX_FMT_UYVY")
-        self._add("YVYU (4:2:2)", FormatType.YUV_PACKED, "YVYU", v4l2_name="V4L2_PIX_FMT_YVYU")
-        self._add("VYUY (4:2:2)", FormatType.YUV_PACKED, "VYUY", v4l2_name="V4L2_PIX_FMT_VYUY")
-        self._add("Y41P (4:1:1)", FormatType.YUV_PACKED, "Y41P", v4l2_name="V4L2_PIX_FMT_Y41P")
-        self._add("AYUV (4:4:4)", FormatType.YUV_PACKED, "AYUV", v4l2_name="V4L2_PIX_FMT_AYUV32")
-        self._add("VUYA (4:4:4)", FormatType.YUV_PACKED, "VUYA", v4l2_name="V4L2_PIX_FMT_VUYA32")
-        self._add("Y210 (10-bit 4:2:2)", FormatType.YUV_PACKED, "Y210", bit_depth=10, v4l2_name="V4L2_PIX_FMT_Y210")
+        self._add("YUYV (4:2:2)", FormatType.YUV_PACKED, "YUYV", subsampling=(2,1), v4l2_name="V4L2_PIX_FMT_YUYV")
+        self._add("UYVY (4:2:2)", FormatType.YUV_PACKED, "UYVY", subsampling=(2,1), v4l2_name="V4L2_PIX_FMT_UYVY")
+        self._add("YVYU (4:2:2)", FormatType.YUV_PACKED, "YVYU", subsampling=(2,1), v4l2_name="V4L2_PIX_FMT_YVYU")
+        self._add("VYUY (4:2:2)", FormatType.YUV_PACKED, "VYUY", subsampling=(2,1), v4l2_name="V4L2_PIX_FMT_VYUY")
+        self._add("Y41P (4:1:1)", FormatType.YUV_PACKED, "Y41P", subsampling=(4,1), v4l2_name="V4L2_PIX_FMT_Y41P")
+        self._add("AYUV (4:4:4)", FormatType.YUV_PACKED, "AYUV", subsampling=(1,1), v4l2_name="V4L2_PIX_FMT_AYUV32")
+        self._add("VUYA (4:4:4)", FormatType.YUV_PACKED, "VUYA", subsampling=(1,1), v4l2_name="V4L2_PIX_FMT_VUYA32")
+        self._add("Y210 (10-bit 4:2:2)", FormatType.YUV_PACKED, "Y210", bit_depth=10, subsampling=(2,1), v4l2_name="V4L2_PIX_FMT_Y210")
 
         # --- Planar YUV ---
         self._add("I420 (4:2:0)", FormatType.YUV_PLANAR, "YU12", subsampling=(2,2), v4l2_name="V4L2_PIX_FMT_YUV420")

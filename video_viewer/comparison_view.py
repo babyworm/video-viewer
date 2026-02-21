@@ -67,9 +67,9 @@ class ComparisonCanvas(QWidget):
             return None
         h, w = img.shape[:2]
         if img.shape[2] == 3:
-            # RGB to QImage
             bytes_per_line = 3 * w
-            return QImage(img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+            # .copy() so QImage owns its data (prevents corruption when numpy is GC'd)
+            return QImage(img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
         return None
 
     def set_mode(self, mode: ComparisonMode):
@@ -211,10 +211,8 @@ class ComparisonCanvas(QWidget):
 
     def _paint_diff(self, painter: QPainter, x: int, y: int, w: int, h: int):
         """Render difference heatmap mode"""
-        # This is a simplified version - the actual diff image
-        # should be computed in ComparisonWindow and passed here
-        # For now, just draw image A as placeholder
         dst_rect = QRect(x, y, w, h)
+        # In diff mode, image_a holds the diff heatmap (set by ComparisonWindow)
         painter.drawImage(dst_rect, self.image_a)
 
 
@@ -230,6 +228,8 @@ class ComparisonWindow(QMainWindow):
 
         # Current frame index
         self.current_frame = 0
+        self._diff_mean = None
+        self._diff_max = None
 
         # Setup UI
         self.setWindowTitle("A/B Comparison")
@@ -422,16 +422,28 @@ class ComparisonWindow(QMainWindow):
             # Update canvas based on mode
             mode = self.mode_combo.currentData()
             if mode == ComparisonMode.DIFF:
-                # Compute difference heatmap
-                diff = np.abs(img_main.astype(int) - img_ref.astype(int)).astype(np.uint8)
-                # Convert to grayscale for heatmap
-                diff_gray = cv2.cvtColor(diff, cv2.COLOR_RGB2GRAY)
-                # Apply colormap
-                diff_heatmap = cv2.applyColorMap(diff_gray, cv2.COLORMAP_JET)
-                # Convert BGR to RGB
-                diff_heatmap = cv2.cvtColor(diff_heatmap, cv2.COLOR_BGR2RGB)
+                # Compute difference
+                diff = np.abs(img_main.astype(np.float32) - img_ref.astype(np.float32))
+                diff_gray = cv2.cvtColor(diff.astype(np.uint8), cv2.COLOR_RGB2GRAY)
+                self._diff_mean = float(np.mean(diff_gray))
+                self._diff_max = int(np.max(diff_gray))
+
+                if self._diff_max == 0:
+                    # Identical frames: pure black
+                    diff_heatmap = np.zeros_like(img_main)
+                else:
+                    # Amplify 10x for visibility, clamp to 255
+                    amplified = np.clip(diff_gray.astype(np.float32) * 10, 0, 255).astype(np.uint8)
+                    diff_heatmap = cv2.applyColorMap(amplified, cv2.COLORMAP_JET)
+                    diff_heatmap = cv2.cvtColor(diff_heatmap, cv2.COLOR_BGR2RGB)
+                    # Make zero-diff pixels black
+                    mask = diff_gray == 0
+                    diff_heatmap[mask] = 0
+
                 self.canvas.set_images(diff_heatmap, diff_heatmap)
             else:
+                self._diff_mean = None
+                self._diff_max = None
                 self.canvas.set_images(img_main, img_ref)
 
             # Calculate metrics
@@ -446,11 +458,12 @@ class ComparisonWindow(QMainWindow):
             max_frame = min(self.main_reader.total_frames, self.ref_reader.total_frames) - 1
             self.frame_label.setText(f"Frame: {self.current_frame} / {max_frame}")
 
-            self.statusBar.showMessage(
-                f"Frame {self.current_frame} | "
-                f"Main: {self.main_reader.width}x{self.main_reader.height} | "
-                f"Ref: {self.ref_reader.width}x{self.ref_reader.height}"
-            )
+            status = (f"Frame {self.current_frame} | "
+                      f"Main: {self.main_reader.width}x{self.main_reader.height} | "
+                      f"Ref: {self.ref_reader.width}x{self.ref_reader.height}")
+            if self._diff_mean is not None:
+                status += f" | Diff mean={self._diff_mean:.2f} max={self._diff_max}"
+            self.statusBar.showMessage(status)
 
         except Exception as e:
             self.statusBar.showMessage(f"Error updating frame: {str(e)}")

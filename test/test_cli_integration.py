@@ -44,7 +44,7 @@ def test_cli_headless_conversion(tmp_path):
     assert result.returncode == 0
     assert os.path.exists(outfile)
     assert outfile.stat().st_size == file_size # NV12 is same size as I420
-    assert f"Converted 1 frames" in result.stdout
+    assert "Converted 1 frames: I420" in result.stdout
 
 def test_cli_missing_args(tmp_path):
     """Test CLI behavior with missing arguments for raw files in headless mode."""
@@ -62,4 +62,4 @@ def test_cli_missing_args(tmp_path):
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
 
-    assert "Converted 0 frames" in result.stdout
+    assert "Converted 0 frames: I420" in result.stdout

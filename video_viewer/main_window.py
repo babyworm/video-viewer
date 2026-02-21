@@ -1101,11 +1101,11 @@ class MainWindow(QMainWindow):
         act_open.setToolTip("Open File (Ctrl+O)")
         act_open.triggered.connect(self.open_file)
 
-        # Save Frame
-        act_save = toolbar.addAction(
-            style.standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton), "Save Frame")
-        act_save.setToolTip("Save Current Frame (Ctrl+S)")
-        act_save.triggered.connect(self.save_frame)
+        # Save As (Convert)
+        act_save_as = toolbar.addAction(
+            style.standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton), "Save As")
+        act_save_as.setToolTip("Convert / Save As")
+        act_save_as.triggered.connect(self.show_convert_dialog)
 
         toolbar.addSeparator()
 
@@ -1578,16 +1578,15 @@ class MainWindow(QMainWindow):
                 try:
                     from .video_converter import VideoConverter
                     converter = VideoConverter()
-                    converter.convert(self.current_file_path,
+                    count = converter.convert(self.current_file_path,
                                       self.current_width, self.current_height,
                                       self.current_format,
                                       output_path, output_fmt)
-                    from PySide6.QtWidgets import QMessageBox
-                    QMessageBox.information(self, "Convert Complete",
-                                            f"Converted to:\n{output_path}")
+                    self.show_console_message(
+                        f"Converted {count} frames: {self.current_format} → {output_fmt}, "
+                        f"{os.path.basename(output_path)}")
                 except Exception as e:
-                    from PySide6.QtWidgets import QMessageBox
-                    QMessageBox.critical(self, "Convert Error", str(e))
+                    self.show_console_message(f"Convert error: {e}")
 
     def toggle_analysis_dock(self):
         """Toggle analysis dock visibility."""
@@ -2447,7 +2446,9 @@ class MainWindow(QMainWindow):
                 logger.error(f"Batch convert error for {fpath}: {e}")
 
         progress.setValue(total)
-        self.status_bar.showMessage(f"Batch convert complete: {total} files", 3000)
+        self.show_console_message(
+            f"Batch convert complete: {total} files, "
+            f"{settings['input_fmt']} → {settings['output_fmt']}")
 
     # ── PNG Sequence Export ──
     def show_png_export_dialog(self):

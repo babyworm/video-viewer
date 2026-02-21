@@ -1,4 +1,5 @@
 import sys
+import os
 import argparse
 from PySide6.QtWidgets import QApplication
 from .main_window import MainWindow
@@ -27,7 +28,8 @@ def main():
 
         converter = VideoConverter()
         try:
-             converter.convert(args.file, args.width, args.height, args.input_format, args.output_file, output_fmt)
+             count = converter.convert(args.file, args.width, args.height, args.input_format, args.output_file, output_fmt)
+             print(f"Converted {count} frames: {args.input_format} → {output_fmt}, {os.path.basename(args.output_file)}")
         except Exception as e:
             print(f"Error converting video: {e}")
             sys.exit(1)
