@@ -4,7 +4,7 @@ from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QFormLayout, QLabel,
                                QVBoxLayout, QHBoxLayout, QTableWidget,
                                QTableWidgetItem, QHeaderView, QListWidget,
                                QSpinBox, QGroupBox, QDoubleSpinBox, QCheckBox)
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtCore import QSettings
 
 from .constants import (COMMON_RESOLUTIONS, COMMON_GUESS_FORMATS,
@@ -12,6 +12,11 @@ from .constants import (COMMON_RESOLUTIONS, COMMON_GUESS_FORMATS,
                         DEFAULT_FPS_OPTIONS, DEFAULT_COLOR_MATRIX,
                         DEFAULT_RESOLUTION_WIDTH, DEFAULT_RESOLUTION_HEIGHT)
 from .format_manager import FormatManager
+
+
+def _fix_combo_popup(combo):
+    """Force QComboBox popup to close after item click (WSL2/X11 workaround)."""
+    combo.view().pressed.connect(lambda _: QTimer.singleShot(0, combo.hidePopup))
 
 
 class ParametersDialog(QDialog):
@@ -42,7 +47,7 @@ class ParametersDialog(QDialog):
         # Format
         self.combo_format = QComboBox()
         self.combo_format.addItems(self.format_manager.get_supported_formats())
-
+        _fix_combo_popup(self.combo_format)
         if current_format in self.format_manager.get_supported_formats():
             self.combo_format.setCurrentText(current_format)
         layout.addRow("Format:", self.combo_format)
@@ -83,6 +88,7 @@ class ExportDialog(QDialog):
 
         # Export format
         self.combo_export_fmt = QComboBox()
+        _fix_combo_popup(self.combo_export_fmt)
         self.exportable_formats = [
             "I420 (4:2:0) [YU12]",
             "NV12 (4:2:0) [NV12]",
@@ -139,7 +145,7 @@ class ConvertDialog(QDialog):
         # Output format
         self.combo_output_fmt = QComboBox()
         self.combo_output_fmt.addItems(self.format_manager.get_supported_formats())
-
+        _fix_combo_popup(self.combo_output_fmt)
         layout.addRow("Output Format:", self.combo_output_fmt)
 
         # Output path
@@ -257,11 +263,11 @@ class BatchConvertDialog(QDialog):
         form.addRow("Height:", self.txt_height)
         self.combo_input_fmt = QComboBox()
         self.combo_input_fmt.addItems(self.format_manager.get_supported_formats())
-
+        _fix_combo_popup(self.combo_input_fmt)
         form.addRow("Input Format:", self.combo_input_fmt)
         self.combo_output_fmt = QComboBox()
         self.combo_output_fmt.addItems(self.format_manager.get_supported_formats())
-
+        _fix_combo_popup(self.combo_output_fmt)
         form.addRow("Output Format:", self.combo_output_fmt)
         layout.addLayout(form)
 
@@ -407,9 +413,10 @@ class SettingsDialog(QDialog):
         defaults_layout = QFormLayout()
         self.fps_combo = QComboBox()
         self.fps_combo.addItems(DEFAULT_FPS_OPTIONS)
-
+        _fix_combo_popup(self.fps_combo)
         self.color_matrix_combo = QComboBox()
         self.color_matrix_combo.addItems(["BT.601", "BT.709"])
+        _fix_combo_popup(self.color_matrix_combo)
 
         self.default_width_spin = QSpinBox()
         self.default_width_spin.setRange(1, 7680)
