@@ -1484,16 +1484,42 @@ class MainWindow(QMainWindow):
         # 3. Metrics Tab
         self.metrics_widget = QWidget()
         metrics_layout = QVBoxLayout()
-        self.lbl_psnr = QLabel("PSNR: N/A")
-        self.lbl_ssim = QLabel("SSIM: N/A")
-        self.btn_load_ref = QPushButton("Load Reference Video")
-        self.btn_load_ref.clicked.connect(self.load_reference)
 
+        # Current frame metrics
+        self.lbl_psnr = QLabel("PSNR: N/A")
+        self.lbl_psnr.setStyleSheet("font-weight: bold; font-size: 13px;")
+        self.lbl_ssim = QLabel("SSIM: N/A")
+        self.lbl_ssim.setStyleSheet("font-weight: bold; font-size: 13px;")
         metrics_layout.addWidget(self.lbl_psnr)
         metrics_layout.addWidget(self.lbl_ssim)
+
+        # Load reference button
+        self.btn_load_ref = QPushButton("Load Reference Video")
+        self.btn_load_ref.clicked.connect(self.load_reference)
         metrics_layout.addWidget(self.btn_load_ref)
-        metrics_layout.addStretch()
+
+        # Analyze range controls
+        range_layout = QHBoxLayout()
+        self.btn_analyze_all = QPushButton("Analyze All Frames")
+        self.btn_analyze_all.clicked.connect(self._analyze_all_frames)
+        self.btn_analyze_all.setEnabled(False)
+        range_layout.addWidget(self.btn_analyze_all)
+        self.btn_analyze_clear = QPushButton("Clear")
+        self.btn_analyze_clear.clicked.connect(self._clear_metrics_log)
+        range_layout.addWidget(self.btn_analyze_clear)
+        metrics_layout.addLayout(range_layout)
+
+        # Per-frame metrics log
+        from PySide6.QtWidgets import QPlainTextEdit
+        self.metrics_log = QPlainTextEdit()
+        self.metrics_log.setReadOnly(True)
+        self.metrics_log.setStyleSheet(
+            "font-family: monospace; font-size: 11px; background: #1a1a1a; color: #ddd;")
+        self.metrics_log.setMinimumHeight(120)
+        metrics_layout.addWidget(self.metrics_log, stretch=1)
+
         self.metrics_widget.setLayout(metrics_layout)
+        self._metrics_results = {}  # {frame_idx: (psnr, ssim)}
 
         self.tabs_analysis.addTab(self.metrics_widget, "Metrics")
 
@@ -1590,7 +1616,10 @@ class MainWindow(QMainWindow):
 
     def toggle_analysis_dock(self):
         """Toggle analysis dock visibility."""
-        self.dock_analysis.setVisible(not self.dock_analysis.isVisible())
+        visible = not self.dock_analysis.isVisible()
+        self.dock_analysis.setVisible(visible)
+        if visible:
+            self.update_analysis()
 
     def show_analysis_tab(self, tab_index):
         """Show analysis dock and switch to specified tab."""
@@ -2196,7 +2225,12 @@ class MainWindow(QMainWindow):
                 if self.reader:
                     self.ref_reader = VideoReader(file_path, self.reader.width,
                                                   self.reader.height, self.reader.format.name)
+                    self.btn_analyze_all.setEnabled(True)
+                    self._metrics_results.clear()
+                    self.metrics_log.clear()
                     self.status_bar.showMessage(f"Reference loaded: {os.path.basename(file_path)}", 3000)
+                    # Show metrics dock and compute immediately
+                    self.show_analysis_tab(2)
                 else:
                     self.status_bar.showMessage("Load main video first to establish format.", 3000)
             except Exception as e:
@@ -2248,20 +2282,77 @@ class MainWindow(QMainWindow):
              self.vectorscope_scatter.setData(cb, cr)
 
     def update_metrics(self):
-        """Update metrics display."""
-        if hasattr(self, 'ref_reader') and hasattr(self, 'current_rgb_frame'):
-            # Get Reference Frame
-            ref_raw = self.ref_reader.seek_frame(self.current_frame_idx)
-            if ref_raw:
-                ref_rgb = self.ref_reader.convert_to_rgb(ref_raw)
+        """Update metrics display for current frame."""
+        if not hasattr(self, 'ref_reader') or not hasattr(self, 'current_rgb_frame'):
+            return
+        ref_raw = self.ref_reader.seek_frame(self.current_frame_idx)
+        if ref_raw:
+            ref_rgb = self.ref_reader.convert_to_rgb(ref_raw)
+            psnr = VideoAnalyzer.calculate_psnr(self.current_rgb_frame, ref_rgb)
+            ssim = VideoAnalyzer.calculate_ssim(self.current_rgb_frame, ref_rgb)
 
-                psnr = VideoAnalyzer.calculate_psnr(self.current_rgb_frame, ref_rgb)
-                ssim = VideoAnalyzer.calculate_ssim(self.current_rgb_frame, ref_rgb)
+            psnr_s = f"{psnr:.2f} dB" if psnr != float('inf') else "∞"
+            self.lbl_psnr.setText(f"PSNR: {psnr_s}")
+            self.lbl_ssim.setText(f"SSIM: {ssim:.4f}")
 
-                self.lbl_psnr.setText(f"PSNR: {psnr:.2f} dB")
-                self.lbl_ssim.setText(f"SSIM: {ssim:.4f}")
-            else:
-                 self.lbl_psnr.setText("PSNR: Ref End")
+            # Store and append to log
+            self._metrics_results[self.current_frame_idx] = (psnr, ssim)
+            self._append_metrics_line(self.current_frame_idx, psnr, ssim)
+        else:
+            self.lbl_psnr.setText("PSNR: Ref End")
+            self.lbl_ssim.setText("SSIM: N/A")
+
+    def _append_metrics_line(self, frame_idx, psnr, ssim):
+        """Append a line to the metrics log (avoid duplicates)."""
+        psnr_s = f"{psnr:.2f} dB" if psnr != float('inf') else "∞"
+        line = f"#{frame_idx:4d}: PSNR={psnr_s:>10s}, SSIM={ssim:.4f}"
+        # Check if this frame already logged
+        text = self.metrics_log.toPlainText()
+        tag = f"#{frame_idx:4d}:"
+        if tag in text:
+            return
+        self.metrics_log.appendPlainText(line)
+
+    def _analyze_all_frames(self):
+        """Analyze PSNR/SSIM for all frames."""
+        if not hasattr(self, 'ref_reader') or not self.reader:
+            return
+        total = min(self.reader.total_frames, self.ref_reader.total_frames)
+        self.metrics_log.clear()
+        self._metrics_results.clear()
+
+        from PySide6.QtWidgets import QProgressDialog
+        progress = QProgressDialog("Analyzing frames...", "Cancel", 0, total, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+
+        for i in range(total):
+            if progress.wasCanceled():
+                break
+            raw_main = self.reader.seek_frame(i)
+            raw_ref = self.ref_reader.seek_frame(i)
+            if raw_main is None or raw_ref is None:
+                break
+            rgb_main = self.reader.convert_to_rgb(raw_main)
+            rgb_ref = self.ref_reader.convert_to_rgb(raw_ref)
+            psnr = VideoAnalyzer.calculate_psnr(rgb_main, rgb_ref)
+            ssim = VideoAnalyzer.calculate_ssim(rgb_main, rgb_ref)
+            self._metrics_results[i] = (psnr, ssim)
+            psnr_s = f"{psnr:.2f} dB" if psnr != float('inf') else "∞"
+            self.metrics_log.appendPlainText(
+                f"#{i:4d}: PSNR={psnr_s:>10s}, SSIM={ssim:.4f}")
+            progress.setValue(i + 1)
+
+        progress.close()
+        self.status_bar.showMessage(
+            f"Analyzed {len(self._metrics_results)}/{total} frames", 3000)
+
+    def _clear_metrics_log(self):
+        """Clear metrics analysis log."""
+        self._metrics_results.clear()
+        self.metrics_log.clear()
+        self.lbl_psnr.setText("PSNR: N/A")
+        self.lbl_ssim.setText("SSIM: N/A")
 
     def update_waveform(self):
         """Update waveform monitor display."""
