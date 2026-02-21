@@ -48,10 +48,16 @@ _FORMAT_ALIASES = {
 
 # Regex: explicit WxH (e.g. 1920x1080, 176X144)
 _RE_RESOLUTION = re.compile(r'(?:^|[_.\-/\\])(\d{2,5})[xX](\d{2,5})(?:[_.\-]|$)')
+# Same but allows path separators (/ \) in the trailing position — used for full-path fallback
+_RE_RESOLUTION_PATH = re.compile(r'(?:^|[_.\-/\\])(\d{2,5})[xX](\d{2,5})(?:[_.\-/\\]|$)')
 # Regex: fps (e.g. 15fps, 29.97fps, _30_ as common fps between separators)
 _RE_FPS_SUFFIX = re.compile(r'(\d+(?:\.\d+)?)fps', re.IGNORECASE)
 _RE_FPS_BARE = re.compile(r'(?:^|[_.\-])(\d+(?:\.\d+)?)(?=[_.\-]|$)')
 _COMMON_FPS_VALUES = {1, 5, 10, 15, 24, 25, 29.97, 30, 50, 59.94, 60, 120}
+
+# Regex: bit depth (e.g. 8bit, 10bit, 12bit, 16bit)
+_RE_BIT_DEPTH = re.compile(r'(?:^|[_.\-])(\d{1,2})bit(?:[_.\-]|$)', re.IGNORECASE)
+_VALID_BIT_DEPTHS = {8, 10, 12, 16}
 
 
 def parse_filename_hints(filename):
@@ -73,6 +79,15 @@ def parse_filename_hints(filename):
         if 16 <= w <= 8192 and 16 <= h <= 8192:
             hints['width'] = w
             hints['height'] = h
+
+    # 1b. Fallback: WxH in full path (e.g. /data/1920x1080/video.yuv)
+    if 'width' not in hints:
+        m = _RE_RESOLUTION_PATH.search(filename)
+        if m:
+            w, h = int(m.group(1)), int(m.group(2))
+            if 16 <= w <= 8192 and 16 <= h <= 8192:
+                hints['width'] = w
+                hints['height'] = h
 
     # 2. Named resolution (only if no explicit WxH found)
     if 'width' not in hints:
@@ -103,6 +118,13 @@ def parse_filename_hints(filename):
             if val in _COMMON_FPS_VALUES:
                 hints['fps'] = val
                 break
+
+    # --- Bit depth ---
+    m = _RE_BIT_DEPTH.search(name_no_ext)
+    if m:
+        bd = int(m.group(1))
+        if bd in _VALID_BIT_DEPTHS:
+            hints['bit_depth'] = bd
 
     return hints
 

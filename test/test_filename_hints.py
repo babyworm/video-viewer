@@ -20,13 +20,10 @@ def test_explicit_wxh(filename, expected_w, expected_h):
 
 
 def test_wxh_in_path_separator():
-    """WxH only in a path directory component does NOT match (basename behavior).
-    parse_filename_hints() calls os.path.basename() first, so '/path/to/1920x1080/video.yuv'
-    reduces to 'video.yuv' which contains no WxH pattern.
-    """
+    """WxH in path directory is used as fallback when basename has no WxH."""
     hints = parse_filename_hints("/path/to/1920x1080/video.yuv")
-    assert 'width' not in hints
-    assert 'height' not in hints
+    assert hints['width'] == 1920
+    assert hints['height'] == 1080
 
 
 def test_wxh_in_basename_with_path():
@@ -255,3 +252,77 @@ def test_hyphens_as_separators():
     assert hints['width'] == 352
     assert hints['height'] == 288
     assert hints['format'] == "I420"
+
+
+# --- Path WxH fallback ---
+
+def test_path_wxh_fallback():
+    """WxH in directory path used as fallback when basename has no WxH."""
+    hints = parse_filename_hints("/data/1920x1080/video.yuv")
+    assert hints['width'] == 1920
+    assert hints['height'] == 1080
+
+
+def test_path_wxh_basename_takes_priority():
+    """Basename WxH takes priority over path WxH."""
+    hints = parse_filename_hints("/data/1920x1080/clip_640x480.yuv")
+    assert hints['width'] == 640
+    assert hints['height'] == 480
+
+
+def test_path_wxh_out_of_range_ignored():
+    """Out-of-range WxH in path should be ignored."""
+    hints = parse_filename_hints("/data/1x1/video.yuv")
+    assert 'width' not in hints
+
+
+def test_path_wxh_with_named_alias():
+    """Path WxH takes priority over named alias in basename."""
+    hints = parse_filename_hints("/data/1920x1080/clip_qcif.yuv")
+    assert hints['width'] == 1920
+    assert hints['height'] == 1080
+
+
+# --- Bit depth ---
+
+@pytest.mark.parametrize("token, expected_bd", [
+    ("8bit", 8),
+    ("10bit", 10),
+    ("12bit", 12),
+    ("16bit", 16),
+])
+def test_bit_depth(token, expected_bd):
+    hints = parse_filename_hints(f"video_{token}.raw")
+    assert hints['bit_depth'] == expected_bd
+
+
+def test_bit_depth_case_insensitive():
+    hints = parse_filename_hints("video_10BIT.raw")
+    assert hints['bit_depth'] == 10
+
+
+def test_bit_depth_invalid_ignored():
+    """Non-standard bit depths should be ignored."""
+    hints = parse_filename_hints("video_14bit.raw")
+    assert 'bit_depth' not in hints
+
+
+def test_bit_depth_with_format():
+    """Bit depth and format should both be extracted."""
+    hints = parse_filename_hints("sensor_rggb_10bit.raw")
+    assert hints['bit_depth'] == 10
+
+
+def test_bit_depth_not_in_filename():
+    hints = parse_filename_hints("video_1920x1080.yuv")
+    assert 'bit_depth' not in hints
+
+
+def test_full_combined_with_bit_depth():
+    """Full filename with all hints including bit depth."""
+    hints = parse_filename_hints("sensor_1920x1080_10bit_30fps_nv12.raw")
+    assert hints['width'] == 1920
+    assert hints['height'] == 1080
+    assert hints['bit_depth'] == 10
+    assert hints['fps'] == pytest.approx(30.0)
+    assert hints['format'] == "NV12"
