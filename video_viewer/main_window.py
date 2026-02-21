@@ -19,11 +19,6 @@ import cv2
 logger = logging.getLogger(__name__)
 
 
-def _fix_combo_popup(combo):
-    """Force QComboBox popup to close after item click (WSL2/X11 workaround)."""
-    combo.view().pressed.connect(lambda _: QTimer.singleShot(0, combo.hidePopup))
-
-
 from .video_reader import VideoReader, FrameDecodeWorker
 from .format_manager import FormatManager
 from .analysis import VideoAnalyzer
@@ -389,6 +384,17 @@ class MainWindow(QMainWindow):
         if self.initial_file:
             self.current_file_path = self.initial_file
             self.reload_video()
+
+        # WSL2/X11 workaround: close QComboBox popups when focus changes
+        QApplication.instance().focusChanged.connect(self._on_focus_changed)
+
+    def _on_focus_changed(self, old, new):
+        """Hide any open QComboBox popup when focus leaves the combo's view."""
+        if isinstance(old, QComboBox):
+            QTimer.singleShot(0, old.hidePopup)
+        # Also check if old widget's parent is a QComboBox (popup view)
+        elif old is not None and isinstance(old.parent(), QComboBox):
+            QTimer.singleShot(0, old.parent().hidePopup)
 
     def init_ui(self):
         # Create central widget
@@ -1067,7 +1073,7 @@ class MainWindow(QMainWindow):
         self.combo_fps.setCurrentText("30")
         self.combo_fps.setFixedWidth(60)
         self.combo_fps.currentTextChanged.connect(self._update_playback_fps)
-        _fix_combo_popup(self.combo_fps)
+
 
         nav_layout.addWidget(QLabel("FPS:"))
         nav_layout.addWidget(self.combo_fps)
@@ -2585,7 +2591,7 @@ class MainWindow(QMainWindow):
         combo_algo = QComboBox()
         algo_names = [a[0] for a in self._SCENE_ALGORITHMS]
         combo_algo.addItems(algo_names)
-        _fix_combo_popup(combo_algo)
+
         form.addRow("Algorithm:", combo_algo)
 
         from PySide6.QtWidgets import QDoubleSpinBox
