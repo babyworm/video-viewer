@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QTableWidgetItem, QHeaderView, QProgressDialog,
                              QSpinBox, QCheckBox, QListWidget, QListWidgetItem,
                              QSizePolicy, QTabWidget)
-from PySide6.QtCore import Qt, QTimer, Signal, QSettings, QMimeData, QUrl
+from PySide6.QtCore import Qt, QTimer, Signal, QSettings, QMimeData, QUrl, QRect
 from PySide6.QtGui import (QImage, QPixmap, QPainter, QColor, QPen, QMouseEvent,
                           QAction, QKeySequence, QDragEnterEvent, QDropEvent,
                           QClipboard, QIcon)
@@ -1173,7 +1173,7 @@ class MainWindow(QMainWindow):
 
         # Compare
         act_compare = toolbar.addAction(
-            style.standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView), "Compare")
+            self._create_ab_icon(), "Compare")
         act_compare.setToolTip("A/B Compare View")
         act_compare.triggered.connect(self.show_comparison_window)
 
@@ -1185,11 +1185,42 @@ class MainWindow(QMainWindow):
 
         # Analysis
         act_analysis = toolbar.addAction(
-            style.standardIcon(QStyle.StandardPixmap.SP_FileDialogInfoView), "Analysis")
+            style.standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView), "Analysis")
         act_analysis.setToolTip("Show Analysis Dock")
         act_analysis.triggered.connect(self.toggle_analysis_dock)
 
+        toolbar.addSeparator()
+
+        # About
+        act_about = toolbar.addAction(
+            style.standardIcon(QStyle.StandardPixmap.SP_FileDialogInfoView), "About")
+        act_about.setToolTip("About")
+        act_about.triggered.connect(self.show_about)
+
         self.addToolBar(toolbar)
+
+    def _create_ab_icon(self):
+        """Create a custom A|B comparison icon."""
+        size = 24
+        pixmap = QPixmap(size, size)
+        pixmap.fill(QColor(60, 63, 65))
+        p = QPainter(pixmap)
+        # Left half - blue "A"
+        p.setPen(QColor(100, 160, 255))
+        p.setFont(p.font())
+        font = p.font()
+        font.setBold(True)
+        font.setPixelSize(14)
+        p.setFont(font)
+        p.drawText(QRect(0, 0, 12, size), Qt.AlignmentFlag.AlignCenter, "A")
+        # Divider
+        p.setPen(QPen(QColor(200, 200, 0), 1))
+        p.drawLine(12, 2, 12, size - 2)
+        # Right half - green "B"
+        p.setPen(QColor(100, 255, 160))
+        p.drawText(QRect(12, 0, 12, size), Qt.AlignmentFlag.AlignCenter, "B")
+        p.end()
+        return QIcon(pixmap)
 
     def _create_zoom_icon(self, label):
         """Create a custom zoom icon with text label (e.g. '1:1', '2:1')."""
@@ -1532,6 +1563,9 @@ class MainWindow(QMainWindow):
         self.waveform_widget.setLabel('left', 'Level')
         self.waveform_widget.setLabel('bottom', 'Column')
         self.tabs_analysis.addTab(self.waveform_widget, "Waveform")
+
+        # Update analysis when switching tabs
+        self.tabs_analysis.currentChanged.connect(lambda _: self.update_analysis())
 
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.dock_analysis)
 
@@ -2229,8 +2263,9 @@ class MainWindow(QMainWindow):
                     self._metrics_results.clear()
                     self.metrics_log.clear()
                     self.status_bar.showMessage(f"Reference loaded: {os.path.basename(file_path)}", 3000)
-                    # Show metrics dock and compute immediately
-                    self.show_analysis_tab(2)
+                    # Update metrics if dock is already visible
+                    if self.dock_analysis.isVisible():
+                        self.update_analysis()
                 else:
                     self.status_bar.showMessage("Load main video first to establish format.", 3000)
             except Exception as e:
@@ -2477,6 +2512,8 @@ class MainWindow(QMainWindow):
         state = self._settings.value("windowState")
         if state:
             self.restoreState(state)
+        # Analysis dock should always start hidden
+        self.dock_analysis.setVisible(False)
 
     def closeEvent(self, event):
         self._settings.setValue("geometry", self.saveGeometry())
