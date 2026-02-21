@@ -445,7 +445,7 @@ class MainWindow(QMainWindow):
         console_layout.setContentsMargins(4, 0, 0, 0)
         console_layout.setSpacing(2)
         self.lbl_console = QLabel("")
-        self.lbl_console.setFixedHeight(30)
+        self.lbl_console.setFixedHeight(46)
         self.lbl_console.setWordWrap(True)
         self.lbl_console.setStyleSheet("color: #aaccff; font-size: 11px; background-color: #2b2b2b;")
         self.lbl_console.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -464,7 +464,7 @@ class MainWindow(QMainWindow):
         btn_col.addWidget(btn_console_up)
         btn_col.addWidget(btn_console_down)
         console_layout.addLayout(btn_col)
-        console_widget.setFixedHeight(34)
+        console_widget.setFixedHeight(50)
         console_widget.setStyleSheet("background-color: #2b2b2b;")
         self._console_history = []
         self._console_view_idx = -1  # -1 = latest
@@ -1721,6 +1721,10 @@ class MainWindow(QMainWindow):
             self.reader = VideoReader(self.current_file_path, self.current_width,
                                      self.current_height, self.current_format)
             self._decode_worker.set_reader(self.reader)
+
+            # Show reader warnings in console
+            for warn in self.reader.warnings:
+                self.show_console_message(f"[WARN] {warn}")
 
             # Update parameters if reader detected different properties (e.g. Y4M)
             if self.reader.is_y4m:

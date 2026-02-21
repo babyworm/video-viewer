@@ -87,6 +87,7 @@ class VideoReader:
         self.format_manager = FormatManager()
         self.y4m_header_len = 0
         self.y4m_frame_header_len = 6 # "FRAME\n"
+        self.warnings = []  # collect warnings for UI display
         self.y4m_fps = None
         self.y4m_interlace = "progressive"
         self.y4m_par = (1, 1)
@@ -199,7 +200,9 @@ class VideoReader:
                     elif colorspace.startswith("mono"):
                         self.format = self.format_manager.get_format("Greyscale (8-bit) [GREY]")
                     else:
-                        logger.warning("Unknown Y4M colorspace '%s', falling back to I420", colorspace)
+                        msg = f"Unknown Y4M colorspace '{colorspace}', falling back to I420"
+                        logger.warning(msg)
+                        self.warnings.append(msg)
                 elif part.startswith('F'):
                     # Frame rate: F25:1 or F30000:1001
                     try:
@@ -225,7 +228,9 @@ class VideoReader:
 
             if not getattr(self, 'format', None):
                 # Default to I420 if colorspace unknown or unspecified
-                logger.warning("Y4M colorspace not recognized, defaulting to I420")
+                msg = "Y4M colorspace not recognized, defaulting to I420"
+                logger.warning(msg)
+                self.warnings.append(msg)
                 self.format = self.format_manager.get_format("I420 (4:2:0) [YU12]")
 
             self.frame_size = self.format.calculate_frame_size(self.width, self.height)
