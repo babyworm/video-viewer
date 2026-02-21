@@ -45,8 +45,6 @@ COMMON_GUESS_FORMATS = ["I420", "NV12", "YUYV", "RGB24"]
 
 # Dark theme stylesheet
 DARK_STYLE = """
-QMainWindow, QDialog { background-color: #2b2b2b; color: #dcdcdc; }
-QWidget { background-color: #2b2b2b; color: #dcdcdc; }
 QMenuBar { background-color: #3c3f41; color: #dcdcdc; }
 QMenuBar::item:selected { background-color: #4b6eaf; }
 QMenu { background-color: #3c3f41; color: #dcdcdc; border: 1px solid #555; }

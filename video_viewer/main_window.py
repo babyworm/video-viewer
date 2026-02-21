@@ -1061,7 +1061,7 @@ class MainWindow(QMainWindow):
         self.combo_fps.setCurrentText("30")
         self.combo_fps.setFixedWidth(60)
         self.combo_fps.currentTextChanged.connect(self._update_playback_fps)
-        self.combo_fps.activated.connect(lambda: self.combo_fps.hidePopup())
+
         nav_layout.addWidget(QLabel("FPS:"))
         nav_layout.addWidget(self.combo_fps)
 
@@ -2253,8 +2253,23 @@ class MainWindow(QMainWindow):
         self._dark_theme = enable
         app = QApplication.instance()
         if enable:
+            from PySide6.QtGui import QPalette, QColor
+            palette = QPalette()
+            dark = QColor(43, 43, 43)
+            text = QColor(220, 220, 220)
+            palette.setColor(QPalette.ColorRole.Window, dark)
+            palette.setColor(QPalette.ColorRole.WindowText, text)
+            palette.setColor(QPalette.ColorRole.Base, QColor(50, 50, 50))
+            palette.setColor(QPalette.ColorRole.AlternateBase, dark)
+            palette.setColor(QPalette.ColorRole.Text, text)
+            palette.setColor(QPalette.ColorRole.Button, QColor(60, 63, 65))
+            palette.setColor(QPalette.ColorRole.ButtonText, text)
+            palette.setColor(QPalette.ColorRole.Highlight, QColor(75, 110, 175))
+            palette.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
+            app.setPalette(palette)
             app.setStyleSheet(DARK_STYLE)
         else:
+            app.setPalette(app.style().standardPalette())
             app.setStyleSheet("")
         self._settings.setValue("dark_theme", enable)
         self._refresh_custom_icons()
@@ -2563,7 +2578,7 @@ class MainWindow(QMainWindow):
         combo_algo = QComboBox()
         algo_names = [a[0] for a in self._SCENE_ALGORITHMS]
         combo_algo.addItems(algo_names)
-        combo_algo.activated.connect(lambda: combo_algo.hidePopup())
+
         form.addRow("Algorithm:", combo_algo)
 
         from PySide6.QtWidgets import QDoubleSpinBox
