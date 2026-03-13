@@ -52,6 +52,9 @@ impl ImageCanvas {
             ui.allocate_painter(available, egui::Sense::click_and_drag().union(egui::Sense::hover()));
         let panel_rect = response.rect;
 
+        // Clear background to prevent resize artifacts.
+        painter.rect_filled(panel_rect, 0.0, ui.visuals().extreme_bg_color);
+
         if let (Some(ref texture), Some((w, h))) = (&self.texture, self.image_size) {
             let img_w = w as f32 * self.zoom;
             let img_h = h as f32 * self.zoom;
