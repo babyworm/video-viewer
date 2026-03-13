@@ -1209,7 +1209,7 @@ pub fn show_about_dialog(ctx: &egui::Context) -> bool {
             ui.label("YUV/Raw Video Viewer with egui");
             ui.label("Copyright (c) babyworm (Hyun-Gyu Kim)");
             ui.separator();
-            ui.label("Built with egui, opencv-rust, rayon");
+            ui.label("Built with egui, rayon");
         });
     open
 }

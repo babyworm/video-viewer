@@ -53,18 +53,16 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ```bash
 # Ubuntu / Debian
-sudo apt install libopencv-dev clang libxcb-render0-dev libxcb-shape0-dev \
+sudo apt install libxcb-render0-dev libxcb-shape0-dev \
   libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgtk-3-dev
 
 # Fedora
-sudo dnf install opencv-devel clang-devel libxcb-devel libxkbcommon-devel \
-  openssl-devel gtk3-devel
+sudo dnf install libxcb-devel libxkbcommon-devel openssl-devel gtk3-devel
 
 # Arch Linux
-sudo pacman -S opencv clang libxcb libxkbcommon openssl gtk3
+sudo pacman -S libxcb libxkbcommon openssl gtk3
 
-# macOS
-brew install opencv llvm
+# macOS (no extra dependencies needed)
 ```
 
 #### Build
@@ -159,7 +157,6 @@ Greyscale 8-bit, 10-bit, 12-bit, 16-bit
 |-------|---------|---------|
 | eframe / egui | Apache-2.0 OR MIT | GUI framework |
 | egui_plot | Apache-2.0 OR MIT | Plot widgets (histogram, waveform, vectorscope) |
-| opencv | MIT | Image processing, color conversion |
 | clap | Apache-2.0 OR MIT | CLI argument parsing |
 | memmap2 | Apache-2.0 OR MIT | Memory-mapped file I/O |
 | rayon | Apache-2.0 OR MIT | Parallel processing |
@@ -206,7 +203,7 @@ rust/
 │   └── conversion/      # Format converter, chroma resampling
 ├── tests/               # Integration tests (110 tests)
 scripts/
-└── generate_test_data.py  # Test data generator (Python/OpenCV)
+└── generate_test_data.py  # Test data generator (Python)
 test_data/                 # Sample QCIF files (I420, NV12, RGB565, YUYV)
 ```
 
