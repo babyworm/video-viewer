@@ -493,6 +493,17 @@ fn convert_via_rgb(
                 .map_err(|e| e.to_string())?;
             mat_to_rgb_vec(&rgb_mat)?
         }
+        FormatType::Rgb => {
+            // 32-bit and 16-bit RGB variants → RGB24
+            rgb_variant_to_rgb24(frame, w, h, src_fmt)?
+        }
+        FormatType::Bayer if src_fmt.bit_depth == 8 => {
+            bayer_to_rgb24(frame, w, h, src_fmt)?
+        }
+        FormatType::Bayer => {
+            // 10/12/16-bit Bayer: truncate to 8-bit, then demosaic
+            bayer_highbit_to_rgb24(frame, w, h, src_fmt)?
+        }
         FormatType::Grey if src_fmt.bit_depth == 8 => {
             let grey_mat = unsafe {
                 Mat::new_rows_cols_with_data_unsafe(
@@ -506,7 +517,11 @@ fn convert_via_rgb(
                 .map_err(|e| e.to_string())?;
             mat_to_rgb_vec(&rgb_mat)?
         }
-        _ => {
+        FormatType::Grey => {
+            // 10/12/16-bit greyscale: 2 bytes per pixel LE, shift to 8-bit
+            grey_highbit_to_rgb24(frame, w, h, src_fmt)?
+        }
+        _ if is_yuv(src_fmt) => {
             // For other YUV variants, extract planes, upsample to 444, convert manually
             let (y, u, v) = extract_yuv_planes(frame, w, h, src_fmt);
             let (s_h, s_v) = (src_fmt.subsampling.0, src_fmt.subsampling.1);
@@ -526,6 +541,12 @@ fn convert_via_rgb(
             }
             rgb
         }
+        _ => {
+            return Err(format!(
+                "Conversion from format '{}' ({}) not supported as source",
+                src_fmt.name, src_fmt.fourcc
+            ));
+        }
     };
 
     // --- Step 2: RGB -> dst format ---
@@ -544,6 +565,10 @@ fn convert_via_rgb(
                 .map_err(|e| e.to_string())?;
             mat_to_rgb_vec(&bgr_mat)
         }
+        FormatType::Rgb => {
+            // RGB24 → 32-bit/16-bit RGB variants
+            rgb24_to_rgb_variant(&rgb, w, h, dst_fmt)
+        }
         FormatType::Grey if dst_fmt.bit_depth == 8 => {
             let rgb_mat = unsafe {
                 Mat::new_rows_cols_with_data_unsafe(
@@ -556,6 +581,10 @@ fn convert_via_rgb(
             imgproc::cvt_color(&rgb_mat, &mut grey_mat, imgproc::COLOR_RGB2GRAY, 0)
                 .map_err(|e| e.to_string())?;
             mat_to_rgb_vec(&grey_mat)
+        }
+        FormatType::Grey => {
+            // 10/12/16-bit greyscale destination: convert to 8-bit grey, then upshift
+            rgb24_to_grey_highbit(&rgb, w, h, dst_fmt)
         }
         _ if is_yuv(dst_fmt) => {
             // RGB -> YUV via manual BT.601 then pack
@@ -583,6 +612,376 @@ fn convert_via_rgb(
             dst_fmt.name
         )),
     }
+}
+
+/// Convert 32-bit/16-bit RGB variant → RGB24.
+fn rgb_variant_to_rgb24(frame: &[u8], w: u32, h: u32, fmt: &VideoFormat) -> Result<Vec<u8>, String> {
+    let pixels = (w * h) as usize;
+    let mut rgb = vec![0u8; pixels * 3];
+    let fc = fmt.fourcc.as_str();
+
+    match fc {
+        // 32-bit: 4 bytes per pixel
+        "RGB4" => { // RGB32: R G B X
+            for i in 0..pixels { rgb[i*3]=frame[i*4]; rgb[i*3+1]=frame[i*4+1]; rgb[i*3+2]=frame[i*4+2]; }
+        }
+        "BGR4" => { // BGR32: B G R X
+            for i in 0..pixels { rgb[i*3]=frame[i*4+2]; rgb[i*3+1]=frame[i*4+1]; rgb[i*3+2]=frame[i*4]; }
+        }
+        "BA24" => { // ARGB32: A R G B
+            for i in 0..pixels { rgb[i*3]=frame[i*4+1]; rgb[i*3+1]=frame[i*4+2]; rgb[i*3+2]=frame[i*4+3]; }
+        }
+        "AR24" => { // ABGR32: A B G R
+            for i in 0..pixels { rgb[i*3]=frame[i*4+3]; rgb[i*3+1]=frame[i*4+2]; rgb[i*3+2]=frame[i*4+1]; }
+        }
+        "AB24" => { // RGBA32: R G B A
+            for i in 0..pixels { rgb[i*3]=frame[i*4]; rgb[i*3+1]=frame[i*4+1]; rgb[i*3+2]=frame[i*4+2]; }
+        }
+        "RA24" => { // BGRA32: B G R A
+            for i in 0..pixels { rgb[i*3]=frame[i*4+2]; rgb[i*3+1]=frame[i*4+1]; rgb[i*3+2]=frame[i*4]; }
+        }
+        "XB24" | "XR24" | "BX24" | "RX24" => {
+            // XRGB/XBGR/RGBX/BGRX — same layout as ARGB/ABGR/RGBA/BGRA, alpha ignored
+            let mapped = match fc {
+                "XB24" => "BA24", // XRGB → treat as ARGB
+                "XR24" => "AR24", // XBGR → treat as ABGR
+                "BX24" => "AB24", // RGBX → treat as RGBA
+                "RX24" => "RA24", // BGRX → treat as BGRA
+                _ => unreachable!(),
+            };
+            let mut fake_fmt = fmt.clone();
+            fake_fmt.fourcc = mapped.to_string();
+            return rgb_variant_to_rgb24(frame, w, h, &fake_fmt);
+        }
+        // 16-bit: 2 bytes per pixel
+        "RGBP" => { // RGB565: RRRRRGGG GGGBBBBB
+            for i in 0..pixels {
+                let v = u16::from_le_bytes([frame[i*2], frame[i*2+1]]);
+                rgb[i*3]   = ((v >> 11) as u8) << 3;
+                rgb[i*3+1] = (((v >> 5) & 0x3F) as u8) << 2;
+                rgb[i*3+2] = ((v & 0x1F) as u8) << 3;
+            }
+        }
+        "RGBO" => { // RGB555: 0RRRRRGGGGGBBBBB
+            for i in 0..pixels {
+                let v = u16::from_le_bytes([frame[i*2], frame[i*2+1]]);
+                rgb[i*3]   = (((v >> 10) & 0x1F) as u8) << 3;
+                rgb[i*3+1] = (((v >> 5) & 0x1F) as u8) << 3;
+                rgb[i*3+2] = ((v & 0x1F) as u8) << 3;
+            }
+        }
+        "R444" => { // RGB444: 0000RRRRGGGGBBBB
+            for i in 0..pixels {
+                let v = u16::from_le_bytes([frame[i*2], frame[i*2+1]]);
+                rgb[i*3]   = (((v >> 8) & 0xF) as u8) << 4;
+                rgb[i*3+1] = (((v >> 4) & 0xF) as u8) << 4;
+                rgb[i*3+2] = ((v & 0xF) as u8) << 4;
+            }
+        }
+        "RGB1" => { // RGB332: RRRGGGBB
+            for i in 0..pixels {
+                let v = frame[i];
+                rgb[i*3]   = (v >> 5) << 5;
+                rgb[i*3+1] = ((v >> 2) & 0x07) << 5;
+                rgb[i*3+2] = (v & 0x03) << 6;
+            }
+        }
+        _ => {
+            return Err(format!("RGB variant '{}' ({}) not supported as source", fmt.name, fc));
+        }
+    }
+    Ok(rgb)
+}
+
+/// Convert RGB24 → 32-bit/16-bit RGB variant.
+fn rgb24_to_rgb_variant(rgb: &[u8], w: u32, h: u32, fmt: &VideoFormat) -> Result<Vec<u8>, String> {
+    let pixels = (w * h) as usize;
+    let fc = fmt.fourcc.as_str();
+
+    match fc {
+        // 32-bit
+        "RGB4" => {
+            let mut out = vec![0u8; pixels * 4];
+            for i in 0..pixels { out[i*4]=rgb[i*3]; out[i*4+1]=rgb[i*3+1]; out[i*4+2]=rgb[i*3+2]; out[i*4+3]=0xFF; }
+            Ok(out)
+        }
+        "BGR4" => {
+            let mut out = vec![0u8; pixels * 4];
+            for i in 0..pixels { out[i*4]=rgb[i*3+2]; out[i*4+1]=rgb[i*3+1]; out[i*4+2]=rgb[i*3]; out[i*4+3]=0xFF; }
+            Ok(out)
+        }
+        "BA24" => { // ARGB
+            let mut out = vec![0u8; pixels * 4];
+            for i in 0..pixels { out[i*4]=0xFF; out[i*4+1]=rgb[i*3]; out[i*4+2]=rgb[i*3+1]; out[i*4+3]=rgb[i*3+2]; }
+            Ok(out)
+        }
+        "AR24" => { // ABGR
+            let mut out = vec![0u8; pixels * 4];
+            for i in 0..pixels { out[i*4]=0xFF; out[i*4+1]=rgb[i*3+2]; out[i*4+2]=rgb[i*3+1]; out[i*4+3]=rgb[i*3]; }
+            Ok(out)
+        }
+        "AB24" => { // RGBA
+            let mut out = vec![0u8; pixels * 4];
+            for i in 0..pixels { out[i*4]=rgb[i*3]; out[i*4+1]=rgb[i*3+1]; out[i*4+2]=rgb[i*3+2]; out[i*4+3]=0xFF; }
+            Ok(out)
+        }
+        "RA24" => { // BGRA
+            let mut out = vec![0u8; pixels * 4];
+            for i in 0..pixels { out[i*4]=rgb[i*3+2]; out[i*4+1]=rgb[i*3+1]; out[i*4+2]=rgb[i*3]; out[i*4+3]=0xFF; }
+            Ok(out)
+        }
+        "XB24" | "XR24" | "BX24" | "RX24" => {
+            let mapped = match fc {
+                "XB24" => "BA24", "XR24" => "AR24", "BX24" => "AB24", "RX24" => "RA24", _ => unreachable!(),
+            };
+            let mut fake_fmt = fmt.clone();
+            fake_fmt.fourcc = mapped.to_string();
+            rgb24_to_rgb_variant(rgb, w, h, &fake_fmt)
+        }
+        "AR12" | "AR15" | "XR12" | "XR15" => {
+            // 16-bit ARGB variants → same as non-alpha versions
+            let mapped = match fc {
+                "AR12" | "XR12" => "R444", "AR15" | "XR15" => "RGBO", _ => unreachable!(),
+            };
+            let mut fake_fmt = fmt.clone();
+            fake_fmt.fourcc = mapped.to_string();
+            rgb24_to_rgb_variant(rgb, w, h, &fake_fmt)
+        }
+        // 16-bit
+        "RGBP" => { // RGB565
+            let mut out = vec![0u8; pixels * 2];
+            for i in 0..pixels {
+                let r = (rgb[i*3] >> 3) as u16;
+                let g = (rgb[i*3+1] >> 2) as u16;
+                let b = (rgb[i*3+2] >> 3) as u16;
+                let v = (r << 11) | (g << 5) | b;
+                let bytes = v.to_le_bytes();
+                out[i*2] = bytes[0]; out[i*2+1] = bytes[1];
+            }
+            Ok(out)
+        }
+        "RGBO" | "RGBQ" => { // RGB555/RGB555X
+            let mut out = vec![0u8; pixels * 2];
+            for i in 0..pixels {
+                let r = (rgb[i*3] >> 3) as u16;
+                let g = (rgb[i*3+1] >> 3) as u16;
+                let b = (rgb[i*3+2] >> 3) as u16;
+                let v = (r << 10) | (g << 5) | b;
+                let bytes = if fc == "RGBQ" { v.to_be_bytes() } else { v.to_le_bytes() };
+                out[i*2] = bytes[0]; out[i*2+1] = bytes[1];
+            }
+            Ok(out)
+        }
+        "RGBR" => { // RGB565X (big-endian)
+            let mut out = vec![0u8; pixels * 2];
+            for i in 0..pixels {
+                let r = (rgb[i*3] >> 3) as u16;
+                let g = (rgb[i*3+1] >> 2) as u16;
+                let b = (rgb[i*3+2] >> 3) as u16;
+                let v = (r << 11) | (g << 5) | b;
+                let bytes = v.to_be_bytes();
+                out[i*2] = bytes[0]; out[i*2+1] = bytes[1];
+            }
+            Ok(out)
+        }
+        "R444" => { // RGB444
+            let mut out = vec![0u8; pixels * 2];
+            for i in 0..pixels {
+                let r = (rgb[i*3] >> 4) as u16;
+                let g = (rgb[i*3+1] >> 4) as u16;
+                let b = (rgb[i*3+2] >> 4) as u16;
+                let v = (r << 8) | (g << 4) | b;
+                let bytes = v.to_le_bytes();
+                out[i*2] = bytes[0]; out[i*2+1] = bytes[1];
+            }
+            Ok(out)
+        }
+        "RGB1" => { // RGB332
+            let mut out = vec![0u8; pixels];
+            for i in 0..pixels {
+                out[i] = (rgb[i*3] & 0xE0) | ((rgb[i*3+1] >> 3) & 0x1C) | (rgb[i*3+2] >> 6);
+            }
+            Ok(out)
+        }
+        _ => Err(format!("Conversion to RGB variant '{}' ({}) not supported", fmt.name, fc)),
+    }
+}
+
+/// Bayer 8-bit → RGB24 via simple bilinear demosaic.
+fn bayer_to_rgb24(frame: &[u8], w: u32, h: u32, fmt: &VideoFormat) -> Result<Vec<u8>, String> {
+    let w = w as usize;
+    let h = h as usize;
+    let mut rgb = vec![0u8; w * h * 3];
+    let fc = fmt.fourcc.as_str();
+
+    // Determine pattern: which color is at (0,0)?
+    // RGGB: R at (0,0), G at (0,1)/(1,0), B at (1,1)
+    // BGGR: B at (0,0), G at (0,1)/(1,0), R at (1,1)
+    // GBRG: G at (0,0), B at (0,1), R at (1,0), G at (1,1)
+    // GRBG: G at (0,0), R at (0,1), B at (1,0), G at (1,1)
+    let (r_row, r_col, b_row, b_col) = match fc {
+        "RGGB" => (0usize, 0usize, 1usize, 1usize),
+        "BGGR" => (1, 1, 0, 0),
+        "GBRG" => (1, 0, 0, 1),
+        "GRBG" => (0, 1, 1, 0),
+        _ => return Err(format!("Unsupported Bayer pattern: {fc}")),
+    };
+
+    // Simple nearest-neighbor demosaic (good enough for conversion)
+    for y in 0..h {
+        for x in 0..w {
+            let idx = y * w + x;
+            let yr = y % 2;
+            let xr = x % 2;
+
+            let (r, g, b);
+            if yr == r_row && xr == r_col {
+                // Red pixel
+                r = frame[idx];
+                g = avg_neighbors_cross(frame, w, h, x, y);
+                b = avg_neighbors_diag(frame, w, h, x, y);
+            } else if yr == b_row && xr == b_col {
+                // Blue pixel
+                b = frame[idx];
+                g = avg_neighbors_cross(frame, w, h, x, y);
+                r = avg_neighbors_diag(frame, w, h, x, y);
+            } else {
+                // Green pixel
+                g = frame[idx];
+                if yr == r_row {
+                    r = avg_neighbors_h(frame, w, x, y);
+                    b = avg_neighbors_v(frame, w, h, x, y);
+                } else {
+                    b = avg_neighbors_h(frame, w, x, y);
+                    r = avg_neighbors_v(frame, w, h, x, y);
+                }
+            }
+
+            rgb[idx * 3] = r;
+            rgb[idx * 3 + 1] = g;
+            rgb[idx * 3 + 2] = b;
+        }
+    }
+    Ok(rgb)
+}
+
+fn avg_neighbors_cross(data: &[u8], w: usize, h: usize, x: usize, y: usize) -> u8 {
+    let mut sum = 0u32;
+    let mut count = 0u32;
+    if x > 0 { sum += data[y * w + x - 1] as u32; count += 1; }
+    if x + 1 < w { sum += data[y * w + x + 1] as u32; count += 1; }
+    if y > 0 { sum += data[(y - 1) * w + x] as u32; count += 1; }
+    if y + 1 < h { sum += data[(y + 1) * w + x] as u32; count += 1; }
+    if count == 0 { data[y * w + x] } else { (sum / count) as u8 }
+}
+
+fn avg_neighbors_diag(data: &[u8], w: usize, h: usize, x: usize, y: usize) -> u8 {
+    let mut sum = 0u32;
+    let mut count = 0u32;
+    if x > 0 && y > 0 { sum += data[(y-1) * w + x-1] as u32; count += 1; }
+    if x+1 < w && y > 0 { sum += data[(y-1) * w + x+1] as u32; count += 1; }
+    if x > 0 && y+1 < h { sum += data[(y+1) * w + x-1] as u32; count += 1; }
+    if x+1 < w && y+1 < h { sum += data[(y+1) * w + x+1] as u32; count += 1; }
+    if count == 0 { data[y * w + x] } else { (sum / count) as u8 }
+}
+
+fn avg_neighbors_h(data: &[u8], w: usize, x: usize, y: usize) -> u8 {
+    let mut sum = 0u32;
+    let mut count = 0u32;
+    if x > 0 { sum += data[y * w + x - 1] as u32; count += 1; }
+    if x + 1 < w { sum += data[y * w + x + 1] as u32; count += 1; }
+    if count == 0 { data[y * w + x] } else { (sum / count) as u8 }
+}
+
+fn avg_neighbors_v(data: &[u8], w: usize, h: usize, x: usize, y: usize) -> u8 {
+    let mut sum = 0u32;
+    let mut count = 0u32;
+    if y > 0 { sum += data[(y - 1) * w + x] as u32; count += 1; }
+    if y + 1 < h { sum += data[(y + 1) * w + x] as u32; count += 1; }
+    if count == 0 { data[y * w + x] } else { (sum / count) as u8 }
+}
+
+/// High bit-depth Bayer (10/12/16-bit, 2 bytes LE per pixel) → RGB24.
+/// Truncates to 8-bit, then runs nearest-neighbor demosaic.
+fn bayer_highbit_to_rgb24(frame: &[u8], w: u32, h: u32, fmt: &VideoFormat) -> Result<Vec<u8>, String> {
+    let pixels = (w as usize) * (h as usize);
+    let shift = fmt.bit_depth.saturating_sub(8);
+    // Check for MIPI CSI-2 packed (10-bit packed = 5 bytes per 4 pixels)
+    let is_packed = matches!(fmt.fourcc.as_str(), "pRAA" | "pBAA" | "pGAA" | "pGBA");
+
+    let data_8bit: Vec<u8> = if is_packed {
+        // MIPI CSI-2 10-bit packed: 4 pixels in 5 bytes
+        let mut out = vec![0u8; pixels];
+        let mut si = 0;
+        let mut di = 0;
+        while di + 3 < pixels && si + 4 < frame.len() {
+            // Top 8 bits of each 10-bit sample
+            out[di]     = frame[si];
+            out[di + 1] = frame[si + 1];
+            out[di + 2] = frame[si + 2];
+            out[di + 3] = frame[si + 3];
+            si += 5;
+            di += 4;
+        }
+        out
+    } else {
+        // 16-bit LE container
+        let mut out = vec![0u8; pixels];
+        for i in 0..pixels {
+            let lo = frame[i * 2] as u16;
+            let hi = frame[i * 2 + 1] as u16;
+            let val = lo | (hi << 8);
+            out[i] = (val >> shift) as u8;
+        }
+        out
+    };
+
+    // Map fourcc to base 8-bit pattern
+    let base_pattern = match fmt.fourcc.as_str() {
+        "RG10" | "RG12" | "RG16" | "pRAA" => "RGGB",
+        "BG10" | "BG12" | "BG16" | "pBAA" => "BGGR",
+        "GB10" | "GB12" | "GB16" | "pGAA" => "GBRG",
+        "BA10" | "BA12" | "GR16" | "pGBA" => "GRBG",
+        _ => return Err(format!("Unknown high-bit Bayer pattern: {}", fmt.fourcc)),
+    };
+
+    let mut fake_fmt = fmt.clone();
+    fake_fmt.fourcc = base_pattern.to_string();
+    fake_fmt.bit_depth = 8;
+    bayer_to_rgb24(&data_8bit, w, h, &fake_fmt)
+}
+
+/// High bit-depth greyscale (10/12/16-bit, 2 bytes LE) → RGB24.
+fn grey_highbit_to_rgb24(frame: &[u8], w: u32, h: u32, fmt: &VideoFormat) -> Result<Vec<u8>, String> {
+    let pixels = (w as usize) * (h as usize);
+    let shift = fmt.bit_depth.saturating_sub(8);
+    let mut rgb = vec![0u8; pixels * 3];
+    for i in 0..pixels {
+        let lo = frame[i * 2] as u16;
+        let hi = frame[i * 2 + 1] as u16;
+        let val = ((lo | (hi << 8)) >> shift) as u8;
+        rgb[i * 3] = val;
+        rgb[i * 3 + 1] = val;
+        rgb[i * 3 + 2] = val;
+    }
+    Ok(rgb)
+}
+
+/// RGB24 → high bit-depth greyscale (10/12/16-bit, 2 bytes LE).
+fn rgb24_to_grey_highbit(rgb: &[u8], w: u32, h: u32, fmt: &VideoFormat) -> Result<Vec<u8>, String> {
+    let pixels = (w as usize) * (h as usize);
+    let shift = fmt.bit_depth.saturating_sub(8);
+    let mut out = vec![0u8; pixels * 2];
+    for i in 0..pixels {
+        let r = rgb[i * 3] as f32;
+        let g = rgb[i * 3 + 1] as f32;
+        let b = rgb[i * 3 + 2] as f32;
+        let grey = (0.299 * r + 0.587 * g + 0.114 * b).clamp(0.0, 255.0) as u16;
+        let val = grey << shift;
+        out[i * 2] = val as u8;
+        out[i * 2 + 1] = (val >> 8) as u8;
+    }
+    Ok(out)
 }
 
 fn mat_to_rgb_vec(mat: &opencv::core::Mat) -> Result<Vec<u8>, String> {

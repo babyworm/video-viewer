@@ -1,4 +1,6 @@
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 use eframe::egui;
 
@@ -56,6 +58,12 @@ pub struct VideoViewerApp {
     auto_fit: bool,
     /// Last known available size for auto-fit detection.
     last_available_size: Option<(f32, f32)>,
+    /// Background conversion progress tracking.
+    convert_progress_current: Arc<AtomicUsize>,
+    convert_progress_total: Arc<AtomicUsize>,
+    convert_done: Arc<AtomicBool>,
+    convert_error: Arc<std::sync::Mutex<Option<String>>>,
+    convert_running: bool,
 }
 
 impl VideoViewerApp {
@@ -109,6 +117,11 @@ impl VideoViewerApp {
             render_fps: 0.0,
             auto_fit: true,
             last_available_size: None,
+            convert_progress_current: Arc::new(AtomicUsize::new(0)),
+            convert_progress_total: Arc::new(AtomicUsize::new(0)),
+            convert_done: Arc::new(AtomicBool::new(false)),
+            convert_error: Arc::new(std::sync::Mutex::new(None)),
+            convert_running: false,
         }
     }
 
@@ -455,7 +468,6 @@ impl VideoViewerApp {
     }
 
     fn run_conversion(&mut self, out_format: &str, out_path: &str) {
-        use crate::conversion::converter::VideoConverter;
         let reader = match self.reader.as_ref() {
             Some(r) => r,
             None => {
@@ -470,21 +482,46 @@ impl VideoViewerApp {
         let src_fmt = reader.format_name().to_string();
         let w = reader.width();
         let h = reader.height();
+        let out_format = out_format.to_string();
+        let out_path = out_path.to_string();
 
-        let converter = VideoConverter::new();
-        match converter.convert(&in_path, w, h, &src_fmt, out_path, out_format, None) {
-            Ok((count, cancelled)) => {
-                if cancelled {
-                    self.status_error = Some("Conversion cancelled".to_string());
-                } else {
-                    self.status_error = None;
-                    log::info!("Converted {} frames to {}", count, out_path);
+        // Reset progress
+        self.convert_progress_current.store(0, Ordering::Relaxed);
+        self.convert_progress_total.store(0, Ordering::Relaxed);
+        self.convert_done.store(false, Ordering::Relaxed);
+        *self.convert_error.lock().unwrap() = None;
+        self.convert_running = true;
+
+        let progress_current = Arc::clone(&self.convert_progress_current);
+        let progress_total = Arc::clone(&self.convert_progress_total);
+        let done = Arc::clone(&self.convert_done);
+        let error = Arc::clone(&self.convert_error);
+
+        std::thread::spawn(move || {
+            use crate::conversion::converter::VideoConverter;
+            let converter = VideoConverter::new();
+            let cb = |current: usize, total: usize| -> bool {
+                progress_current.store(current, Ordering::Relaxed);
+                progress_total.store(total, Ordering::Relaxed);
+                true // never cancel (for now)
+            };
+            match converter.convert(&in_path, w, h, &src_fmt, &out_path, &out_format, Some(&cb)) {
+                Ok((count, cancelled)) => {
+                    if cancelled {
+                        *error.lock().unwrap() = Some("Conversion cancelled".to_string());
+                    } else {
+                        // Store total as final count
+                        progress_current.store(count, Ordering::Relaxed);
+                        progress_total.store(count, Ordering::Relaxed);
+                        log::info!("Converted {} frames to {}", count, out_path);
+                    }
+                }
+                Err(e) => {
+                    *error.lock().unwrap() = Some(format!("Convert error: {e}"));
                 }
             }
-            Err(e) => {
-                self.status_error = Some(format!("Convert error: {e}"));
-            }
-        }
+            done.store(true, Ordering::Relaxed);
+        });
     }
 
     fn copy_frame_to_clipboard(&self) {
@@ -850,7 +887,10 @@ impl eframe::App for VideoViewerApp {
                         } else {
                             "No file loaded".to_string()
                         };
-                        self.convert_dialog = Some(dialogs::ConvertDialog::new(&info));
+                        self.convert_dialog = Some(dialogs::ConvertDialog::new(
+                            &info,
+                            self.current_file.as_deref(),
+                        ));
                         self.dialog_state = DialogState::Convert;
                     }
                     if ui.button("Copy Frame (Ctrl+C)").clicked() {
@@ -871,7 +911,7 @@ impl eframe::App for VideoViewerApp {
 
                 // --- Window control buttons (right-aligned) ---
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("✕").clicked() {
+                    if ui.button("x").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                     let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
@@ -1164,13 +1204,41 @@ impl VideoViewerApp {
 
         // Convert dialog
         if self.dialog_state == DialogState::Convert {
+            // Poll background conversion progress
+            if self.convert_running {
+                let current = self.convert_progress_current.load(Ordering::Relaxed);
+                let total = self.convert_progress_total.load(Ordering::Relaxed);
+                if let Some(ref mut dlg) = self.convert_dialog {
+                    dlg.progress = Some((current, total));
+                }
+                ctx.request_repaint(); // keep UI updating during conversion
+
+                if self.convert_done.load(Ordering::Relaxed) {
+                    self.convert_running = false;
+                    let err = self.convert_error.lock().unwrap().take();
+                    if let Some(e) = err {
+                        self.status_error = Some(e);
+                    } else {
+                        self.status_error = None;
+                    }
+                    if let Some(ref mut dlg) = self.convert_dialog {
+                        dlg.progress = None;
+                    }
+                    self.dialog_state = DialogState::None;
+                    self.convert_dialog = None;
+                }
+            }
+
             if let Some(ref mut dlg) = self.convert_dialog {
                 if let Some(result) = dlg.show(ctx) {
                     if let Some((out_format, out_path)) = result {
                         self.run_conversion(&out_format, &out_path);
+                        // Don't close dialog yet — it stays open showing progress
+                    } else {
+                        // Cancel
+                        self.dialog_state = DialogState::None;
+                        self.convert_dialog = None;
                     }
-                    self.dialog_state = DialogState::None;
-                    self.convert_dialog = None;
                 }
             }
         }
