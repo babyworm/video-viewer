@@ -4,6 +4,8 @@ use crate::core::formats::get_all_formats;
 #[derive(Debug, Clone, PartialEq)]
 pub enum DialogState {
     None,
+    OpenFile,
+    SaveFile,
     Parameters,
     Export,
     Convert,
@@ -443,6 +445,262 @@ impl SettingsDialog {
 
         if !open {
             return Some(false);
+        }
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Open File Dialog (text-based path input, fallback for when rfd is unavailable)
+// ---------------------------------------------------------------------------
+
+pub struct OpenFileDialog {
+    pub path: String,
+    pub width: u32,
+    pub height: u32,
+    pub format_idx: usize,
+    pub format_names: Vec<String>,
+    pub is_y4m: bool,
+    /// Track last path for which hints were applied, to avoid re-overriding user edits.
+    last_hinted_path: String,
+}
+
+impl OpenFileDialog {
+    pub fn new(default_width: u32, default_height: u32, default_format: &str) -> Self {
+        let format_names: Vec<String> = get_all_formats()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        let format_idx = format_names
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(default_format))
+            .unwrap_or(0);
+        Self {
+            path: String::new(),
+            width: default_width,
+            height: default_height,
+            format_idx,
+            format_names,
+            is_y4m: false,
+            last_hinted_path: String::new(),
+        }
+    }
+
+    /// Returns Some((path, w, h, format)) on Open, None on cancel, stays open otherwise.
+    pub fn show(&mut self, ctx: &egui::Context) -> Option<Option<(String, u32, u32, String)>> {
+        let mut result = None;
+        let mut open = true;
+
+        egui::Window::new("Open File")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .min_width(400.0)
+            .show(ctx, |ui| {
+                egui::Grid::new("open_file_grid")
+                    .num_columns(2)
+                    .spacing(egui::vec2(8.0, 4.0))
+                    .show(ui, |ui| {
+                        ui.label("File path:");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.path)
+                                    .desired_width(300.0)
+                                    .hint_text("/path/to/video.yuv"),
+                            );
+                            if ui.button("Browse...").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter(
+                                        "Video",
+                                        &["yuv", "y4m", "rgb", "raw", "nv12", "nv21"],
+                                    )
+                                    .pick_file()
+                                {
+                                    self.path = path.display().to_string();
+                                }
+                            }
+                        });
+                        ui.end_row();
+
+                        // Auto-detect Y4M and apply hints when path changes
+                        let ext = std::path::Path::new(&self.path)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+                        self.is_y4m = ext == "y4m";
+
+                        // Auto-fill from filename hints when path changes
+                        if !self.is_y4m && self.path != self.last_hinted_path && !self.path.is_empty() {
+                            let hints = crate::core::hints::parse_filename_hints(&self.path);
+                            if let Some(w) = hints.width {
+                                self.width = w;
+                            }
+                            if let Some(h) = hints.height {
+                                self.height = h;
+                            }
+                            if let Some(ref fmt) = hints.format {
+                                if let Some(idx) = self.format_names.iter().position(|n| n.eq_ignore_ascii_case(fmt)) {
+                                    self.format_idx = idx;
+                                }
+                            }
+                            self.last_hinted_path = self.path.clone();
+                        }
+
+                        if !self.is_y4m {
+                            ui.label("Width:");
+                            ui.add(egui::DragValue::new(&mut self.width).range(1..=8192));
+                            ui.end_row();
+
+                            ui.label("Height:");
+                            ui.add(egui::DragValue::new(&mut self.height).range(1..=8192));
+                            ui.end_row();
+
+                            ui.label("Format:");
+                            let current = self
+                                .format_names
+                                .get(self.format_idx)
+                                .cloned()
+                                .unwrap_or_default();
+                            egui::ComboBox::from_id_salt("open_format_combo")
+                                .selected_text(&current)
+                                .show_ui(ui, |ui| {
+                                    for (idx, name) in self.format_names.iter().enumerate() {
+                                        ui.selectable_value(&mut self.format_idx, idx, name);
+                                    }
+                                });
+                            ui.end_row();
+                        } else {
+                            ui.label("Info:");
+                            ui.label("Y4M: parameters auto-detected from header");
+                            ui.end_row();
+                        }
+                    });
+
+                if !self.path.is_empty() {
+                    // Show hint-detected info
+                    let hints = crate::core::hints::parse_filename_hints(&self.path);
+                    if hints.width.is_some() || hints.format.is_some() {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Detected: {}{}{}",
+                                hints
+                                    .width
+                                    .map(|w| format!("{}x{}", w, hints.height.unwrap_or(0)))
+                                    .unwrap_or_default(),
+                                if hints.width.is_some() && hints.format.is_some() {
+                                    " "
+                                } else {
+                                    ""
+                                },
+                                hints.format.as_deref().unwrap_or(""),
+                            ))
+                            .color(egui::Color32::LIGHT_BLUE),
+                        );
+                    }
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let can_open = !self.path.is_empty()
+                        && std::path::Path::new(&self.path).exists();
+                    if ui
+                        .add_enabled(can_open, egui::Button::new("Open"))
+                        .clicked()
+                    {
+                        let (w, h, fmt) = if self.is_y4m {
+                            (0, 0, String::new())
+                        } else {
+                            (
+                                self.width,
+                                self.height,
+                                self.format_names
+                                    .get(self.format_idx)
+                                    .cloned()
+                                    .unwrap_or_else(|| "I420".to_string()),
+                            )
+                        };
+                        result = Some(Some((self.path.clone(), w, h, fmt)));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(None);
+                    }
+                    if !self.path.is_empty() && !std::path::Path::new(&self.path).exists() {
+                        ui.colored_label(egui::Color32::RED, "File not found");
+                    }
+                });
+            });
+
+        if !open {
+            return Some(None);
+        }
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Save File Dialog (text-based path input)
+// ---------------------------------------------------------------------------
+
+pub struct SaveFileDialog {
+    pub path: String,
+    pub title: String,
+}
+
+impl SaveFileDialog {
+    pub fn new(title: &str, default_name: &str) -> Self {
+        Self {
+            path: default_name.to_string(),
+            title: title.to_string(),
+        }
+    }
+
+    /// Returns Some(path) on Save, None on cancel.
+    pub fn show(&mut self, ctx: &egui::Context) -> Option<Option<String>> {
+        let mut result = None;
+        let mut open = true;
+
+        egui::Window::new(&self.title)
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .min_width(400.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Save to:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.path)
+                            .desired_width(300.0)
+                            .hint_text("/path/to/output.png"),
+                    );
+                    if ui.button("Browse...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("PNG", &["png"])
+                            .set_file_name(&self.path)
+                            .save_file()
+                        {
+                            self.path = path.display().to_string();
+                        }
+                    }
+                });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!self.path.is_empty(), egui::Button::new("Save"))
+                        .clicked()
+                    {
+                        result = Some(Some(self.path.clone()));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(None);
+                    }
+                });
+            });
+
+        if !open {
+            return Some(None);
         }
         result
     }

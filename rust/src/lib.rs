@@ -10,6 +10,14 @@ pub fn run_gui(
     height: Option<u32>,
     format: Option<String>,
 ) {
+    // Force software rendering on WSL2 / headless environments where GPU
+    // drivers are unavailable.  LIBGL_ALWAYS_SOFTWARE makes Mesa's llvmpipe
+    // kick in, and EGL_PLATFORM=x11 avoids the broken Wayland path.
+    if std::env::var("LIBGL_ALWAYS_SOFTWARE").is_err() {
+        // Only set if the user hasn't already chosen a value.
+        std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+    }
+
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
@@ -17,7 +25,7 @@ pub fn run_gui(
         ..Default::default()
     };
 
-    eframe::run_native(
+    if let Err(e) = eframe::run_native(
         "Video Viewer",
         options,
         Box::new(move |cc| {
@@ -29,6 +37,7 @@ pub fn run_gui(
                 format.clone(),
             )))
         }),
-    )
-    .unwrap();
+    ) {
+        log::error!("eframe exited with error: {e}");
+    }
 }
