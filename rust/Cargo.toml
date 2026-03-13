@@ -19,7 +19,6 @@ lru = "0.12"
 parking_lot = "0.12"
 crossbeam = "0.8"
 arboard = { version = "3", features = ["wayland-data-control"] }
-rfd = "0.15"
 log = "0.4"
 env_logger = "0.11"
 
