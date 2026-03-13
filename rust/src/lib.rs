@@ -1,6 +1,8 @@
 pub mod core;
 pub mod app;
 pub mod ui;
+pub mod analysis;
+pub mod conversion;
 
 pub fn run_gui(
     input: Option<String>,
@@ -8,8 +10,6 @@ pub fn run_gui(
     height: Option<u32>,
     format: Option<String>,
 ) {
-    let _ = (input, width, height, format); // will be used once VideoReader is integrated
-
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
@@ -20,7 +20,15 @@ pub fn run_gui(
     eframe::run_native(
         "Video Viewer",
         options,
-        Box::new(|cc| Ok(Box::new(app::VideoViewerApp::new(cc)))),
+        Box::new(move |cc| {
+            Ok(Box::new(app::VideoViewerApp::new(
+                cc,
+                input.clone(),
+                width,
+                height,
+                format.clone(),
+            )))
+        }),
     )
     .unwrap();
 }
