@@ -1,5 +1,6 @@
 use eframe::egui;
 use crate::core::formats::get_all_formats;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DialogState {
@@ -432,7 +433,178 @@ impl SettingsDialog {
 }
 
 // ---------------------------------------------------------------------------
-// Open File Dialog (text-based path input, fallback for when rfd is unavailable)
+// Inline File Browser (egui-based, no OS dialog dependency)
+// ---------------------------------------------------------------------------
+
+/// Video file extensions recognized by the browser filter.
+const VIDEO_EXTENSIONS: &[&str] = &[
+    "yuv", "y4m", "raw", "rgb", "bgr", "nv12", "nv21", "yuyv", "uyvy",
+    "yvyu", "i420", "yv12", "422p", "444p", "grey", "gray", "bayer",
+];
+
+struct FileBrowser {
+    current_dir: PathBuf,
+    entries: Vec<DirEntry>,
+    filter_video_only: bool,
+    error: Option<String>,
+}
+
+struct DirEntry {
+    name: String,
+    is_dir: bool,
+    full_path: PathBuf,
+}
+
+impl FileBrowser {
+    fn new() -> Self {
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/"));
+        let mut fb = Self {
+            current_dir: home,
+            entries: Vec::new(),
+            filter_video_only: false,
+            error: None,
+        };
+        fb.refresh();
+        fb
+    }
+
+    fn navigate_to(&mut self, dir: PathBuf) {
+        self.current_dir = dir;
+        self.refresh();
+    }
+
+    fn refresh(&mut self) {
+        self.entries.clear();
+        self.error = None;
+        let read = match std::fs::read_dir(&self.current_dir) {
+            Ok(r) => r,
+            Err(e) => {
+                self.error = Some(format!("Cannot read directory: {e}"));
+                return;
+            }
+        };
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        for entry in read.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue; // skip hidden files
+            }
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if is_dir {
+                dirs.push(DirEntry {
+                    name,
+                    is_dir: true,
+                    full_path: entry.path(),
+                });
+            } else {
+                if self.filter_video_only {
+                    let ext = Path::new(&name)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    if !VIDEO_EXTENSIONS.contains(&ext.as_str()) {
+                        continue;
+                    }
+                }
+                files.push(DirEntry {
+                    name,
+                    is_dir: false,
+                    full_path: entry.path(),
+                });
+            }
+        }
+        dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        self.entries.extend(dirs);
+        self.entries.extend(files);
+    }
+
+    /// Show the browser UI. Returns Some(path) when a file is selected.
+    fn show(&mut self, ui: &mut egui::Ui) -> Option<String> {
+        let mut selected_path = None;
+
+        // Current directory + parent navigation
+        ui.horizontal(|ui| {
+            if ui.button("⬆ Up").clicked() {
+                if let Some(parent) = self.current_dir.parent() {
+                    let parent = parent.to_path_buf();
+                    self.navigate_to(parent);
+                }
+            }
+            // Editable directory path
+            let mut dir_str = self.current_dir.to_string_lossy().to_string();
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut dir_str)
+                    .desired_width(ui.available_width() - 5.0),
+            );
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let p = PathBuf::from(&dir_str);
+                if p.is_dir() {
+                    self.navigate_to(p);
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            if ui.checkbox(&mut self.filter_video_only, "Video files only").changed() {
+                self.refresh();
+            }
+        });
+
+        if let Some(ref err) = self.error {
+            ui.colored_label(egui::Color32::RED, err);
+        }
+
+        // File list with scroll
+        egui::ScrollArea::vertical()
+            .max_height(250.0)
+            .show(ui, |ui| {
+                for entry in &self.entries {
+                    let label = if entry.is_dir {
+                        format!("📁 {}", entry.name)
+                    } else {
+                        format!("  {}", entry.name)
+                    };
+                    let resp = ui.selectable_label(false, &label);
+                    if resp.double_clicked() {
+                        if entry.is_dir {
+                            let path = entry.full_path.clone();
+                            selected_path = Some(("__nav__".to_string(), path));
+                        } else {
+                            selected_path = Some((
+                                entry.full_path.to_string_lossy().to_string(),
+                                entry.full_path.clone(),
+                            ));
+                        }
+                    } else if resp.clicked() && !entry.is_dir {
+                        selected_path = Some((
+                            entry.full_path.to_string_lossy().to_string(),
+                            entry.full_path.clone(),
+                        ));
+                    }
+                }
+            });
+
+        // Process navigation vs selection
+        if let Some((action, path)) = selected_path {
+            if action == "__nav__" {
+                self.navigate_to(path);
+                None
+            } else {
+                Some(action)
+            }
+        } else {
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Open File Dialog (text path input + inline file browser)
 // ---------------------------------------------------------------------------
 
 pub struct OpenFileDialog {
@@ -444,6 +616,8 @@ pub struct OpenFileDialog {
     pub is_y4m: bool,
     /// Track last path for which hints were applied, to avoid re-overriding user edits.
     last_hinted_path: String,
+    /// Inline file browser (created on demand when Browse is clicked).
+    file_browser: Option<FileBrowser>,
 }
 
 impl OpenFileDialog {
@@ -464,6 +638,7 @@ impl OpenFileDialog {
             format_names,
             is_y4m: false,
             last_hinted_path: String::new(),
+            file_browser: None,
         }
     }
 
@@ -474,20 +649,40 @@ impl OpenFileDialog {
 
         egui::Window::new("Open File")
             .open(&mut open)
-            .resizable(false)
+            .resizable(true)
             .collapsible(false)
-            .min_width(400.0)
+            .min_width(500.0)
             .show(ctx, |ui| {
                 egui::Grid::new("open_file_grid")
                     .num_columns(2)
                     .spacing(egui::vec2(8.0, 4.0))
                     .show(ui, |ui| {
                         ui.label("File path:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.path)
-                                .desired_width(400.0)
-                                .hint_text("/path/to/video.yuv"),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.path)
+                                    .desired_width(350.0)
+                                    .hint_text("/path/to/video.yuv"),
+                            );
+                            let browse_label = if self.file_browser.is_some() { "Close" } else { "Browse..." };
+                            if ui.button(browse_label).clicked() {
+                                if self.file_browser.is_some() {
+                                    self.file_browser = None;
+                                } else {
+                                    let mut fb = FileBrowser::new();
+                                    // If the user already typed a path, start browsing in its directory
+                                    if !self.path.is_empty() {
+                                        let p = Path::new(&self.path);
+                                        if let Some(parent) = p.parent() {
+                                            if parent.is_dir() {
+                                                fb.navigate_to(parent.to_path_buf());
+                                            }
+                                        }
+                                    }
+                                    self.file_browser = Some(fb);
+                                }
+                            }
+                        });
                         ui.end_row();
 
                         // Auto-detect Y4M and apply hints when path changes
@@ -544,6 +739,15 @@ impl OpenFileDialog {
                             ui.end_row();
                         }
                     });
+
+                // Inline file browser (shown when Browse is active)
+                if let Some(ref mut browser) = self.file_browser {
+                    ui.separator();
+                    if let Some(selected) = browser.show(ui) {
+                        self.path = selected;
+                        self.file_browser = None; // auto-close on selection
+                    }
+                }
 
                 if !self.path.is_empty() {
                     // Show hint-detected info
