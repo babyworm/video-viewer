@@ -1,0 +1,27 @@
+[package]
+name = "video-viewer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.31"
+egui = "0.31"
+egui_plot = "0.31"
+opencv = { version = "0.93", features = ["clang-runtime"], optional = true }
+ndarray = "0.16"
+rayon = "1.10"
+image = "0.25"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+memmap2 = "0.9"
+lru = "0.12"
+parking_lot = "0.12"
+crossbeam = "0.8"
+arboard = { version = "3", features = ["wayland-data-control"] }
+rfd = "0.15"
+log = "0.4"
+env_logger = "0.11"
+
+[dev-dependencies]
+tempfile = "3"
