@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
 use eframe::egui;
 
@@ -49,6 +49,9 @@ pub struct VideoViewerApp {
     settings_dialog: Option<dialogs::SettingsDialog>,
     show_shortcuts: bool,
     show_about: bool,
+    /// Frame timestamps for render FPS calculation (rolling window).
+    frame_times: VecDeque<Instant>,
+    render_fps: f64,
 }
 
 impl VideoViewerApp {
@@ -98,6 +101,8 @@ impl VideoViewerApp {
             settings_dialog: None,
             show_shortcuts: false,
             show_about: false,
+            frame_times: VecDeque::new(),
+            render_fps: 0.0,
         }
     }
 
@@ -456,6 +461,21 @@ impl VideoViewerApp {
 
 impl eframe::App for VideoViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // --- Track render FPS (rolling average over last 30 frames) ---
+        let now = Instant::now();
+        self.frame_times.push_back(now);
+        while self.frame_times.len() > 30 {
+            self.frame_times.pop_front();
+        }
+        if self.frame_times.len() >= 2 {
+            let elapsed = self.frame_times.back().unwrap()
+                .duration_since(*self.frame_times.front().unwrap());
+            let secs = elapsed.as_secs_f64();
+            if secs > 0.0 {
+                self.render_fps = (self.frame_times.len() - 1) as f64 / secs;
+            }
+        }
+
         // --- Auto-open from CLI args ---
         if let Some(path) = self.startup_input.take() {
             let w = self.startup_width.unwrap_or(self.settings.defaults.width);
@@ -826,7 +846,7 @@ impl eframe::App for VideoViewerApp {
                 } else if let Some(ref path) = self.current_file {
                     if let Some(ref r) = self.reader {
                         ui.label(format!(
-                            "{}  |  {}x{}  {}  |  {:.0}%  |  Frame {}/{}",
+                            "{}  |  {}x{}  {}  |  {:.0}%  |  Frame {}/{}  |  {:.1} fps",
                             path,
                             r.width(),
                             r.height(),
@@ -834,6 +854,7 @@ impl eframe::App for VideoViewerApp {
                             self.canvas.zoom_level() * 100.0,
                             self.current_frame_idx,
                             r.total_frames().saturating_sub(1),
+                            self.render_fps,
                         ));
                     }
                 } else {
@@ -901,7 +922,10 @@ impl eframe::App for VideoViewerApp {
         self.sidebar.show_analysis_window(ctx);
 
         // --- Central panel (canvas) ---
-        egui::CentralPanel::default().show(ctx, |ui| {
+        let bg = ctx.style().visuals.extreme_bg_color;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(bg))
+            .show(ctx, |ui| {
             if self.reader.is_some() {
                 let response = self.canvas.show(ui);
                 // Update pixel info on hover — pass absolute screen pos
