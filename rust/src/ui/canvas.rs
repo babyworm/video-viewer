@@ -78,9 +78,9 @@ impl ImageCanvas {
             // Grid overlays (drawn on top of image).
             self.draw_grid(&painter, image_rect, w, h);
 
-            // Mouse wheel zoom (zoom towards cursor).
+            // Mouse wheel zoom (zoom towards cursor) — only when canvas is hovered.
             let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll_delta != 0.0 {
+            if scroll_delta != 0.0 && response.hovered() {
                 let factor = if scroll_delta > 0.0 { 1.1_f32 } else { 1.0 / 1.1 };
                 let new_zoom = (self.zoom * factor).clamp(0.1, 50.0);
                 // Zoom towards the mouse cursor position.
