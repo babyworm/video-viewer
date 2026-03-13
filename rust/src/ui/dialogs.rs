@@ -2,8 +2,9 @@ use eframe::egui;
 use crate::core::formats::get_all_formats;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum DialogState {
+    #[default]
     None,
     OpenFile,
     SaveFile,
@@ -12,12 +13,6 @@ pub enum DialogState {
     Convert,
     PngExport,
     Settings,
-}
-
-impl Default for DialogState {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -823,9 +818,9 @@ impl FileBrowser {
                         let matches = if filter.starts_with('*') && filter.ends_with('*') && filter.len() > 2 {
                             // *text* → contains
                             name_lower.contains(&filter[1..filter.len() - 1])
-                        } else if filter.starts_with('*') {
+                        } else if let Some(suffix) = filter.strip_prefix('*') {
                             // *text → suffix (ends with)
-                            name_lower.ends_with(&filter[1..])
+                            name_lower.ends_with(suffix)
                         } else if filter.ends_with('*') {
                             // text* → prefix (starts with)
                             name_lower.starts_with(&filter[..filter.len() - 1])
@@ -910,7 +905,7 @@ impl OpenFileDialog {
             .position(|n| n.eq_ignore_ascii_case(default_format))
             .unwrap_or(0);
         let initial_dir = initial_dir
-            .map(|d| PathBuf::from(d))
+            .map(PathBuf::from)
             .filter(|p| p.is_dir())
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| {

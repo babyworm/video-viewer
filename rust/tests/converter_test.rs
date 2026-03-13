@@ -34,7 +34,7 @@ fn test_convert_i420_to_nv12() {
 
     let converter = VideoConverter::new();
     let (n, cancelled) = converter
-        .convert(&input_path, 4, 4, "I420", output_str, "NV12", None)
+        .convert(&input_path, (4, 4), "I420", output_str, "NV12", None)
         .expect("conversion failed");
 
     assert_eq!(n, 1);
@@ -68,7 +68,7 @@ fn test_convert_same_format() {
 
     let converter = VideoConverter::new();
     let (n, cancelled) = converter
-        .convert(&input_path, 4, 4, "I420", output_str, "I420", None)
+        .convert(&input_path, (4, 4), "I420", output_str, "I420", None)
         .expect("conversion failed");
 
     assert_eq!(n, 1);
@@ -92,7 +92,7 @@ fn test_convert_frame_count() {
 
     let converter = VideoConverter::new();
     let (n, cancelled) = converter
-        .convert(&input_path, 4, 4, "I420", output_str, "NV12", None)
+        .convert(&input_path, (4, 4), "I420", output_str, "NV12", None)
         .expect("conversion failed");
 
     assert_eq!(n, 2);
@@ -140,7 +140,7 @@ fn test_progress_cancellation() {
     // Cancel after 2 frames
     let (n, cancelled) = converter
         .convert(
-            &input_path, 4, 4, "I420", output_str, "I420",
+            &input_path, (4, 4), "I420", output_str, "I420",
             Some(&|current, _total| current < 2),
         )
         .expect("conversion failed");

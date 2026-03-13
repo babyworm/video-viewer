@@ -67,7 +67,7 @@ fn format_aliases() -> &'static HashMap<&'static str, &'static str> {
 
 /// Split a string on `_`, `.`, `-`, `/`, `\`.
 fn split_tokens(s: &str) -> Vec<&str> {
-    s.split(|c| c == '_' || c == '.' || c == '-' || c == '/' || c == '\\')
+    s.split(['_', '.', '-', '/', '\\'])
         .filter(|t| !t.is_empty())
         .collect()
 }

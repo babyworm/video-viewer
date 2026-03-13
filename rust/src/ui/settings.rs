@@ -22,7 +22,7 @@ pub struct DefaultSettings {
     pub format: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
     pub cache: CacheSettings,
     pub display: DisplaySettings,
@@ -55,17 +55,6 @@ impl Default for DefaultSettings {
             width: 1920,
             height: 1080,
             format: "I420".to_string(),
-        }
-    }
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            cache: CacheSettings::default(),
-            display: DisplaySettings::default(),
-            defaults: DefaultSettings::default(),
-            recent_files: Vec::new(),
         }
     }
 }

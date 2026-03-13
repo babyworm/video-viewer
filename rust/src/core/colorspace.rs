@@ -1,4 +1,4 @@
-/// Pure Rust color space conversions (replaces OpenCV imgproc::cvt_color).
+//! Pure Rust color space conversions.
 
 /// YUV to RGB conversion using BT.601 or BT.709 coefficients.
 #[inline]
@@ -39,10 +39,10 @@ pub fn yuv_to_rgb_planar(
     v_plane: &[u8],
     w: usize,
     h: usize,
-    h_sub: usize,
-    v_sub: usize,
+    subsampling: (usize, usize),
     bt709: bool,
 ) -> Vec<u8> {
+    let (h_sub, v_sub) = subsampling;
     let uv_w = w / h_sub;
     let mut rgb = vec![0u8; w * h * 3];
 
@@ -186,8 +186,7 @@ pub fn rgb_to_bgr(raw: &[u8], w: usize, h: usize) -> Vec<u8> {
 /// Convert greyscale 8-bit to RGB24 (replicate to all channels).
 pub fn grey_to_rgb(raw: &[u8], w: usize, h: usize) -> Vec<u8> {
     let mut rgb = vec![0u8; w * h * 3];
-    for i in 0..(w * h) {
-        let v = raw[i];
+    for (i, &v) in raw.iter().enumerate().take(w * h) {
         let o = i * 3;
         rgb[o] = v;
         rgb[o + 1] = v;
@@ -199,11 +198,10 @@ pub fn grey_to_rgb(raw: &[u8], w: usize, h: usize) -> Vec<u8> {
 /// Convert RGB24 to greyscale 8-bit using BT.601 luma weights.
 pub fn rgb_to_grey(raw: &[u8], w: usize, h: usize) -> Vec<u8> {
     let mut grey = vec![0u8; w * h];
-    for i in 0..(w * h) {
-        let s = i * 3;
-        let r = raw[s] as f32;
-        let g = raw[s + 1] as f32;
-        let b = raw[s + 2] as f32;
+    for (i, chunk) in raw.chunks_exact(3).enumerate().take(w * h) {
+        let r = chunk[0] as f32;
+        let g = chunk[1] as f32;
+        let b = chunk[2] as f32;
         grey[i] = (0.299 * r + 0.587 * g + 0.114 * b).clamp(0.0, 255.0) as u8;
     }
     grey

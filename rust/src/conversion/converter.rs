@@ -23,13 +23,13 @@ impl VideoConverter {
     pub fn convert(
         &self,
         input_path: &str,
-        w: u32,
-        h: u32,
+        dimensions: (u32, u32),
         input_fmt_name: &str,
         output_path: &str,
         output_fmt_name: &str,
         progress_cb: Option<&dyn Fn(usize, usize) -> bool>,
     ) -> Result<(usize, bool), String> {
+        let (w, h) = dimensions;
         let is_ppm_output = output_fmt_name.eq_ignore_ascii_case("PPM");
 
         let input_fmt = get_format_by_name(input_fmt_name)
@@ -455,7 +455,7 @@ fn convert_via_rgb(
                 // YV12: V before U
                 (&frame[y_size + uv_size..y_size + 2 * uv_size], &frame[y_size..y_size + uv_size])
             };
-            colorspace::yuv_to_rgb_planar(y_plane, u_plane, v_plane, uw, uh, 2, 2, false)
+            colorspace::yuv_to_rgb_planar(y_plane, u_plane, v_plane, uw, uh, (2, 2), false)
         }
         FormatType::YuvSemiPlanar if matches!(src_fmt.fourcc.as_str(), "NV12" | "NV21") => {
             let uv_swapped = src_fmt.fourcc == "NV21";
