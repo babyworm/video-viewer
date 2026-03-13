@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod colorspace;
 pub mod formats;
 pub mod hints;
 pub mod pixel;
