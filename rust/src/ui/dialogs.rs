@@ -456,12 +456,9 @@ struct DirEntry {
 }
 
 impl FileBrowser {
-    fn new() -> Self {
-        let home = std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/"));
+    fn new(start_dir: PathBuf) -> Self {
         let mut fb = Self {
-            current_dir: home,
+            current_dir: start_dir,
             entries: Vec::new(),
             filter_video_only: false,
             error: None,
@@ -618,10 +615,15 @@ pub struct OpenFileDialog {
     last_hinted_path: String,
     /// Inline file browser (created on demand when Browse is clicked).
     file_browser: Option<FileBrowser>,
+    /// Starting directory for file browser.
+    initial_dir: PathBuf,
 }
 
 impl OpenFileDialog {
-    pub fn new(default_width: u32, default_height: u32, default_format: &str) -> Self {
+    /// Create a new Open File dialog.
+    /// `initial_dir` sets the starting directory for the file browser:
+    /// pass the directory of the currently open file, or None for cwd.
+    pub fn new(default_width: u32, default_height: u32, default_format: &str, initial_dir: Option<&str>) -> Self {
         let format_names: Vec<String> = get_all_formats()
             .iter()
             .map(|f| f.name.clone())
@@ -630,6 +632,13 @@ impl OpenFileDialog {
             .iter()
             .position(|n| n.eq_ignore_ascii_case(default_format))
             .unwrap_or(0);
+        let initial_dir = initial_dir
+            .map(|d| PathBuf::from(d))
+            .filter(|p| p.is_dir())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| {
+                std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
+            });
         Self {
             path: String::new(),
             width: default_width,
@@ -639,6 +648,7 @@ impl OpenFileDialog {
             is_y4m: false,
             last_hinted_path: String::new(),
             file_browser: None,
+            initial_dir,
         }
     }
 
@@ -669,17 +679,17 @@ impl OpenFileDialog {
                                 if self.file_browser.is_some() {
                                     self.file_browser = None;
                                 } else {
-                                    let mut fb = FileBrowser::new();
-                                    // If the user already typed a path, start browsing in its directory
-                                    if !self.path.is_empty() {
-                                        let p = Path::new(&self.path);
-                                        if let Some(parent) = p.parent() {
-                                            if parent.is_dir() {
-                                                fb.navigate_to(parent.to_path_buf());
-                                            }
-                                        }
-                                    }
-                                    self.file_browser = Some(fb);
+                                    // Start dir: typed path's parent > initial_dir (open file or cwd)
+                                    let start = if !self.path.is_empty() {
+                                        Path::new(&self.path)
+                                            .parent()
+                                            .filter(|p| p.is_dir())
+                                            .map(|p| p.to_path_buf())
+                                            .unwrap_or_else(|| self.initial_dir.clone())
+                                    } else {
+                                        self.initial_dir.clone()
+                                    };
+                                    self.file_browser = Some(FileBrowser::new(start));
                                 }
                             }
                         });
