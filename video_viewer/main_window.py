@@ -1573,18 +1573,58 @@ class MainWindow(QMainWindow):
         self.slider_frame.setValue(next_idx)
         self._programmatic_slider_change = False
 
-    def _on_frame_decoded(self, generation, frame_idx, rgb):
+    def _on_frame_decoded(self, generation, frame_idx, rgb, raw):
         """Slot called when background decode worker finishes a frame."""
         # Ignore stale frames from a previous playback session or different video
         if generation != self._playback_generation:
             return
 
-        if rgb is not None:
+        if rgb is None:
+            return
+
+        comp_idx = getattr(self, 'current_component', 0)
+        self.current_raw_frame = raw
+
+        if comp_idx == 0:
+            # Full view
             if not rgb.flags['C_CONTIGUOUS']:
                 rgb = np.ascontiguousarray(rgb)
             self.canvas.set_image(rgb)
             self.current_rgb_frame = rgb
-            self.update_status_bar()
+        elif comp_idx <= 3:
+            # Single channel view
+            channels = self.reader.get_channels(raw)
+            keys = []
+            if 'Y' in channels: keys = ['Y', 'U', 'V']
+            elif 'R' in channels: keys = ['R', 'G', 'B']
+
+            if keys and (comp_idx - 1) < len(keys):
+                key = keys[comp_idx - 1]
+                if key in channels:
+                    ch_rgb = self._colorize_channel(channels[key], key)
+                    if not ch_rgb.flags['C_CONTIGUOUS']:
+                        ch_rgb = np.ascontiguousarray(ch_rgb)
+                    self.canvas.set_image(ch_rgb)
+        elif comp_idx == 4:
+            # Split view (2x2)
+            channels = self.reader.get_channels(raw)
+            keys = []
+            if 'Y' in channels: keys = ['Y', 'U', 'V']
+            elif 'R' in channels: keys = ['R', 'G', 'B']
+
+            if len(keys) == 3:
+                h, w = rgb.shape[:2]
+                half_h, half_w = h // 2, w // 2
+                tl = cv2.resize(rgb, (half_w, half_h))
+                tr = cv2.resize(self._colorize_channel(channels[keys[0]], keys[0]), (half_w, half_h))
+                bl = cv2.resize(self._colorize_channel(channels[keys[1]], keys[1]), (half_w, half_h))
+                br = cv2.resize(self._colorize_channel(channels[keys[2]], keys[2]), (half_w, half_h))
+                top = np.hstack([tl, tr])
+                bottom = np.hstack([bl, br])
+                composite = np.vstack([top, bottom])
+                self.canvas.set_image(np.ascontiguousarray(composite))
+
+        self.update_status_bar()
 
     def _update_playback_fps(self):
         """Update playback timer interval when FPS changes."""

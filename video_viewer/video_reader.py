@@ -912,7 +912,7 @@ class VideoReader:
 
 class FrameDecodeWorker(QThread):
     """Background thread for frame decoding during playback."""
-    frame_ready = Signal(int, int, object)  # (generation, frame_index, rgb_ndarray)
+    frame_ready = Signal(int, int, object, object)  # (generation, frame_index, rgb_ndarray, raw_data)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -946,7 +946,7 @@ class FrameDecodeWorker(QThread):
                 if raw_data:
                     rgb = self._reader.convert_to_rgb(raw_data)
                     if rgb is not None:
-                        self.frame_ready.emit(self._generation, self._frame_idx, rgb)
+                        self.frame_ready.emit(self._generation, self._frame_idx, rgb, raw_data)
         except Exception:
             pass
         finally:
