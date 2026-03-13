@@ -24,11 +24,17 @@ Raw/YUV/RGB video viewer built with PySide6 (Qt6). Supports 30+ pixel formats fo
 ## Installation
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 pip install -e .
 ```
 
 ## Usage
+
+```bash
+source .venv/bin/activate
+```
 
 ### GUI mode
 
@@ -84,6 +90,8 @@ GRAY8, GRAY10, GRAY12, GRAY16
 ## Development
 
 ```bash
+source .venv/bin/activate
+
 # Run tests
 pytest test/ -v
 
