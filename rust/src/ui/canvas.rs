@@ -5,6 +5,8 @@ pub struct ImageCanvas {
     pub zoom: f32,
     pub pan_offset: egui::Vec2,
     pub image_size: Option<(u32, u32)>,
+    pub grid_size: u32,
+    pub sub_grid_size: u32,
 }
 
 impl ImageCanvas {
@@ -14,7 +16,17 @@ impl ImageCanvas {
             zoom: 1.0,
             pan_offset: egui::Vec2::ZERO,
             image_size: None,
+            grid_size: 0,
+            sub_grid_size: 0,
         }
+    }
+
+    pub fn set_grid_size(&mut self, size: u32) {
+        self.grid_size = size;
+    }
+
+    pub fn set_sub_grid_size(&mut self, size: u32) {
+        self.sub_grid_size = size;
     }
 
     pub fn set_image(&mut self, ctx: &egui::Context, rgb: &[u8], width: u32, height: u32) {
@@ -39,6 +51,70 @@ impl ImageCanvas {
                 egui::Image::new(texture)
                     .fit_to_exact_size(display_size)
             );
+
+            // Grid overlay
+            let image_origin = response.rect.min;
+            let painter = ui.painter();
+
+            if self.sub_grid_size > 0 {
+                let step = self.sub_grid_size as f32 * self.zoom;
+                let img_w = w as f32 * self.zoom;
+                let img_h = h as f32 * self.zoom;
+                let color = egui::Color32::from_rgb(200, 200, 0);
+                let stroke = egui::Stroke::new(0.5, color);
+                let mut x = step;
+                while x < img_w {
+                    painter.line_segment(
+                        [
+                            egui::pos2(image_origin.x + x, image_origin.y),
+                            egui::pos2(image_origin.x + x, image_origin.y + img_h),
+                        ],
+                        stroke,
+                    );
+                    x += step;
+                }
+                let mut y = step;
+                while y < img_h {
+                    painter.line_segment(
+                        [
+                            egui::pos2(image_origin.x, image_origin.y + y),
+                            egui::pos2(image_origin.x + img_w, image_origin.y + y),
+                        ],
+                        stroke,
+                    );
+                    y += step;
+                }
+            }
+
+            if self.grid_size > 0 {
+                let step = self.grid_size as f32 * self.zoom;
+                let img_w = w as f32 * self.zoom;
+                let img_h = h as f32 * self.zoom;
+                let color = egui::Color32::from_rgb(0, 200, 0);
+                let stroke = egui::Stroke::new(1.0, color);
+                let mut x = step;
+                while x < img_w {
+                    painter.line_segment(
+                        [
+                            egui::pos2(image_origin.x + x, image_origin.y),
+                            egui::pos2(image_origin.x + x, image_origin.y + img_h),
+                        ],
+                        stroke,
+                    );
+                    x += step;
+                }
+                let mut y = step;
+                while y < img_h {
+                    painter.line_segment(
+                        [
+                            egui::pos2(image_origin.x, image_origin.y + y),
+                            egui::pos2(image_origin.x + img_w, image_origin.y + y),
+                        ],
+                        stroke,
+                    );
+                    y += step;
+                }
+            }
 
             // Mouse wheel zoom
             let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
