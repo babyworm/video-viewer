@@ -1,7 +1,0 @@
-/home/babyworm/work/video-viewer/rust/target/debug/deps/calloop_wayland_source-8ceb70393104b941.d: /home/babyworm/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/calloop-wayland-source-0.4.1/src/lib.rs
-
-/home/babyworm/work/video-viewer/rust/target/debug/deps/libcalloop_wayland_source-8ceb70393104b941.rlib: /home/babyworm/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/calloop-wayland-source-0.4.1/src/lib.rs
-
-/home/babyworm/work/video-viewer/rust/target/debug/deps/libcalloop_wayland_source-8ceb70393104b941.rmeta: /home/babyworm/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/calloop-wayland-source-0.4.1/src/lib.rs
-
-/home/babyworm/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/calloop-wayland-source-0.4.1/src/lib.rs:
