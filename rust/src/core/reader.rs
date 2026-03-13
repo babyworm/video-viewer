@@ -230,13 +230,11 @@ impl VideoReader {
 
     /// Convert raw frame bytes to packed RGB (H × W × 3).
     pub fn convert_to_rgb(&self, raw: &[u8]) -> Result<Vec<u8>, String> {
-        #[allow(unused_imports)]
-        use opencv::prelude::*;
-        use opencv::core::{Mat, CV_8UC1, CV_8UC2, CV_8UC3};
-        use opencv::imgproc;
+        use crate::core::colorspace;
 
-        let w = self.width as i32;
-        let h = self.height as i32;
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let bt709 = self.color_matrix == "BT.709";
 
         match self.format.format_type {
             // ----------------------------------------------------------
@@ -247,26 +245,19 @@ impl VideoReader {
                 if raw.len() < expected {
                     return Err(format!("Raw data too short: {} < {}", raw.len(), expected));
                 }
-                // OpenCV YUV2RGB_I420 expects the entire YUV420 image as a (h*3/2 x w) Mat.
-                let yuv_mat = unsafe {
-                    Mat::new_rows_cols_with_data_unsafe(
-                        h * 3 / 2,
-                        w,
-                        CV_8UC1,
-                        raw.as_ptr() as *mut std::ffi::c_void,
-                        opencv::core::Mat_AUTO_STEP,
-                    )
-                    .map_err(|e| e.to_string())?
-                };
-                let code = if self.format.fourcc == "YU12" {
-                    imgproc::COLOR_YUV2RGB_I420
+                let y_size = w * h;
+                let uv_size = (w / 2) * (h / 2);
+                let y = &raw[..y_size];
+                if self.format.fourcc == "YU12" {
+                    let u = &raw[y_size..y_size + uv_size];
+                    let v = &raw[y_size + uv_size..y_size + uv_size * 2];
+                    Ok(colorspace::yuv_to_rgb_planar(y, u, v, w, h, 2, 2, bt709))
                 } else {
-                    imgproc::COLOR_YUV2RGB_YV12
-                };
-                let mut rgb_mat = Mat::default();
-                imgproc::cvt_color(&yuv_mat, &mut rgb_mat, code, 0)
-                    .map_err(|e| e.to_string())?;
-                mat_to_vec(&rgb_mat)
+                    // YV12: V comes before U
+                    let v = &raw[y_size..y_size + uv_size];
+                    let u = &raw[y_size + uv_size..y_size + uv_size * 2];
+                    Ok(colorspace::yuv_to_rgb_planar(y, u, v, w, h, 2, 2, bt709))
+                }
             }
 
             // ----------------------------------------------------------
@@ -275,25 +266,8 @@ impl VideoReader {
             FormatType::YuvSemiPlanar
                 if matches!(self.format.fourcc.as_str(), "NV12" | "NV21") =>
             {
-                let yuv_mat = unsafe {
-                    Mat::new_rows_cols_with_data_unsafe(
-                        h * 3 / 2,
-                        w,
-                        CV_8UC1,
-                        raw.as_ptr() as *mut std::ffi::c_void,
-                        opencv::core::Mat_AUTO_STEP,
-                    )
-                    .map_err(|e| e.to_string())?
-                };
-                let code = if self.format.fourcc == "NV12" {
-                    imgproc::COLOR_YUV2RGB_NV12
-                } else {
-                    imgproc::COLOR_YUV2RGB_NV21
-                };
-                let mut rgb_mat = Mat::default();
-                imgproc::cvt_color(&yuv_mat, &mut rgb_mat, code, 0)
-                    .map_err(|e| e.to_string())?;
-                mat_to_vec(&rgb_mat)
+                let uv_swapped = self.format.fourcc == "NV21";
+                Ok(colorspace::yuv_to_rgb_semi_planar(raw, w, h, uv_swapped, bt709))
             }
 
             // ----------------------------------------------------------
@@ -302,33 +276,18 @@ impl VideoReader {
             FormatType::YuvPacked
                 if matches!(self.format.fourcc.as_str(), "YUYV" | "UYVY") =>
             {
-                // OpenCV expects (h x w) Mat with 2 bytes per pixel (CV_8UC2).
-                let yuv_mat = unsafe {
-                    Mat::new_rows_cols_with_data_unsafe(
-                        h,
-                        w,
-                        CV_8UC2,
-                        raw.as_ptr() as *mut std::ffi::c_void,
-                        opencv::core::Mat_AUTO_STEP,
-                    )
-                    .map_err(|e| e.to_string())?
-                };
-                let code = if self.format.fourcc == "YUYV" {
-                    imgproc::COLOR_YUV2RGB_YUYV
+                if self.format.fourcc == "YUYV" {
+                    Ok(colorspace::yuv_to_rgb_yuyv(raw, w, h, bt709))
                 } else {
-                    imgproc::COLOR_YUV2RGB_UYVY
-                };
-                let mut rgb_mat = Mat::default();
-                imgproc::cvt_color(&yuv_mat, &mut rgb_mat, code, 0)
-                    .map_err(|e| e.to_string())?;
-                mat_to_vec(&rgb_mat)
+                    Ok(colorspace::yuv_to_rgb_uyvy(raw, w, h, bt709))
+                }
             }
 
             // ----------------------------------------------------------
             // RGB24 — already RGB, just copy.
             // ----------------------------------------------------------
             FormatType::Rgb if self.format.fourcc == "RGB3" => {
-                let expected = (w * h * 3) as usize;
+                let expected = w * h * 3;
                 if raw.len() < expected {
                     return Err(format!("Raw data too short: {} < {}", raw.len(), expected));
                 }
@@ -339,54 +298,34 @@ impl VideoReader {
             // BGR24
             // ----------------------------------------------------------
             FormatType::Rgb if self.format.fourcc == "BGR3" => {
-                let bgr_mat = unsafe {
-                    Mat::new_rows_cols_with_data_unsafe(
-                        h,
-                        w,
-                        CV_8UC3,
-                        raw.as_ptr() as *mut std::ffi::c_void,
-                        opencv::core::Mat_AUTO_STEP,
-                    )
-                    .map_err(|e| e.to_string())?
-                };
-                let mut rgb_mat = Mat::default();
-                imgproc::cvt_color(&bgr_mat, &mut rgb_mat, imgproc::COLOR_BGR2RGB, 0)
-                    .map_err(|e| e.to_string())?;
-                mat_to_vec(&rgb_mat)
+                Ok(colorspace::bgr_to_rgb(raw, w, h))
             }
 
             // ----------------------------------------------------------
             // Greyscale 8-bit
             // ----------------------------------------------------------
             FormatType::Grey if self.format.bit_depth == 8 => {
-                let grey_mat = unsafe {
-                    Mat::new_rows_cols_with_data_unsafe(
-                        h,
-                        w,
-                        CV_8UC1,
-                        raw.as_ptr() as *mut std::ffi::c_void,
-                        opencv::core::Mat_AUTO_STEP,
-                    )
-                    .map_err(|e| e.to_string())?
-                };
-                let mut rgb_mat = Mat::default();
-                imgproc::cvt_color(&grey_mat, &mut rgb_mat, imgproc::COLOR_GRAY2RGB, 0)
-                    .map_err(|e| e.to_string())?;
-                mat_to_vec(&rgb_mat)
+                Ok(colorspace::grey_to_rgb(raw, w, h))
             }
 
             // ----------------------------------------------------------
-            // 422P (planar 4:2:2)
+            // YUV planar (422P, 444P, I420-like via subsampling)
             // ----------------------------------------------------------
             FormatType::YuvPlanar if self.format.fourcc == "422P" => {
-                self.convert_yuv_planar_manual(raw, w as usize, h as usize, 2, 1)
+                let y_size = w * h;
+                let uv_size = (w / 2) * h;
+                let y = &raw[..y_size];
+                let u = &raw[y_size..y_size + uv_size];
+                let v = &raw[y_size + uv_size..y_size + uv_size * 2];
+                Ok(colorspace::yuv_to_rgb_planar(y, u, v, w, h, 2, 1, bt709))
             }
 
-            // ----------------------------------------------------------
-            // 444P (planar 4:4:4)
-            // ----------------------------------------------------------
             FormatType::YuvPlanar if self.format.fourcc == "444P" => {
-                self.convert_yuv_planar_manual(raw, w as usize, h as usize, 1, 1)
+                let y_size = w * h;
+                let y = &raw[..y_size];
+                let u = &raw[y_size..y_size * 2];
+                let v = &raw[y_size * 2..y_size * 3];
+                Ok(colorspace::yuv_to_rgb_planar(y, u, v, w, h, 1, 1, bt709))
             }
 
             _ => Err(format!(
@@ -394,84 +333,6 @@ impl VideoReader {
                 self.format.name, self.format.fourcc
             )),
         }
-    }
-
-    /// Manual YUV planar → RGB for 422P and 444P.
-    ///
-    /// `h_sub` and `v_sub` are the horizontal and vertical chroma subsampling
-    /// factors (e.g. 2,1 for 4:2:2; 1,1 for 4:4:4).
-    fn convert_yuv_planar_manual(
-        &self,
-        raw: &[u8],
-        w: usize,
-        h: usize,
-        h_sub: usize,
-        v_sub: usize,
-    ) -> Result<Vec<u8>, String> {
-        let y_size = w * h;
-        let uv_w = w / h_sub;
-        let uv_h = h / v_sub;
-        let uv_size = uv_w * uv_h;
-
-        if raw.len() < y_size + uv_size * 2 {
-            return Err(format!(
-                "Raw data too short for planar YUV: {} < {}",
-                raw.len(),
-                y_size + uv_size * 2
-            ));
-        }
-
-        let y_plane = &raw[..y_size];
-        let u_plane = &raw[y_size..y_size + uv_size];
-        let v_plane = &raw[y_size + uv_size..y_size + uv_size * 2];
-
-        let mut rgb = vec![0u8; w * h * 3];
-
-        if self.color_matrix == "BT.709" {
-            for py in 0..h {
-                for px in 0..w {
-                    let y_val = y_plane[py * w + px] as f32;
-                    let cx = px / h_sub;
-                    let cy = py / v_sub;
-                    let uv_idx = cy * uv_w + cx;
-                    let u_val = u_plane[uv_idx] as f32 - 128.0;
-                    let v_val = v_plane[uv_idx] as f32 - 128.0;
-
-                    let r = (y_val + 1.5748 * v_val).clamp(0.0, 255.0) as u8;
-                    let g = (y_val - 0.1873 * u_val - 0.4681 * v_val).clamp(0.0, 255.0) as u8;
-                    let b = (y_val + 1.8556 * u_val).clamp(0.0, 255.0) as u8;
-
-                    let out_idx = (py * w + px) * 3;
-                    rgb[out_idx] = r;
-                    rgb[out_idx + 1] = g;
-                    rgb[out_idx + 2] = b;
-                }
-            }
-        } else {
-            // BT.601 coefficients
-            for py in 0..h {
-                for px in 0..w {
-                    let y_val = y_plane[py * w + px] as f32;
-                    let cx = px / h_sub;
-                    let cy = py / v_sub;
-                    let uv_idx = cy * uv_w + cx;
-                    let u_val = u_plane[uv_idx] as f32 - 128.0;
-                    let v_val = v_plane[uv_idx] as f32 - 128.0;
-
-                    let r = (y_val + 1.402 * v_val).clamp(0.0, 255.0) as u8;
-                    let g = (y_val - 0.344136 * u_val - 0.714136 * v_val)
-                        .clamp(0.0, 255.0) as u8;
-                    let b = (y_val + 1.772 * u_val).clamp(0.0, 255.0) as u8;
-
-                    let out_idx = (py * w + px) * 3;
-                    rgb[out_idx] = r;
-                    rgb[out_idx + 1] = g;
-                    rgb[out_idx + 2] = b;
-                }
-            }
-        }
-
-        Ok(rgb)
     }
 
     // ------------------------------------------------------------------
@@ -604,22 +465,6 @@ impl VideoReader {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Copy the data bytes from an OpenCV Mat into a Vec<u8>.
-fn mat_to_vec(mat: &opencv::core::Mat) -> Result<Vec<u8>, String> {
-    #[allow(unused_imports)]
-    use opencv::prelude::*;
-    let total = mat.total();
-    let channels = mat.channels();
-    let n = total * channels as usize;
-    let mut out = vec![0u8; n];
-    // SAFETY: Mat data pointer is valid for `n` bytes.
-    unsafe {
-        let ptr = mat.data();
-        std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), n);
-    }
-    Ok(out)
-}
 
 /// Nearest-neighbour upsample a planar greyscale image.
 fn nearest_upsample(
