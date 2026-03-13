@@ -612,6 +612,9 @@ impl eframe::App for VideoViewerApp {
                 self.settings.defaults.width,
                 self.settings.defaults.height,
                 &self.settings.defaults.format,
+                self.current_file.as_ref()
+                    .and_then(|f| std::path::Path::new(f).parent())
+                    .and_then(|p| p.to_str()),
             ));
             self.dialog_state = DialogState::OpenFile;
         }
@@ -630,6 +633,9 @@ impl eframe::App for VideoViewerApp {
                             self.settings.defaults.width,
                             self.settings.defaults.height,
                             &self.settings.defaults.format,
+                            self.current_file.as_ref()
+                                .and_then(|f| std::path::Path::new(f).parent())
+                                .and_then(|p| p.to_str()),
                         ));
                         self.dialog_state = DialogState::OpenFile;
                     }
