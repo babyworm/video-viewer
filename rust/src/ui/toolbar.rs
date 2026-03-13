@@ -10,8 +10,8 @@ pub struct Toolbar {
     pub current_component: u8,
     pub grid_size: u32,
     pub sub_grid_size: u32,
-    grid_idx: usize,
-    sub_grid_idx: usize,
+    pub grid_idx: usize,
+    pub sub_grid_idx: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
