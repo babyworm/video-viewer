@@ -4,7 +4,10 @@
 /// Returns f64::INFINITY if images are identical.
 pub fn calculate_psnr(img1: &[u8], img2: &[u8], w: u32, h: u32) -> f64 {
     let n = (w * h * 3) as usize;
-    assert!(img1.len() >= n && img2.len() >= n, "Image buffers too small");
+    if img1.len() < n || img2.len() < n {
+        log::warn!("Image buffers too small for PSNR: expected {}, got {} / {}", n, img1.len(), img2.len());
+        return 0.0;
+    }
 
     let mut mse_sum: f64 = 0.0;
     for i in 0..n {
@@ -30,7 +33,10 @@ pub fn calculate_ssim(img1: &[u8], img2: &[u8], w: u32, h: u32) -> f64 {
     let w = w as usize;
     let h = h as usize;
     let n = w * h * 3;
-    assert!(img1.len() >= n && img2.len() >= n, "Image buffers too small");
+    if img1.len() < n || img2.len() < n {
+        log::warn!("Image buffers too small for SSIM: expected {}, got {} / {}", n, img1.len(), img2.len());
+        return 0.0;
+    }
 
     // Convert to luma using BT.709
     let luma1 = rgb_to_luma(img1, w, h);

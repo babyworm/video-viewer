@@ -11,12 +11,10 @@
 /// Width is downsampled to max 720 for performance.
 pub fn calculate_waveform(rgb: &[u8], w: u32, h: u32, channel: &str) -> Vec<Vec<u32>> {
     let pixel_count = (w * h) as usize;
-    assert!(
-        rgb.len() >= pixel_count * 3,
-        "RGB buffer too small: expected at least {}, got {}",
-        pixel_count * 3,
-        rgb.len()
-    );
+    if rgb.len() < pixel_count * 3 {
+        log::warn!("RGB buffer too small for waveform: expected {}, got {}", pixel_count * 3, rgb.len());
+        return vec![vec![0u32; 256]; 0];
+    }
 
     let max_display_width: u32 = 720;
     let display_width = w.min(max_display_width) as usize;

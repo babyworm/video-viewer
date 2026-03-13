@@ -9,12 +9,8 @@ pub enum DialogState {
     Parameters,
     Export,
     Convert,
-    BatchConvert,
     PngExport,
     Settings,
-    Shortcuts,
-    Bookmarks,
-    About,
 }
 
 impl Default for DialogState {

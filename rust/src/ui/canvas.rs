@@ -160,7 +160,7 @@ impl ImageCanvas {
         if let Some((w, h)) = self.image_size {
             let zoom_w = available.x / w as f32;
             let zoom_h = available.y / h as f32;
-            self.zoom = zoom_w.min(zoom_h);
+            self.zoom = zoom_w.min(zoom_h).clamp(0.1, 50.0);
             self.pan_offset = egui::Vec2::ZERO;
         }
     }

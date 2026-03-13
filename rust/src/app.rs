@@ -172,8 +172,13 @@ impl VideoViewerApp {
             self.current_component, reader, &raw, &rgb, w, h,
         );
         self.canvas.set_image(ctx, &display_rgb, w, h);
-        // Store previous RGB for inter-frame metrics before overwriting.
-        self.prev_rgb = self.current_rgb.take();
+        // Only keep prev_rgb for sequential navigation (metrics compare adjacent frames).
+        if idx == self.current_frame_idx + 1 {
+            self.prev_rgb = self.current_rgb.take();
+        } else {
+            self.prev_rgb = None;
+            drop(self.current_rgb.take());
+        }
         self.current_rgb = Some(rgb);
         self.current_raw = Some(raw);
         self.current_frame_idx = idx;
@@ -245,7 +250,6 @@ impl VideoViewerApp {
                     rgb.to_vec()
                 };
 
-                let _stride = w as usize * 3;
                 for y in 0..half_h {
                     for x in 0..half_w {
                         let src_y = y * 2;
@@ -288,7 +292,10 @@ impl VideoViewerApp {
     }
 
     /// Compute analysis data from the current RGB frame and feed it to the sidebar.
+    /// Only computes data for the currently active tab to avoid unnecessary work.
     fn update_analysis(&mut self, ctx: &egui::Context) {
+        use crate::ui::sidebar::AnalysisTab;
+
         if !self.sidebar.show_analysis {
             return;
         }
@@ -301,67 +308,67 @@ impl VideoViewerApp {
             None => return,
         };
 
-        // Histogram (RGB mode)
-        let hist_u32 = crate::analysis::histogram::calculate_histogram(rgb, w, h, "RGB");
-        let hist_f64: std::collections::HashMap<String, Vec<f64>> = hist_u32
-            .into_iter()
-            .map(|(k, v)| (k, v.into_iter().map(|c| c as f64).collect()))
-            .collect();
-        self.sidebar.histogram_data = Some(hist_f64);
-
-        // Vectorscope — cap at 50k points for egui_plot performance
-        let (cb, cr) = crate::analysis::vectorscope::calculate_vectorscope(rgb, w, h);
-        let max_points = 50_000;
-        let step = if cb.len() > max_points { cb.len() / max_points } else { 1 };
-        let scatter: Vec<[f64; 2]> = cb
-            .into_iter()
-            .zip(cr.into_iter())
-            .step_by(step)
-            .map(|(u, v)| [u as f64, v as f64])
-            .collect();
-        self.sidebar.vectorscope_data = Some(scatter);
-
-        // Waveform → render to egui texture
-        let wf = crate::analysis::waveform::calculate_waveform(rgb, w, h, "luma");
-        let wf_width = wf.first().map(|r| r.len()).unwrap_or(0);
-        let wf_height = wf.len();
-        if wf_width > 0 {
-            // Find max count for normalization
-            let max_count = wf.iter().flat_map(|row| row.iter()).copied().max().unwrap_or(1).max(1);
-            // Build grayscale image (bottom = level 0, top = level 255)
-            let mut pixels = vec![0u8; wf_width * wf_height * 3];
-            for level in 0..wf_height {
-                let src_row = wf_height - 1 - level; // flip vertically
-                for col in 0..wf_width {
-                    let count = wf[src_row][col];
-                    let intensity = ((count as f64 / max_count as f64).sqrt() * 255.0) as u8;
-                    let idx = (level * wf_width + col) * 3;
-                    // Green-tinted waveform
-                    pixels[idx] = intensity / 3;
-                    pixels[idx + 1] = intensity;
-                    pixels[idx + 2] = intensity / 3;
+        match self.sidebar.active_tab {
+            AnalysisTab::Histogram => {
+                let hist_u32 = crate::analysis::histogram::calculate_histogram(rgb, w, h, "RGB");
+                let hist_f64: std::collections::HashMap<String, Vec<f64>> = hist_u32
+                    .into_iter()
+                    .map(|(k, v)| (k, v.into_iter().map(|c| c as f64).collect()))
+                    .collect();
+                self.sidebar.histogram_data = Some(hist_f64);
+            }
+            AnalysisTab::Vectorscope => {
+                let (cb, cr) = crate::analysis::vectorscope::calculate_vectorscope(rgb, w, h);
+                let max_points = 50_000;
+                let step = if cb.len() > max_points { cb.len() / max_points } else { 1 };
+                let scatter: Vec<[f64; 2]> = cb
+                    .into_iter()
+                    .zip(cr.into_iter())
+                    .step_by(step)
+                    .map(|(u, v)| [u as f64, v as f64])
+                    .collect();
+                self.sidebar.vectorscope_data = Some(scatter);
+            }
+            AnalysisTab::Waveform => {
+                let wf = crate::analysis::waveform::calculate_waveform(rgb, w, h, "luma");
+                let wf_width = wf.first().map(|r| r.len()).unwrap_or(0);
+                let wf_height = wf.len();
+                if wf_width > 0 {
+                    let max_count = wf.iter().flat_map(|row| row.iter()).copied().max().unwrap_or(1).max(1);
+                    let mut pixels = vec![0u8; wf_width * wf_height * 3];
+                    for level in 0..wf_height {
+                        let src_row = wf_height - 1 - level;
+                        for col in 0..wf_width {
+                            let count = wf[src_row][col];
+                            let intensity = ((count as f64 / max_count as f64).sqrt() * 255.0) as u8;
+                            let idx = (level * wf_width + col) * 3;
+                            pixels[idx] = intensity / 3;
+                            pixels[idx + 1] = intensity;
+                            pixels[idx + 2] = intensity / 3;
+                        }
+                    }
+                    let color_image = egui::ColorImage::from_rgb([wf_width, wf_height], &pixels);
+                    let tex = ctx.load_texture("waveform_tex", color_image, egui::TextureOptions::LINEAR);
+                    self.sidebar.waveform_texture = Some(tex);
                 }
             }
-            let color_image = egui::ColorImage::from_rgb([wf_width, wf_height], &pixels);
-            let tex = ctx.load_texture("waveform_tex", color_image, egui::TextureOptions::LINEAR);
-            self.sidebar.waveform_texture = Some(tex);
-        }
-
-        // Metrics: compare with previous frame
-        if let Some(ref prev) = self.prev_rgb {
-            if prev.len() == rgb.len() {
-                self.sidebar.psnr = Some(crate::analysis::metrics::calculate_psnr(prev, rgb, w, h));
-                self.sidebar.ssim = Some(crate::analysis::metrics::calculate_ssim(prev, rgb, w, h));
-                self.sidebar.frame_diff = Some(crate::analysis::metrics::calculate_frame_difference(prev, rgb));
-            } else {
-                self.sidebar.psnr = None;
-                self.sidebar.ssim = None;
-                self.sidebar.frame_diff = None;
+            AnalysisTab::Metrics => {
+                if let Some(ref prev) = self.prev_rgb {
+                    if prev.len() == rgb.len() {
+                        self.sidebar.psnr = Some(crate::analysis::metrics::calculate_psnr(prev, rgb, w, h));
+                        self.sidebar.ssim = Some(crate::analysis::metrics::calculate_ssim(prev, rgb, w, h));
+                        self.sidebar.frame_diff = Some(crate::analysis::metrics::calculate_frame_difference(prev, rgb));
+                    } else {
+                        self.sidebar.psnr = None;
+                        self.sidebar.ssim = None;
+                        self.sidebar.frame_diff = None;
+                    }
+                } else {
+                    self.sidebar.psnr = None;
+                    self.sidebar.ssim = None;
+                    self.sidebar.frame_diff = None;
+                }
             }
-        } else {
-            self.sidebar.psnr = None;
-            self.sidebar.ssim = None;
-            self.sidebar.frame_diff = None;
         }
     }
 
@@ -379,7 +386,14 @@ impl VideoViewerApp {
                 } else {
                     self.status_error = None;
                 }
+            } else {
+                self.status_error = Some(format!(
+                    "PNG save error: RGB buffer size mismatch ({}x{}, {} bytes)",
+                    w, h, rgb.len()
+                ));
             }
+        } else {
+            self.status_error = Some("No frame loaded to save".to_string());
         }
     }
 
@@ -525,6 +539,7 @@ impl eframe::App for VideoViewerApp {
                 i.modifiers.ctrl && i.key_pressed(egui::Key::S), // 13
                 i.modifiers.ctrl && i.key_pressed(egui::Key::C), // 14
                 i.modifiers.ctrl && i.key_pressed(egui::Key::O), // 15
+                i.modifiers.ctrl && i.key_pressed(egui::Key::Q), // 16
             )
         });
 
@@ -600,6 +615,10 @@ impl eframe::App for VideoViewerApp {
             ));
             self.dialog_state = DialogState::OpenFile;
         }
+        if keys.16 {
+            // Ctrl+Q: quit
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
 
         // --- Menu bar ---
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
@@ -637,12 +656,21 @@ impl eframe::App for VideoViewerApp {
                             let recent = self.settings.recent_files.clone();
                             for path in &recent {
                                 if ui.button(path).clicked() {
-                                    let hints = crate::core::hints::parse_filename_hints(path);
-                                    let (w, h, fmt) = (
-                                        hints.width.unwrap_or(self.settings.defaults.width),
-                                        hints.height.unwrap_or(self.settings.defaults.height),
-                                        hints.format.unwrap_or_else(|| self.settings.defaults.format.clone()),
-                                    );
+                                    let ext = std::path::Path::new(path.as_str())
+                                        .extension()
+                                        .and_then(|e| e.to_str())
+                                        .unwrap_or("")
+                                        .to_lowercase();
+                                    let (w, h, fmt) = if ext == "y4m" {
+                                        (0, 0, String::new())
+                                    } else {
+                                        let hints = crate::core::hints::parse_filename_hints(path);
+                                        (
+                                            hints.width.unwrap_or(self.settings.defaults.width),
+                                            hints.height.unwrap_or(self.settings.defaults.height),
+                                            hints.format.unwrap_or_else(|| self.settings.defaults.format.clone()),
+                                        )
+                                    };
                                     self.open_file(ctx, path.clone(), w, h, &fmt);
                                     ui.close_menu();
                                 }
@@ -857,8 +885,8 @@ impl eframe::App for VideoViewerApp {
             .show(ctx, |ui| {
                 self.sidebar.show(ui);
             });
-        // If user just toggled analysis on, compute immediately.
-        if analysis_was_off && self.sidebar.show_analysis && self.sidebar.histogram_data.is_none() {
+        // If user just toggled analysis on, always recompute (data may be stale).
+        if analysis_was_off && self.sidebar.show_analysis {
             self.update_analysis(ctx);
         }
 
@@ -881,7 +909,11 @@ impl eframe::App for VideoViewerApp {
                             );
                             self.sidebar.set_pixel_info(Some(info));
                         }
+                    } else {
+                        self.sidebar.set_pixel_info(None);
                     }
+                } else {
+                    self.sidebar.set_pixel_info(None);
                 }
             } else {
                 ui.centered_and_justified(|ui| {
@@ -1016,6 +1048,10 @@ impl VideoViewerApp {
     }
 
     fn export_clip(&mut self, start: usize, end: usize, path: &str) {
+        if start > end {
+            self.status_error = Some(format!("Export error: start frame ({start}) > end frame ({end})"));
+            return;
+        }
         let reader = match self.reader.as_mut() {
             Some(r) => r,
             None => return,
@@ -1046,6 +1082,10 @@ impl VideoViewerApp {
     }
 
     fn export_png_sequence(&mut self, _ctx: &egui::Context, start: usize, end: usize, dir: &str, prefix: &str) {
+        if start > end {
+            self.status_error = Some(format!("PNG export error: start frame ({start}) > end frame ({end})"));
+            return;
+        }
         let reader = match self.reader.as_mut() {
             Some(r) => r,
             None => return,

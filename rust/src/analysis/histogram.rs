@@ -12,12 +12,10 @@ use std::collections::HashMap;
 /// HashMap with channel names as keys and 256-bin count vectors as values.
 pub fn calculate_histogram(rgb: &[u8], w: u32, h: u32, mode: &str) -> HashMap<String, Vec<u32>> {
     let pixel_count = (w * h) as usize;
-    assert!(
-        rgb.len() >= pixel_count * 3,
-        "RGB buffer too small: expected at least {}, got {}",
-        pixel_count * 3,
-        rgb.len()
-    );
+    if rgb.len() < pixel_count * 3 {
+        log::warn!("RGB buffer too small for histogram: expected {}, got {}", pixel_count * 3, rgb.len());
+        return HashMap::new();
+    }
 
     let mut result = HashMap::new();
 

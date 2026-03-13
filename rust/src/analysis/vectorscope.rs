@@ -13,12 +13,10 @@
 /// Downsamples by subsampling every Nth pixel if total pixels > 640*480.
 pub fn calculate_vectorscope(rgb: &[u8], w: u32, h: u32) -> (Vec<f32>, Vec<f32>) {
     let pixel_count = (w * h) as usize;
-    assert!(
-        rgb.len() >= pixel_count * 3,
-        "RGB buffer too small: expected at least {}, got {}",
-        pixel_count * 3,
-        rgb.len()
-    );
+    if rgb.len() < pixel_count * 3 {
+        log::warn!("RGB buffer too small for vectorscope: expected {}, got {}", pixel_count * 3, rgb.len());
+        return (Vec::new(), Vec::new());
+    }
 
     let max_pixels = 640 * 480;
     let step = if pixel_count > max_pixels {
