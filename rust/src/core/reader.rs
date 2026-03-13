@@ -169,6 +169,7 @@ impl VideoReader {
     pub fn total_frames(&self) -> usize { self.total_frames }
     pub fn is_y4m(&self) -> bool { self.is_y4m }
     pub fn format_name(&self) -> &str { &self.format.name }
+    pub fn format(&self) -> &crate::core::formats::VideoFormat { &self.format }
     pub fn y4m_fps(&self) -> Option<f64> { self.y4m_fps }
 
     // ------------------------------------------------------------------
