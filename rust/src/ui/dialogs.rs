@@ -940,63 +940,63 @@ impl OpenFileDialog {
             .collapsible(false)
             .min_width(500.0)
             .show(ctx, |ui| {
+                // File path + Browse outside Grid so button isn't clipped
+                ui.horizontal(|ui| {
+                    ui.label("File path:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.path)
+                            .desired_width(350.0)
+                            .hint_text("/path/to/video.yuv"),
+                    );
+                    let browse_label = if self.file_browser.is_some() { "Close" } else { "Browse..." };
+                    if ui.button(browse_label).clicked() {
+                        if self.file_browser.is_some() {
+                            self.file_browser = None;
+                        } else {
+                            let start = if !self.path.is_empty() {
+                                Path::new(&self.path)
+                                    .parent()
+                                    .filter(|p| p.is_dir())
+                                    .map(|p| p.to_path_buf())
+                                    .unwrap_or_else(|| self.initial_dir.clone())
+                            } else {
+                                self.initial_dir.clone()
+                            };
+                            self.file_browser = Some(FileBrowser::new(start));
+                        }
+                    }
+                });
+
+                // Auto-detect Y4M and apply hints when path changes
+                let ext = std::path::Path::new(&self.path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                self.is_y4m = ext == "y4m";
+
+                // Auto-fill from filename hints when path changes
+                if !self.is_y4m && self.path != self.last_hinted_path && !self.path.is_empty() {
+                    let hints = crate::core::hints::parse_filename_hints(&self.path);
+                    if let Some(w) = hints.width {
+                        self.width = w;
+                    }
+                    if let Some(h) = hints.height {
+                        self.height = h;
+                    }
+                    if let Some(ref fmt) = hints.format {
+                        if let Some(idx) = self.format_names.iter().position(|n| n.eq_ignore_ascii_case(fmt)) {
+                            self.format_idx = idx;
+                        }
+                    }
+                    self.last_hinted_path = self.path.clone();
+                }
+
+                // Width/Height/Format in a Grid
                 egui::Grid::new("open_file_grid")
                     .num_columns(2)
                     .spacing(egui::vec2(8.0, 4.0))
                     .show(ui, |ui| {
-                        ui.label("File path:");
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.path)
-                                    .desired_width(350.0)
-                                    .hint_text("/path/to/video.yuv"),
-                            );
-                            let browse_label = if self.file_browser.is_some() { "Close" } else { "Browse..." };
-                            if ui.button(browse_label).clicked() {
-                                if self.file_browser.is_some() {
-                                    self.file_browser = None;
-                                } else {
-                                    // Start dir: typed path's parent > initial_dir (open file or cwd)
-                                    let start = if !self.path.is_empty() {
-                                        Path::new(&self.path)
-                                            .parent()
-                                            .filter(|p| p.is_dir())
-                                            .map(|p| p.to_path_buf())
-                                            .unwrap_or_else(|| self.initial_dir.clone())
-                                    } else {
-                                        self.initial_dir.clone()
-                                    };
-                                    self.file_browser = Some(FileBrowser::new(start));
-                                }
-                            }
-                        });
-                        ui.end_row();
-
-                        // Auto-detect Y4M and apply hints when path changes
-                        let ext = std::path::Path::new(&self.path)
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .unwrap_or("")
-                            .to_lowercase();
-                        self.is_y4m = ext == "y4m";
-
-                        // Auto-fill from filename hints when path changes
-                        if !self.is_y4m && self.path != self.last_hinted_path && !self.path.is_empty() {
-                            let hints = crate::core::hints::parse_filename_hints(&self.path);
-                            if let Some(w) = hints.width {
-                                self.width = w;
-                            }
-                            if let Some(h) = hints.height {
-                                self.height = h;
-                            }
-                            if let Some(ref fmt) = hints.format {
-                                if let Some(idx) = self.format_names.iter().position(|n| n.eq_ignore_ascii_case(fmt)) {
-                                    self.format_idx = idx;
-                                }
-                            }
-                            self.last_hinted_path = self.path.clone();
-                        }
-
                         if !self.is_y4m {
                             ui.label("Width:");
                             ui.add(egui::DragValue::new(&mut self.width).range(1..=8192));

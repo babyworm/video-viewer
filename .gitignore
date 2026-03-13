@@ -1,30 +1,18 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-*.egg
-dist/
-build/
-.venv/
-venv/
+# Rust
+/rust/target/
+*.rs.bk
 
 # IDE
 .vscode/
 .idea/
-
-# Test/Cache
-.pytest_cache/
 
 # Large media files
 *.y4m
 *.yuv
 *.raw
 
-# Firebase
-firebase-debug.log
-
-# Shared lib (local build artifact)
-libqxcb.so
-
 # OMC state
 .omc/
+
+# RTL agent team (not related to this project)
+.rtl-agent-team/
