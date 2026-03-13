@@ -290,7 +290,6 @@ fn extract_components(
                         components.insert("Y".to_string(), data[y_off] as u16);
                     }
                     if offset + 1 < data.len() {
-                        components.insert("Y".to_string(), data[y_off] as u16);
                         components.insert("V".to_string(), data[offset + 1] as u16);
                     }
                     if offset + 3 < data.len() {
