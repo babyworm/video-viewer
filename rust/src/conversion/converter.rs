@@ -112,7 +112,7 @@ impl VideoConverter {
                     // Direct YUV plane manipulation
                     convert_yuv_to_yuv(frame_data, w, h, input_fmt, output_fmt)?
                 } else {
-                    // Go through RGB intermediate using opencv
+                    // Go through RGB intermediate
                     convert_via_rgb(frame_data, w, h, input_fmt, output_fmt)?
                 };
 
@@ -430,7 +430,7 @@ fn convert_yuv_to_yuv(
     Ok(pack_yuv(&y, &u_out, &v_out, w, h, dst_fmt))
 }
 
-/// Convert a frame through an RGB intermediate using opencv.
+/// Convert a frame through an RGB intermediate using pure Rust colorspace.
 fn convert_via_rgb(
     frame: &[u8],
     w: u32,
@@ -438,82 +438,41 @@ fn convert_via_rgb(
     src_fmt: &VideoFormat,
     dst_fmt: &VideoFormat,
 ) -> Result<Vec<u8>, String> {
-    #[allow(unused_imports)]
-    use opencv::prelude::*;
-    use opencv::core::{Mat, CV_8UC1, CV_8UC2, CV_8UC3};
-    use opencv::imgproc;
+    use crate::core::colorspace;
 
-    let iw = w as i32;
-    let ih = h as i32;
+    let uw = w as usize;
+    let uh = h as usize;
 
     // --- Step 1: src format -> RGB ---
     let rgb = match src_fmt.format_type {
         FormatType::YuvPlanar if matches!(src_fmt.fourcc.as_str(), "YU12" | "YV12") => {
-            let yuv_mat = unsafe {
-                Mat::new_rows_cols_with_data_unsafe(
-                    ih * 3 / 2, iw, CV_8UC1,
-                    frame.as_ptr() as *mut std::ffi::c_void,
-                    opencv::core::Mat_AUTO_STEP,
-                ).map_err(|e| e.to_string())?
-            };
-            let code = if src_fmt.fourcc == "YU12" {
-                imgproc::COLOR_YUV2RGB_I420
+            let y_size = uw * uh;
+            let uv_size = (uw / 2) * (uh / 2);
+            let y_plane = &frame[..y_size];
+            let (u_plane, v_plane) = if src_fmt.fourcc == "YU12" {
+                (&frame[y_size..y_size + uv_size], &frame[y_size + uv_size..y_size + 2 * uv_size])
             } else {
-                imgproc::COLOR_YUV2RGB_YV12
+                // YV12: V before U
+                (&frame[y_size + uv_size..y_size + 2 * uv_size], &frame[y_size..y_size + uv_size])
             };
-            let mut rgb_mat = Mat::default();
-            imgproc::cvt_color(&yuv_mat, &mut rgb_mat, code, 0).map_err(|e| e.to_string())?;
-            mat_to_rgb_vec(&rgb_mat)?
+            colorspace::yuv_to_rgb_planar(y_plane, u_plane, v_plane, uw, uh, 2, 2, false)
         }
         FormatType::YuvSemiPlanar if matches!(src_fmt.fourcc.as_str(), "NV12" | "NV21") => {
-            let yuv_mat = unsafe {
-                Mat::new_rows_cols_with_data_unsafe(
-                    ih * 3 / 2, iw, CV_8UC1,
-                    frame.as_ptr() as *mut std::ffi::c_void,
-                    opencv::core::Mat_AUTO_STEP,
-                ).map_err(|e| e.to_string())?
-            };
-            let code = if src_fmt.fourcc == "NV12" {
-                imgproc::COLOR_YUV2RGB_NV12
-            } else {
-                imgproc::COLOR_YUV2RGB_NV21
-            };
-            let mut rgb_mat = Mat::default();
-            imgproc::cvt_color(&yuv_mat, &mut rgb_mat, code, 0).map_err(|e| e.to_string())?;
-            mat_to_rgb_vec(&rgb_mat)?
+            let uv_swapped = src_fmt.fourcc == "NV21";
+            colorspace::yuv_to_rgb_semi_planar(frame, uw, uh, uv_swapped, false)
         }
         FormatType::YuvPacked if matches!(src_fmt.fourcc.as_str(), "YUYV" | "UYVY") => {
-            let yuv_mat = unsafe {
-                Mat::new_rows_cols_with_data_unsafe(
-                    ih, iw, CV_8UC2,
-                    frame.as_ptr() as *mut std::ffi::c_void,
-                    opencv::core::Mat_AUTO_STEP,
-                ).map_err(|e| e.to_string())?
-            };
-            let code = if src_fmt.fourcc == "YUYV" {
-                imgproc::COLOR_YUV2RGB_YUYV
+            if src_fmt.fourcc == "YUYV" {
+                colorspace::yuv_to_rgb_yuyv(frame, uw, uh, false)
             } else {
-                imgproc::COLOR_YUV2RGB_UYVY
-            };
-            let mut rgb_mat = Mat::default();
-            imgproc::cvt_color(&yuv_mat, &mut rgb_mat, code, 0).map_err(|e| e.to_string())?;
-            mat_to_rgb_vec(&rgb_mat)?
+                colorspace::yuv_to_rgb_uyvy(frame, uw, uh, false)
+            }
         }
         FormatType::Rgb if src_fmt.fourcc == "RGB3" => {
-            frame[..(w as usize * h as usize * 3)].to_vec()
+            frame[..(uw * uh * 3)].to_vec()
         }
         FormatType::Rgb if src_fmt.fourcc == "BGR3" => {
-            let bgr_mat = unsafe {
-                Mat::new_rows_cols_with_data_unsafe(
-                    ih, iw, CV_8UC3,
-                    frame.as_ptr() as *mut std::ffi::c_void,
-                    opencv::core::Mat_AUTO_STEP,
-                ).map_err(|e| e.to_string())?
-            };
-            let mut rgb_mat = Mat::default();
-            imgproc::cvt_color(&bgr_mat, &mut rgb_mat, imgproc::COLOR_BGR2RGB, 0)
-                .map_err(|e| e.to_string())?;
-            mat_to_rgb_vec(&rgb_mat)?
+            colorspace::bgr_to_rgb(frame, uw, uh)
         }
         FormatType::Rgb => {
             // 32-bit and 16-bit RGB variants → RGB24
@@ -527,24 +486,14 @@ fn convert_via_rgb(
             bayer_highbit_to_rgb24(frame, w, h, src_fmt)?
         }
         FormatType::Grey if src_fmt.bit_depth == 8 => {
-            let grey_mat = unsafe {
-                Mat::new_rows_cols_with_data_unsafe(
-                    ih, iw, CV_8UC1,
-                    frame.as_ptr() as *mut std::ffi::c_void,
-                    opencv::core::Mat_AUTO_STEP,
-                ).map_err(|e| e.to_string())?
-            };
-            let mut rgb_mat = Mat::default();
-            imgproc::cvt_color(&grey_mat, &mut rgb_mat, imgproc::COLOR_GRAY2RGB, 0)
-                .map_err(|e| e.to_string())?;
-            mat_to_rgb_vec(&rgb_mat)?
+            colorspace::grey_to_rgb(frame, uw, uh)
         }
         FormatType::Grey => {
             // 10/12/16-bit greyscale: 2 bytes per pixel LE, shift to 8-bit
             grey_highbit_to_rgb24(frame, w, h, src_fmt)?
         }
         _ if is_yuv(src_fmt) => {
-            // For other YUV variants, extract planes, upsample to 444, convert manually
+            // For other YUV variants, extract planes, upsample to 444, convert
             let (y, u, v) = extract_yuv_planes(frame, w, h, src_fmt);
             let (s_h, s_v) = (src_fmt.subsampling.0, src_fmt.subsampling.1);
             let uv_w = w / s_h;
@@ -575,34 +524,14 @@ fn convert_via_rgb(
     match dst_fmt.format_type {
         FormatType::Rgb if dst_fmt.fourcc == "RGB3" => Ok(rgb),
         FormatType::Rgb if dst_fmt.fourcc == "BGR3" => {
-            let rgb_mat = unsafe {
-                Mat::new_rows_cols_with_data_unsafe(
-                    ih, iw, CV_8UC3,
-                    rgb.as_ptr() as *mut std::ffi::c_void,
-                    opencv::core::Mat_AUTO_STEP,
-                ).map_err(|e| e.to_string())?
-            };
-            let mut bgr_mat = Mat::default();
-            imgproc::cvt_color(&rgb_mat, &mut bgr_mat, imgproc::COLOR_RGB2BGR, 0)
-                .map_err(|e| e.to_string())?;
-            mat_to_rgb_vec(&bgr_mat)
+            Ok(colorspace::rgb_to_bgr(&rgb, uw, uh))
         }
         FormatType::Rgb => {
             // RGB24 → 32-bit/16-bit RGB variants
             rgb24_to_rgb_variant(&rgb, w, h, dst_fmt)
         }
         FormatType::Grey if dst_fmt.bit_depth == 8 => {
-            let rgb_mat = unsafe {
-                Mat::new_rows_cols_with_data_unsafe(
-                    ih, iw, CV_8UC3,
-                    rgb.as_ptr() as *mut std::ffi::c_void,
-                    opencv::core::Mat_AUTO_STEP,
-                ).map_err(|e| e.to_string())?
-            };
-            let mut grey_mat = Mat::default();
-            imgproc::cvt_color(&rgb_mat, &mut grey_mat, imgproc::COLOR_RGB2GRAY, 0)
-                .map_err(|e| e.to_string())?;
-            mat_to_rgb_vec(&grey_mat)
+            Ok(colorspace::rgb_to_grey(&rgb, uw, uh))
         }
         FormatType::Grey => {
             // 10/12/16-bit greyscale destination: convert to 8-bit grey, then upshift
@@ -1006,16 +935,3 @@ fn rgb24_to_grey_highbit(rgb: &[u8], w: u32, h: u32, fmt: &VideoFormat) -> Resul
     Ok(out)
 }
 
-fn mat_to_rgb_vec(mat: &opencv::core::Mat) -> Result<Vec<u8>, String> {
-    #[allow(unused_imports)]
-    use opencv::prelude::*;
-    let total = mat.total();
-    let channels = mat.channels();
-    let n = total * channels as usize;
-    let mut out = vec![0u8; n];
-    unsafe {
-        let ptr = mat.data();
-        std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), n);
-    }
-    Ok(out)
-}
