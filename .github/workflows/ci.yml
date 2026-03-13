@@ -13,7 +13,7 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -29,6 +29,14 @@ jobs:
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install opencv llvm
+
+      - name: Install system dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install llvm opencv -y
+          echo "OPENCV_LINK_LIBS=opencv_world4100" >> $env:GITHUB_ENV
+          echo "OPENCV_LINK_PATHS=C:\tools\opencv\build\x64\vc16\lib" >> $env:GITHUB_ENV
+          echo "OPENCV_INCLUDE_PATHS=C:\tools\opencv\build\include" >> $env:GITHUB_ENV
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
