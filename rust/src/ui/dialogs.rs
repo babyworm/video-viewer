@@ -152,11 +152,6 @@ impl ExportDialog {
 
                     ui.label("Output path:");
                     ui.text_edit_singleline(&mut self.output_path);
-                    if ui.button("Browse...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().save_file() {
-                            self.output_path = path.display().to_string();
-                        }
-                    }
                     ui.end_row();
                 });
 
@@ -236,11 +231,6 @@ impl ConvertDialog {
 
                     ui.label("Output path:");
                     ui.text_edit_singleline(&mut self.output_path);
-                    if ui.button("Browse...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().save_file() {
-                            self.output_path = path.display().to_string();
-                        }
-                    }
                     ui.end_row();
                 });
 
@@ -310,11 +300,6 @@ impl PngExportDialog {
 
                     ui.label("Output dir:");
                     ui.text_edit_singleline(&mut self.output_dir);
-                    if ui.button("Browse...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.output_dir = path.display().to_string();
-                        }
-                    }
                     ui.end_row();
 
                     ui.label("Prefix:");
@@ -502,24 +487,11 @@ impl OpenFileDialog {
                     .spacing(egui::vec2(8.0, 4.0))
                     .show(ui, |ui| {
                         ui.label("File path:");
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.path)
-                                    .desired_width(300.0)
-                                    .hint_text("/path/to/video.yuv"),
-                            );
-                            if ui.button("Browse...").clicked() {
-                                if let Some(path) = rfd::FileDialog::new()
-                                    .add_filter(
-                                        "Video",
-                                        &["yuv", "y4m", "rgb", "raw", "nv12", "nv21"],
-                                    )
-                                    .pick_file()
-                                {
-                                    self.path = path.display().to_string();
-                                }
-                            }
-                        });
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.path)
+                                .desired_width(400.0)
+                                .hint_text("/path/to/video.yuv"),
+                        );
                         ui.end_row();
 
                         // Auto-detect Y4M and apply hints when path changes
@@ -671,18 +643,9 @@ impl SaveFileDialog {
                     ui.label("Save to:");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.path)
-                            .desired_width(300.0)
+                            .desired_width(350.0)
                             .hint_text("/path/to/output.png"),
                     );
-                    if ui.button("Browse...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("PNG", &["png"])
-                            .set_file_name(&self.path)
-                            .save_file()
-                        {
-                            self.path = path.display().to_string();
-                        }
-                    }
                 });
 
                 ui.separator();
