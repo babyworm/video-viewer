@@ -52,6 +52,10 @@ pub struct VideoViewerApp {
     /// Frame timestamps for render FPS calculation (rolling window).
     frame_times: VecDeque<Instant>,
     render_fps: f64,
+    /// Auto-fit mode: automatically fit image when window resizes.
+    auto_fit: bool,
+    /// Last known available size for auto-fit detection.
+    last_available_size: Option<(f32, f32)>,
 }
 
 impl VideoViewerApp {
@@ -103,6 +107,8 @@ impl VideoViewerApp {
             show_about: false,
             frame_times: VecDeque::new(),
             render_fps: 0.0,
+            auto_fit: true,
+            last_available_size: None,
         }
     }
 
@@ -296,6 +302,52 @@ impl VideoViewerApp {
         }
     }
 
+    /// Handle window edge resize (custom, since OS decorations are disabled).
+    fn handle_window_resize(&self, ctx: &egui::Context) {
+        use egui::viewport::ResizeDirection;
+
+        let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        if is_max {
+            return; // No resize when maximized.
+        }
+
+        let screen = ctx.screen_rect();
+        let border = 5.0_f32;
+
+        if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+            let left = pos.x - screen.min.x < border;
+            let right = screen.max.x - pos.x < border;
+            let top = pos.y - screen.min.y < border;
+            let bottom = screen.max.y - pos.y < border;
+
+            let dir = match (left, right, top, bottom) {
+                (true, _, true, _) => Some(ResizeDirection::NorthWest),
+                (_, true, true, _) => Some(ResizeDirection::NorthEast),
+                (true, _, _, true) => Some(ResizeDirection::SouthWest),
+                (_, true, _, true) => Some(ResizeDirection::SouthEast),
+                (true, _, _, _) => Some(ResizeDirection::West),
+                (_, true, _, _) => Some(ResizeDirection::East),
+                (_, _, true, _) => Some(ResizeDirection::North),
+                (_, _, _, true) => Some(ResizeDirection::South),
+                _ => None,
+            };
+
+            if let Some(direction) = dir {
+                let cursor = match direction {
+                    ResizeDirection::North | ResizeDirection::South => egui::CursorIcon::ResizeVertical,
+                    ResizeDirection::East | ResizeDirection::West => egui::CursorIcon::ResizeHorizontal,
+                    ResizeDirection::NorthWest | ResizeDirection::SouthEast => egui::CursorIcon::ResizeNwSe,
+                    ResizeDirection::NorthEast | ResizeDirection::SouthWest => egui::CursorIcon::ResizeNeSw,
+                };
+                ctx.set_cursor_icon(cursor);
+
+                if ctx.input(|i| i.pointer.any_pressed()) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+                }
+            }
+        }
+    }
+
     /// Compute analysis data from the current RGB frame and feed it to the sidebar.
     /// Only computes data for the currently active tab to avoid unnecessary work.
     fn update_analysis(&mut self, ctx: &egui::Context) {
@@ -460,7 +512,23 @@ impl VideoViewerApp {
 }
 
 impl eframe::App for VideoViewerApp {
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        let c = visuals.extreme_bg_color;
+        [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0]
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Paint full viewport background to prevent maximize artifacts on WSLg.
+        let bg_color = ctx.style().visuals.extreme_bg_color;
+        ctx.layer_painter(egui::LayerId::background()).rect_filled(
+            ctx.screen_rect(),
+            0.0,
+            bg_color,
+        );
+
+        // Custom window resize handles (no OS decorations).
+        self.handle_window_resize(ctx);
+
         // --- Track render FPS (rolling average over last 30 frames) ---
         let now = Instant::now();
         self.frame_times.push_back(now);
@@ -645,6 +713,20 @@ impl eframe::App for VideoViewerApp {
 
         // --- Menu bar ---
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            // Make the menu bar draggable as a title bar (no OS decorations).
+            let title_bar_response = ui.interact(
+                ui.max_rect(),
+                ui.id().with("title_bar_drag"),
+                egui::Sense::click_and_drag(),
+            );
+            if title_bar_response.dragged() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            if title_bar_response.double_clicked() {
+                let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
+            }
+
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open... (Ctrl+O)").clicked() {
@@ -786,6 +868,23 @@ impl eframe::App for VideoViewerApp {
                         self.show_about = true;
                     }
                 });
+
+                // --- Window control buttons (right-aligned) ---
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("✕").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                    let max_label = if is_max { "🗗" } else { "🗖" };
+                    if ui.button(max_label).clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
+                    }
+                    if ui.button("🗕").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    }
+                    ui.separator();
+                    ui.label("Video Viewer");
+                });
             });
         });
 
@@ -804,7 +903,7 @@ impl eframe::App for VideoViewerApp {
             })
             .unwrap_or(true);
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            if let Some(act) = self.toolbar.show(ui, is_yuv) {
+            if let Some(act) = self.toolbar.show(ui, is_yuv, self.auto_fit) {
                 match act {
                     ToolbarAction::SetComponent(c) => {
                         self.current_component = c;
@@ -822,17 +921,33 @@ impl eframe::App for VideoViewerApp {
                         let avail = ctx.available_rect().size();
                         self.canvas.fit_to_view(avail);
                     }
+                    ToolbarAction::ToggleAutoFit => {
+                        self.auto_fit = !self.auto_fit;
+                        if self.auto_fit {
+                            let avail = ctx.available_rect().size();
+                            self.canvas.fit_to_view(avail);
+                        }
+                    }
+                    ToolbarAction::Refresh => {
+                        // Re-decode and re-display the current frame
+                        let idx = self.current_frame_idx;
+                        self.goto_frame(ctx, idx);
+                    }
                     ToolbarAction::ZoomIn => {
                         self.canvas.zoom = (self.canvas.zoom * 1.25).min(50.0);
+                        self.auto_fit = false;
                     }
                     ToolbarAction::ZoomOut => {
                         self.canvas.zoom = (self.canvas.zoom / 1.25).max(0.1);
+                        self.auto_fit = false;
                     }
                     ToolbarAction::Zoom1to1 => {
                         self.canvas.zoom = 1.0;
+                        self.auto_fit = false;
                     }
                     ToolbarAction::Zoom2to1 => {
                         self.canvas.zoom = 2.0;
+                        self.auto_fit = false;
                     }
                 }
             }
@@ -922,10 +1037,26 @@ impl eframe::App for VideoViewerApp {
         self.sidebar.show_analysis_window(ctx);
 
         // --- Central panel (canvas) ---
-        let bg = ctx.style().visuals.extreme_bg_color;
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(bg))
-            .show(ctx, |ui| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // Detect window resize and force repaints (fixes WSLg compositor artifacts).
+            {
+                let avail = ui.available_size();
+                let cur = (avail.x, avail.y);
+                let changed = match self.last_available_size {
+                    Some(prev) => (prev.0 - cur.0).abs() > 1.0 || (prev.1 - cur.1).abs() > 1.0,
+                    None => true,
+                };
+                if changed {
+                    if self.auto_fit && self.reader.is_some() {
+                        self.canvas.fit_to_view(avail);
+                    }
+                    self.last_available_size = Some(cur);
+                    // Force multiple repaints so the compositor fully redraws.
+                    ctx.request_repaint();
+                    ctx.request_repaint();
+                }
+            }
+
             if self.reader.is_some() {
                 let response = self.canvas.show(ui);
                 // Update pixel info on hover — pass absolute screen pos

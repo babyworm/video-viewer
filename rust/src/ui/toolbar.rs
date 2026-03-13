@@ -20,6 +20,8 @@ pub enum ToolbarAction {
     ToggleGrid,
     ToggleSubGrid,
     FitToView,
+    ToggleAutoFit,
+    Refresh,
     ZoomIn,
     ZoomOut,
     Zoom1to1,
@@ -38,7 +40,7 @@ impl Toolbar {
     }
 
     /// Show the toolbar. Returns an action if one was triggered.
-    pub fn show(&mut self, ui: &mut egui::Ui, is_yuv: bool) -> Option<ToolbarAction> {
+    pub fn show(&mut self, ui: &mut egui::Ui, is_yuv: bool, auto_fit: bool) -> Option<ToolbarAction> {
         let mut action = None;
 
         ui.horizontal(|ui| {
@@ -103,6 +105,13 @@ impl Toolbar {
             // --- Zoom controls ---
             if ui.button("Fit").clicked() {
                 action = Some(ToolbarAction::FitToView);
+            }
+            let auto_btn = egui::Button::new("Auto").selected(auto_fit);
+            if ui.add(auto_btn).clicked() {
+                action = Some(ToolbarAction::ToggleAutoFit);
+            }
+            if ui.button("↻").clicked() {
+                action = Some(ToolbarAction::Refresh);
             }
             if ui.button("1:1").clicked() {
                 action = Some(ToolbarAction::Zoom1to1);
