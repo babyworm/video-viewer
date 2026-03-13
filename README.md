@@ -2,9 +2,7 @@
 
 Raw/YUV/RGB video viewer built with Rust + egui. Supports 75+ pixel formats for inspecting uncompressed video data.
 
-<!-- TODO: Add screenshot
 ![Video Viewer screenshot](assets/screenshot.png)
--->
 
 ## Features
 
