@@ -2,7 +2,7 @@
 
 ## Version
 
-- Current version: defined in `video_viewer/__init__.py` (`__version__`)
+- Current version: defined in `rust/Cargo.toml` (`version`)
 - Follows Semantic Versioning (SemVer): `MAJOR.MINOR.PATCH`
 
 ### Versioning Rules
@@ -10,56 +10,82 @@
 - **MAJOR**: Only the user (babyworm) decides when to bump the major version.
 - **MINOR**: Increment when adding new features (e.g., new UI panel, new analysis tool, new format support).
 - **PATCH**: Increment for bug fixes, small UI tweaks, refactoring without new features.
-- Always update `video_viewer/__init__.py` when the version changes.
+- Always update `rust/Cargo.toml` when the version changes.
 - **Every commit that adds features or fixes bugs must bump the version.**
-- The About dialog reads `__version__` automatically.
 
 ## Project Structure
 
-- `video_viewer/` - Main package
-  - `__init__.py` - Package version (`__version__`)
-  - `main.py` - CLI entry point (argparse, headless conversion)
-  - `main_window.py` - ImageCanvas, MainWindow (UI, toolbar, menus, shortcuts)
-  - `video_reader.py` - VideoReader, FrameCache, parse_filename_hints (format decoding, pixel inspection, filename metadata extraction)
-  - `format_manager.py` - FormatManager, FormatType (YUV/RGB/Bayer format definitions)
-  - `constants.py` - Shared constants (resolutions, FPS options, theme, defaults)
-  - `dialogs.py` - ParametersDialog, ExportDialog, ConvertDialog, SettingsDialog, etc.
-  - `analysis.py` - VideoAnalyzer (PSNR, SSIM, histogram, waveform, vectorscope)
-  - `comparison_view.py` - ComparisonWindow (A/B compare)
-  - `video_converter.py` - VideoConverter (format conversion engine)
-  - `log_config.py` - Logging configuration
-- `test/` - pytest test suite
+- `rust/` - Main Rust codebase (eframe/egui)
+  - `Cargo.toml` - Dependencies and version
+  - `src/main.rs` - CLI entry point (clap, headless conversion)
+  - `src/lib.rs` - Library root, GUI launch
+  - `src/app.rs` - VideoViewerApp (main application state, keyboard shortcuts, frame logic)
+  - `src/core/` - Core logic
+    - `formats.rs` - FormatType, VideoFormat, FORMAT_DEFS (75+ pixel format definitions)
+    - `reader.rs` - VideoReader (file I/O, frame seeking, RGB conversion, channel extraction)
+    - `cache.rs` - FrameCache (LRU memory-bounded cache)
+    - `hints.rs` - parse_filename_hints (resolution, format, fps, bit depth from filename)
+    - `y4m.rs` - Y4M header parser and frame offset builder
+    - `pixel.rs` - get_pixel_info (pixel inspector values, hex, neighborhood)
+  - `src/ui/` - UI components
+    - `canvas.rs` - ImageCanvas (rendering, zoom, grid overlay)
+    - `toolbar.rs` - Toolbar (component selection, grid controls, colorize_channel)
+    - `sidebar.rs` - Sidebar (analysis tabs: histogram, waveform, vectorscope, metrics)
+    - `navigation.rs` - NavigationBar (frame slider, playback controls)
+    - `dialogs.rs` - Open, Save, Parameters, Export, Convert, Settings dialogs
+    - `comparison.rs` - ComparisonView (split, overlay, diff modes)
+    - `settings.rs` - Settings persistence (toml)
+  - `src/analysis/` - Analysis tools
+    - `histogram.rs` - RGB and luma histograms
+    - `waveform.rs` - Waveform display
+    - `vectorscope.rs` - BT.709 YCbCr vectorscope
+    - `metrics.rs` - PSNR, SSIM, frame difference
+    - `scene.rs` - Scene change detection
+  - `src/conversion/` - Format conversion
+    - `converter.rs` - VideoConverter, extract/pack YUV planes, chroma resampling
+  - `tests/` - Integration tests
+- `scripts/generate_test_data.py` - Test data generator (Python/OpenCV)
+- `test_data/` - Sample raw video files (QCIF I420, NV12, RGB565, YUYV)
 
 ## Testing Conventions
 
-- Run tests: `.venv/bin/python -m pytest test/ -v`
+- Run tests: `cd rust && cargo test`
 - All tests must pass before any release.
-- Framework: pytest with PySide6 Qt integration
+- Framework: Rust integration tests in `rust/tests/`
 
-### Fixtures & Patterns
+### Test Patterns
 
-- `qapp` — QApplication fixture (defined in each test file, reuses existing instance)
-- `tmp_path` — pytest built-in for temporary file creation
-- Minimal I420 frame data: `b'\x80' * int(w * h * 1.5)` (4x4 default: 24 bytes)
-- Y4M helper: `_make_y4m(tmp_path, name, header_params)` in `test_main_window.py`
-- Use `pytest.mark.parametrize` for variant testing (resolution aliases, format tokens, etc.)
-- Use `unittest.mock.patch` for dialog mocking and method interception
+- Use `tempfile::NamedTempFile` or `tempfile::tempdir()` for temporary files
+- Minimal I420 frame: 4x4 = 24 bytes (16 Y + 4 U + 4 V)
+- Helper functions: `make_raw_i420(frames)`, `make_i420_frame(y, u, v)`
+- Test naming: `test_<module>_<behavior>` (e.g., `test_pixel_info_yuyv_odd`)
 
 ### Test File Organization
 
-| File | Scope | Qt Required |
-|------|-------|-------------|
-| `test/test_filename_hints.py` | `parse_filename_hints()` pure function | No |
-| `test/test_main_window.py` | MainWindow integration, `_apply_file_hints`, Y4M fps | Yes (`qapp`) |
-| `test/test_pixel_inspector.py` | `get_pixel_info()` for various formats | No |
-| `test/test_suite.py` | VideoReader core operations | No |
-| `test/test_video_reader.py` | VideoReader file I/O | No |
+| File | Scope |
+|------|-------|
+| `tests/formats_test.rs` | Format lookup, frame_size, categories (21 tests) |
+| `tests/formats_extra_test.rs` | RGB16/32, semi-planar, packed frame sizes (9 tests) |
+| `tests/reader_test.rs` | VideoReader open, seek, Y4M, RGB convert, channels (6 tests) |
+| `tests/pixel_test.rs` | Pixel info: I420, YV12, NV12, NV21, RGB24, BGR24, Grey (12 tests) |
+| `tests/pixel_packed_test.rs` | Pixel info: YUYV, UYVY, NV16 packed formats (5 tests) |
+| `tests/hints_test.rs` | Filename hint parsing (10 tests) |
+| `tests/y4m_test.rs` | Y4M header parsing, frame offsets (8 tests) |
+| `tests/cache_test.rs` | LRU cache operations (6 tests) |
+| `tests/converter_test.rs` | I420→NV12, identity, multi-frame, roundtrip, cancel (5 tests) |
+| `tests/converter_extra_test.rs` | resample_chroma, I420→YV12, I420→422P, NV12 roundtrip (6 tests) |
+| `tests/histogram_test.rs` | Histogram RGB/Y modes (2 tests) |
+| `tests/waveform_test.rs` | Waveform luma/R/G/B, edge cases (6 tests) |
+| `tests/vectorscope_test.rs` | Vectorscope neutral/red/blue, subsampling (5 tests) |
+| `tests/metrics_test.rs` | PSNR, SSIM, frame difference (4 tests) |
+| `tests/scene_test.rs` | Scene detection, threshold, save/load (4 tests) |
+| `tests/integration_test.rs` | Real Y4M file (conditional) (1 test) |
 
 ## Filename Hint Reference
 
-When adding new aliases, update BOTH `video_reader.py` dictionaries AND this table.
+When adding new aliases, update `rust/src/core/hints.rs` tables AND this section.
 
-### Named Resolutions (`_NAMED_RESOLUTIONS`)
+### Named Resolutions
 
 | Alias | Width | Height | Notes |
 |-------|-------|--------|-------|
@@ -77,7 +103,7 @@ When adding new aliases, update BOTH `video_reader.py` dictionaries AND this tab
 | `sd` / `pal` | 720 | 576 | PAL SD |
 | `ntsc` | 720 | 480 | NTSC SD |
 
-### Format Aliases (`_FORMAT_ALIASES`)
+### Format Aliases
 
 | Token(s) | Maps To | Type |
 |----------|---------|------|
@@ -87,14 +113,14 @@ When adding new aliases, update BOTH `video_reader.py` dictionaries AND this tab
 | `nv21` | NV21 | YUV Semi-Planar 4:2:0 |
 | `nv16` | NV16 | YUV Semi-Planar 4:2:2 |
 | `nv61` | NV61 | YUV Semi-Planar 4:2:2 |
-| `yuv422p`, `yuv422` | 422P | YUV Planar 4:2:2 |
-| `yuv444p`, `yuv444` | 444P | YUV Planar 4:4:4 |
+| `yuv422p`, `yuv422` | YUV422P | YUV Planar 4:2:2 |
+| `yuv444p`, `yuv444` | YUV444P | YUV Planar 4:4:4 |
 | `yuyv`, `yuy2` | YUYV | YUV Packed 4:2:2 |
 | `uyvy` | UYVY | YUV Packed 4:2:2 |
 | `yvyu` | YVYU | YUV Packed 4:2:2 |
-| `rgb24`, `rgb` | RGB3 | RGB 24-bit |
-| `bgr24`, `bgr` | BGR3 | RGB 24-bit |
-| `grey`, `gray` | GREY | Greyscale 8-bit |
+| `rgb24`, `rgb` | RGB24 | RGB 24-bit |
+| `bgr24`, `bgr` | BGR24 | RGB 24-bit |
+| `grey`, `gray` | Greyscale (8-bit) | Greyscale |
 
 ### Bit Depth Tokens (parsed from filename)
 
