@@ -6,6 +6,7 @@ use std::fs::File;
 use crate::core::cache::FrameCache;
 use crate::core::formats::{VideoFormat, FormatType, get_format_by_name};
 use crate::core::hints::parse_filename_hints;
+use crate::core::ppm::parse_ppm_header;
 use crate::core::y4m::{parse_y4m_header, build_frame_offsets};
 
 /// Default cache budget: 512 MiB.
@@ -81,14 +82,13 @@ impl VideoReader {
         // ------------------------------------------------------------------
         // 2. Detect Y4M vs raw.
         // ------------------------------------------------------------------
-        let is_y4m = {
-            let ext = Path::new(path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            ext == "y4m" || raw.starts_with(b"YUV4MPEG2")
-        };
+        let ext = Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let is_y4m = ext == "y4m" || raw.starts_with(b"YUV4MPEG2");
+        let is_ppm = ext == "ppm" || raw.starts_with(b"P6");
 
         let mut frame_offsets: Vec<usize> = Vec::new();
         let mut y4m_fps: Option<f64> = None;
@@ -97,7 +97,19 @@ impl VideoReader {
         let frame_size: usize;
         let total_frames: usize;
 
-        if is_y4m {
+        if is_ppm {
+            // --------------------------------------------------------------
+            // 3p. PPM path — parse header, treat as single-frame RGB24.
+            // --------------------------------------------------------------
+            let header = parse_ppm_header(raw)?;
+            width = header.width;
+            height = header.height;
+            format = get_format_by_name("RGB24")
+                .ok_or_else(|| "RGB24 format not found".to_string())?;
+            frame_size = format.frame_size(width, height);
+            frame_offsets.push(header.data_offset);
+            total_frames = 1;
+        } else if is_y4m {
             // --------------------------------------------------------------
             // 3a. Y4M path — parse header, build offset table.
             // --------------------------------------------------------------
@@ -191,9 +203,9 @@ impl VideoReader {
         }
 
         // Determine byte offset.
-        let offset = if self.is_y4m {
+        let offset = if !self.frame_offsets.is_empty() {
             *self.frame_offsets.get(idx).ok_or_else(|| {
-                format!("Y4M frame offset missing for index {idx}")
+                format!("Frame offset missing for index {idx}")
             })?
         } else {
             idx * self.frame_size
