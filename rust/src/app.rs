@@ -599,14 +599,14 @@ impl eframe::App for VideoViewerApp {
                 }
             }
         }
-        if keys.13 {
+        if keys.13 && self.dialog_state == DialogState::None {
             // Ctrl+S: save frame
             let name = format!("frame_{:06}.png", self.current_frame_idx);
             self.save_file_dialog = Some(dialogs::SaveFileDialog::new("Save Frame", &name));
             self.dialog_state = DialogState::SaveFile;
         }
         if keys.14 { self.copy_frame_to_clipboard(); }
-        if keys.15 {
+        if keys.15 && self.dialog_state == DialogState::None {
             // Ctrl+O: open file dialog
             self.open_file_dialog = Some(dialogs::OpenFileDialog::new(
                 self.settings.defaults.width,
@@ -873,7 +873,9 @@ impl eframe::App for VideoViewerApp {
                         self.goto_frame(ctx, last);
                         self.is_playing = false;
                     }
-                    NavigationAction::SetFps(_) => {}
+                    NavigationAction::SetFps(_) => {
+                        self.last_frame_time = Some(Instant::now());
+                    }
                 }
             }
         });
