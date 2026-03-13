@@ -23,6 +23,14 @@ Raw/YUV/RGB video viewer built with PySide6 (Qt6). Supports 30+ pixel formats fo
 
 ## Installation
 
+### Quick install (use anywhere)
+
+```bash
+pipx install git+https://github.com/babyworm/video-viewer.git
+```
+
+### Development install
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
@@ -31,10 +39,6 @@ pip install -e .
 ```
 
 ## Usage
-
-```bash
-source .venv/bin/activate
-```
 
 ### GUI mode
 
