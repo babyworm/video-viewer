@@ -4,6 +4,7 @@ use std::io::Write;
 use memmap2::Mmap;
 
 use crate::core::formats::{get_format_by_name, FormatType, VideoFormat};
+use crate::core::ppm::write_ppm;
 
 /// Stateless video format converter.
 pub struct VideoConverter;
@@ -29,20 +30,30 @@ impl VideoConverter {
         output_fmt_name: &str,
         progress_cb: Option<&dyn Fn(usize, usize) -> bool>,
     ) -> Result<(usize, bool), String> {
+        let is_ppm_output = output_fmt_name.eq_ignore_ascii_case("PPM");
+
         let input_fmt = get_format_by_name(input_fmt_name)
             .ok_or_else(|| format!("Unknown input format '{input_fmt_name}'"))?;
-        let output_fmt = get_format_by_name(output_fmt_name)
-            .ok_or_else(|| format!("Unknown output format '{output_fmt_name}'"))?;
 
         let in_frame_size = input_fmt.frame_size(w, h);
-        let out_frame_size = output_fmt.frame_size(w, h);
-
         if in_frame_size == 0 {
             return Err(format!(
                 "Input frame size is 0 for format '{}'",
                 input_fmt.name
             ));
         }
+
+        // For PPM output, we convert to RGB24 and write with PPM header.
+        // For normal output, look up the output format.
+        let output_fmt = if is_ppm_output {
+            get_format_by_name("RGB24")
+                .ok_or_else(|| "RGB24 format not found".to_string())?
+        } else {
+            get_format_by_name(output_fmt_name)
+                .ok_or_else(|| format!("Unknown output format '{output_fmt_name}'"))?
+        };
+
+        let out_frame_size = output_fmt.frame_size(w, h);
         if out_frame_size == 0 {
             return Err(format!(
                 "Output frame size is 0 for format '{}'",
@@ -66,8 +77,8 @@ impl VideoConverter {
         let mut out_file = File::create(output_path)
             .map_err(|e| format!("Cannot create '{}': {e}", output_path))?;
 
-        let same_format = input_fmt.fourcc == output_fmt.fourcc;
-        let both_yuv = is_yuv(input_fmt) && is_yuv(output_fmt);
+        let same_format = !is_ppm_output && input_fmt.fourcc == output_fmt.fourcc;
+        let both_yuv = is_yuv(input_fmt) && is_yuv(output_fmt) && !is_ppm_output;
 
         for frame_idx in 0..total_frames {
             // Progress callback
@@ -84,20 +95,31 @@ impl VideoConverter {
             }
             let frame_data = &raw[offset..end];
 
-            let out_data = if same_format {
-                // Identity copy
-                frame_data.to_vec()
-            } else if both_yuv {
-                // Direct YUV plane manipulation
-                convert_yuv_to_yuv(frame_data, w, h, input_fmt, output_fmt)?
+            if is_ppm_output {
+                // Convert to RGB and write as PPM
+                let rgb = if input_fmt.fourcc == "RGB3" {
+                    frame_data.to_vec()
+                } else {
+                    convert_via_rgb(frame_data, w, h, input_fmt, output_fmt)?
+                };
+                write_ppm(&mut out_file, w, h, &rgb)
+                    .map_err(|e| format!("PPM write error: {e}"))?;
             } else {
-                // Go through RGB intermediate using opencv
-                convert_via_rgb(frame_data, w, h, input_fmt, output_fmt)?
-            };
+                let out_data = if same_format {
+                    // Identity copy
+                    frame_data.to_vec()
+                } else if both_yuv {
+                    // Direct YUV plane manipulation
+                    convert_yuv_to_yuv(frame_data, w, h, input_fmt, output_fmt)?
+                } else {
+                    // Go through RGB intermediate using opencv
+                    convert_via_rgb(frame_data, w, h, input_fmt, output_fmt)?
+                };
 
-            out_file
-                .write_all(&out_data)
-                .map_err(|e| format!("Write error: {e}"))?;
+                out_file
+                    .write_all(&out_data)
+                    .map_err(|e| format!("Write error: {e}"))?;
+            }
         }
 
         Ok((total_frames, false))
