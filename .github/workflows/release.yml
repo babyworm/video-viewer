@@ -9,6 +9,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
@@ -21,7 +22,7 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: video-viewer-macos-aarch64
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             artifact: video-viewer-macos-x86_64
           - os: windows-latest
