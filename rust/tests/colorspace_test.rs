@@ -13,7 +13,7 @@ fn test_i420_neutral_gray() {
     let u = vec![128u8; (w / 2) * (h / 2)];
     let v = vec![128u8; (w / 2) * (h / 2)];
 
-    let rgb = yuv_to_rgb_planar(&y, &u, &v, w, h, 2, 2, false);
+    let rgb = yuv_to_rgb_planar(&y, &u, &v, w, h, (2, 2), false);
     assert_eq!(rgb.len(), w * h * 3);
     for i in 0..w * h {
         assert_eq!(rgb[i * 3], 128, "R at pixel {i}");
@@ -32,7 +32,7 @@ fn test_i420_red_bt601() {
     let u = vec![90u8; 1]; // 1x1 chroma
     let v = vec![240u8; 1];
 
-    let rgb = yuv_to_rgb_planar(&y, &u, &v, w, h, 2, 2, false);
+    let rgb = yuv_to_rgb_planar(&y, &u, &v, w, h, (2, 2), false);
     // Allow tolerance of ±2 for float rounding
     for i in 0..w * h {
         let r = rgb[i * 3];
@@ -53,7 +53,7 @@ fn test_i420_neutral_gray_bt709() {
     let u = vec![128u8; (w / 2) * (h / 2)];
     let v = vec![128u8; (w / 2) * (h / 2)];
 
-    let rgb = yuv_to_rgb_planar(&y, &u, &v, w, h, 2, 2, true);
+    let rgb = yuv_to_rgb_planar(&y, &u, &v, w, h, (2, 2), true);
     for i in 0..w * h {
         assert_eq!(rgb[i * 3], 128, "R at pixel {i}");
         assert_eq!(rgb[i * 3 + 1], 128, "G at pixel {i}");
@@ -75,7 +75,7 @@ fn test_yv12_neutral_gray() {
     let u = vec![128u8; (w / 2) * (h / 2)];
     let v = vec![128u8; (w / 2) * (h / 2)];
 
-    let rgb = yuv_to_rgb_planar(&y, &u, &v, w, h, 2, 2, false);
+    let rgb = yuv_to_rgb_planar(&y, &u, &v, w, h, (2, 2), false);
     for i in 0..w * h {
         assert_eq!(rgb[i * 3], 128);
         assert_eq!(rgb[i * 3 + 1], 128);

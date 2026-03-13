@@ -181,7 +181,7 @@ impl VideoReader {
     pub fn total_frames(&self) -> usize { self.total_frames }
     pub fn is_y4m(&self) -> bool { self.is_y4m }
     pub fn format_name(&self) -> &str { &self.format.name }
-    pub fn format(&self) -> &crate::core::formats::VideoFormat { &self.format }
+    pub fn format(&self) -> &crate::core::formats::VideoFormat { self.format }
     pub fn y4m_fps(&self) -> Option<f64> { self.y4m_fps }
 
     // ------------------------------------------------------------------
@@ -251,12 +251,12 @@ impl VideoReader {
                 if self.format.fourcc == "YU12" {
                     let u = &raw[y_size..y_size + uv_size];
                     let v = &raw[y_size + uv_size..y_size + uv_size * 2];
-                    Ok(colorspace::yuv_to_rgb_planar(y, u, v, w, h, 2, 2, bt709))
+                    Ok(colorspace::yuv_to_rgb_planar(y, u, v, w, h, (2, 2), bt709))
                 } else {
                     // YV12: V comes before U
                     let v = &raw[y_size..y_size + uv_size];
                     let u = &raw[y_size + uv_size..y_size + uv_size * 2];
-                    Ok(colorspace::yuv_to_rgb_planar(y, u, v, w, h, 2, 2, bt709))
+                    Ok(colorspace::yuv_to_rgb_planar(y, u, v, w, h, (2, 2), bt709))
                 }
             }
 
@@ -317,7 +317,7 @@ impl VideoReader {
                 let y = &raw[..y_size];
                 let u = &raw[y_size..y_size + uv_size];
                 let v = &raw[y_size + uv_size..y_size + uv_size * 2];
-                Ok(colorspace::yuv_to_rgb_planar(y, u, v, w, h, 2, 1, bt709))
+                Ok(colorspace::yuv_to_rgb_planar(y, u, v, w, h, (2, 1), bt709))
             }
 
             FormatType::YuvPlanar if self.format.fourcc == "444P" => {
@@ -325,7 +325,7 @@ impl VideoReader {
                 let y = &raw[..y_size];
                 let u = &raw[y_size..y_size * 2];
                 let v = &raw[y_size * 2..y_size * 3];
-                Ok(colorspace::yuv_to_rgb_planar(y, u, v, w, h, 1, 1, bt709))
+                Ok(colorspace::yuv_to_rgb_planar(y, u, v, w, h, (1, 1), bt709))
             }
 
             _ => Err(format!(

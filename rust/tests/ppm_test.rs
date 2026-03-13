@@ -150,7 +150,7 @@ fn test_convert_i420_to_ppm() {
     let (n, cancelled) = converter
         .convert(
             input_path.to_str().unwrap(),
-            4, 4,
+            (4, 4),
             "I420",
             output_path.to_str().unwrap(),
             "PPM",
@@ -195,7 +195,7 @@ fn test_convert_rgb24_to_ppm() {
     let (n, cancelled) = converter
         .convert(
             input_path.to_str().unwrap(),
-            2, 2,
+            (2, 2),
             "RGB24",
             output_path.to_str().unwrap(),
             "PPM",

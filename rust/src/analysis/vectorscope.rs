@@ -25,7 +25,7 @@ pub fn calculate_vectorscope(rgb: &[u8], w: u32, h: u32) -> (Vec<f32>, Vec<f32>)
         1
     };
 
-    let output_count = (pixel_count + step - 1) / step;
+    let output_count = pixel_count.div_ceil(step);
     let mut cb_values = Vec::with_capacity(output_count);
     let mut cr_values = Vec::with_capacity(output_count);
 

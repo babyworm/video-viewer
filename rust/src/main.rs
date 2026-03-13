@@ -57,7 +57,7 @@ fn main() {
             eprint!("\rConverting frame {}/{}...", current + 1, total);
             true
         };
-        match converter.convert(input_path, width, height, input_fmt, output_path, output_fmt, Some(&progress)) {
+        match converter.convert(input_path, (width, height), input_fmt, output_path, output_fmt, Some(&progress)) {
             Ok((n, cancelled)) => {
                 eprintln!();
                 if cancelled {

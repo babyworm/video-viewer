@@ -79,7 +79,7 @@ fn test_convert_i420_to_yv12() {
 
     let converter = VideoConverter::new();
     let (n, cancelled) = converter
-        .convert(&input_path, 4, 4, "I420", output_str, "YV12", None)
+        .convert(&input_path, (4, 4), "I420", output_str, "YV12", None)
         .expect("conversion failed");
 
     assert_eq!(n, 1);
@@ -107,7 +107,7 @@ fn test_convert_i420_to_422p() {
 
     let converter = VideoConverter::new();
     let (n, cancelled) = converter
-        .convert(&input_path, 4, 4, "I420", output_str, "YUV422P", None)
+        .convert(&input_path, (4, 4), "I420", output_str, "YUV422P", None)
         .expect("conversion failed");
 
     assert_eq!(n, 1);

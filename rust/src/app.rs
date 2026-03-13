@@ -393,7 +393,7 @@ impl VideoViewerApp {
                 let step = if cb.len() > max_points { cb.len() / max_points } else { 1 };
                 let scatter: Vec<[f64; 2]> = cb
                     .into_iter()
-                    .zip(cr.into_iter())
+                    .zip(cr)
                     .step_by(step)
                     .map(|(u, v)| [u as f64, v as f64])
                     .collect();
@@ -408,8 +408,7 @@ impl VideoViewerApp {
                     let mut pixels = vec![0u8; wf_width * wf_height * 3];
                     for level in 0..wf_height {
                         let src_row = wf_height - 1 - level;
-                        for col in 0..wf_width {
-                            let count = wf[src_row][col];
+                        for (col, &count) in wf[src_row].iter().enumerate().take(wf_width) {
                             let intensity = ((count as f64 / max_count as f64).sqrt() * 255.0) as u8;
                             let idx = (level * wf_width + col) * 3;
                             pixels[idx] = intensity / 3;
@@ -505,7 +504,7 @@ impl VideoViewerApp {
                 progress_total.store(total, Ordering::Relaxed);
                 true // never cancel (for now)
             };
-            match converter.convert(&in_path, w, h, &src_fmt, &out_path, &out_format, Some(&cb)) {
+            match converter.convert(&in_path, (w, h), &src_fmt, &out_path, &out_format, Some(&cb)) {
                 Ok((count, cancelled)) => {
                     if cancelled {
                         *error.lock().unwrap() = Some("Conversion cancelled".to_string());
