@@ -446,6 +446,7 @@ struct FileBrowser {
     current_dir: PathBuf,
     entries: Vec<DirEntry>,
     filter_video_only: bool,
+    filter_text: String,
     error: Option<String>,
 }
 
@@ -461,6 +462,7 @@ impl FileBrowser {
             current_dir: start_dir,
             entries: Vec::new(),
             filter_video_only: false,
+            filter_text: String::new(),
             error: None,
         };
         fb.refresh();
@@ -550,6 +552,13 @@ impl FileBrowser {
             if ui.checkbox(&mut self.filter_video_only, "Video files only").changed() {
                 self.refresh();
             }
+            ui.separator();
+            ui.label("Filter:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.filter_text)
+                    .desired_width(150.0)
+                    .hint_text("name filter"),
+            );
         });
 
         if let Some(ref err) = self.error {
@@ -557,10 +566,32 @@ impl FileBrowser {
         }
 
         // File list with scroll
+        let filter = self.filter_text.trim().to_lowercase();
         egui::ScrollArea::vertical()
             .max_height(250.0)
             .show(ui, |ui| {
                 for entry in &self.entries {
+                    // Directories always shown; files filtered by pattern
+                    if !entry.is_dir && !filter.is_empty() {
+                        let name_lower = entry.name.to_lowercase();
+                        let matches = if filter.starts_with('*') && filter.ends_with('*') && filter.len() > 2 {
+                            // *text* → contains
+                            name_lower.contains(&filter[1..filter.len() - 1])
+                        } else if filter.starts_with('*') {
+                            // *text → suffix (ends with)
+                            name_lower.ends_with(&filter[1..])
+                        } else if filter.ends_with('*') {
+                            // text* → prefix (starts with)
+                            name_lower.starts_with(&filter[..filter.len() - 1])
+                        } else {
+                            // plain text → prefix match
+                            name_lower.starts_with(&filter)
+                        };
+                        if !matches {
+                            continue;
+                        }
+                    }
+
                     let label = if entry.is_dir {
                         format!("📁 {}", entry.name)
                     } else {

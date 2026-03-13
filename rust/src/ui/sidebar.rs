@@ -114,14 +114,13 @@ impl Sidebar {
         ui.checkbox(&mut self.show_analysis, "Show Analysis (separate window)");
     }
 
-    /// Render the analysis window as a separate floating egui::Window.
+    /// Render the analysis in a separate OS-level viewport window.
     /// Call this from the app's update() after other panels.
     pub fn show_analysis_window(&mut self, ctx: &egui::Context) {
         if !self.show_analysis {
             return;
         }
 
-        let mut open = self.show_analysis;
         let mut active = self.active_tab;
 
         // Collect references to data before the closure to avoid borrowing self.
@@ -132,40 +131,52 @@ impl Sidebar {
         let ssim = self.ssim;
         let frame_diff = self.frame_diff;
 
-        egui::Window::new("Analysis")
-            .open(&mut open)
-            .default_size(egui::vec2(400.0, 350.0))
-            .resizable(true)
-            .collapsible(true)
-            .show(ctx, |ui| {
-                // Tab bar
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut active, AnalysisTab::Histogram, "Histogram");
-                    ui.selectable_value(&mut active, AnalysisTab::Waveform, "Waveform");
-                    ui.selectable_value(&mut active, AnalysisTab::Vectorscope, "Vectorscope");
-                    ui.selectable_value(&mut active, AnalysisTab::Metrics, "Metrics");
+        let mut close_requested = false;
+
+        let vp_id = egui::ViewportId::from_hash_of("analysis_viewport");
+        ctx.show_viewport_immediate(
+            vp_id,
+            egui::ViewportBuilder::default()
+                .with_title("Analysis")
+                .with_inner_size([420.0, 380.0]),
+            |ctx, _class| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // Tab bar
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut active, AnalysisTab::Histogram, "Histogram");
+                        ui.selectable_value(&mut active, AnalysisTab::Waveform, "Waveform");
+                        ui.selectable_value(&mut active, AnalysisTab::Vectorscope, "Vectorscope");
+                        ui.selectable_value(&mut active, AnalysisTab::Metrics, "Metrics");
+                    });
+
+                    ui.separator();
+
+                    match active {
+                        AnalysisTab::Histogram => {
+                            Self::render_histogram(ui, histogram_data);
+                        }
+                        AnalysisTab::Waveform => {
+                            Self::render_waveform(ui, waveform_texture);
+                        }
+                        AnalysisTab::Vectorscope => {
+                            Self::render_vectorscope(ui, vectorscope_data);
+                        }
+                        AnalysisTab::Metrics => {
+                            Self::render_metrics(ui, psnr, ssim, frame_diff);
+                        }
+                    }
                 });
 
-                ui.separator();
-
-                match active {
-                    AnalysisTab::Histogram => {
-                        Self::render_histogram(ui, histogram_data);
-                    }
-                    AnalysisTab::Waveform => {
-                        Self::render_waveform(ui, waveform_texture);
-                    }
-                    AnalysisTab::Vectorscope => {
-                        Self::render_vectorscope(ui, vectorscope_data);
-                    }
-                    AnalysisTab::Metrics => {
-                        Self::render_metrics(ui, psnr, ssim, frame_diff);
-                    }
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    close_requested = true;
                 }
-            });
+            },
+        );
 
-        self.show_analysis = open;
         self.active_tab = active;
+        if close_requested {
+            self.show_analysis = false;
+        }
     }
 
     // ── Tab implementations (static to avoid borrow conflicts) ─────
