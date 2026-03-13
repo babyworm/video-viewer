@@ -105,7 +105,7 @@ impl VideoViewerApp {
     ) {
         let color_matrix = &self.settings.defaults.color_matrix;
         match VideoReader::open(&path, width, height, format, color_matrix) {
-            Ok(mut reader) => {
+            Ok(reader) => {
                 self.current_frame_idx = 0;
                 self.bookmarks.clear();
                 if let Some(fps) = reader.y4m_fps() {
@@ -115,28 +115,14 @@ impl VideoViewerApp {
                         self.nav.selected_fps_idx = idx;
                     }
                 }
-                match reader.seek_frame(0) {
-                    Ok(raw) => match reader.convert_to_rgb(&raw) {
-                        Ok(rgb) => {
-                            self.canvas.set_image(ctx, &rgb, reader.width(), reader.height());
-                            self.current_rgb = Some(rgb);
-                            self.current_raw = Some(raw);
-                            self.status_error = None;
-                        }
-                        Err(e) => {
-                            self.status_error = Some(format!("Convert error: {e}"));
-                        }
-                    },
-                    Err(e) => {
-                        self.status_error = Some(format!("Seek error: {e}"));
-                    }
-                }
                 self.settings.add_recent_file(&path);
                 self.settings.save();
                 self.current_file = Some(path);
                 self.reader = Some(reader);
                 self.is_playing = false;
                 self.last_frame_time = None;
+                // Use goto_frame so component view is applied correctly.
+                self.goto_frame(ctx, 0);
             }
             Err(e) => {
                 self.status_error = Some(format!("Open error: {e}"));
@@ -244,7 +230,7 @@ impl VideoViewerApp {
                     rgb.to_vec()
                 };
 
-                let stride = w as usize * 3;
+                let _stride = w as usize * 3;
                 for y in 0..half_h {
                     for x in 0..half_w {
                         let src_y = y * 2;
@@ -375,13 +361,13 @@ impl eframe::App for VideoViewerApp {
         // --- Playback tick ---
         if self.is_playing {
             let fps = self.nav.fps();
-            let frame_duration_ms = 1000 / fps.max(1);
+            let frame_duration_ms = (1000.0 / fps.max(1) as f64) as u64;
             let elapsed = self
                 .last_frame_time
                 .map(|t| t.elapsed().as_millis() as u64)
                 .unwrap_or(u64::MAX);
 
-            if elapsed >= frame_duration_ms as u64 {
+            if elapsed >= frame_duration_ms {
                 let total = self.total_frames();
                 let next = self.current_frame_idx + 1;
                 if next >= total {
@@ -693,7 +679,31 @@ impl eframe::App for VideoViewerApp {
             }
         });
 
-        // --- Navigation bar ---
+        // --- Status bar (declared first → stacks above navigation) ---
+        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if let Some(ref err) = self.status_error {
+                    ui.colored_label(egui::Color32::RED, err);
+                } else if let Some(ref path) = self.current_file {
+                    if let Some(ref r) = self.reader {
+                        ui.label(format!(
+                            "{}  |  {}x{}  {}  |  {:.0}%  |  Frame {}/{}",
+                            path,
+                            r.width(),
+                            r.height(),
+                            r.format_name(),
+                            self.canvas.zoom_level() * 100.0,
+                            self.current_frame_idx,
+                            r.total_frames().saturating_sub(1),
+                        ));
+                    }
+                } else {
+                    ui.label("No file loaded — drop a file or use File → Open");
+                }
+            });
+        });
+
+        // --- Navigation bar (declared second → sits at bottom edge) ---
         let total = self.total_frames();
         let cur = self.current_frame_idx;
         let is_playing = self.is_playing;
@@ -735,30 +745,6 @@ impl eframe::App for VideoViewerApp {
             }
         });
 
-        // --- Status bar ---
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if let Some(ref err) = self.status_error {
-                    ui.colored_label(egui::Color32::RED, err);
-                } else if let Some(ref path) = self.current_file {
-                    if let Some(ref r) = self.reader {
-                        ui.label(format!(
-                            "{}  |  {}x{}  {}  |  {:.0}%  |  Frame {}/{}",
-                            path,
-                            r.width(),
-                            r.height(),
-                            r.format_name(),
-                            self.canvas.zoom_level() * 100.0,
-                            self.current_frame_idx,
-                            r.total_frames().saturating_sub(1),
-                        ));
-                    }
-                } else {
-                    ui.label("No file loaded — drop a file or use File → Open");
-                }
-            });
-        });
-
         // --- Sidebar (right panel) ---
         egui::SidePanel::right("sidebar")
             .default_width(250.0)
@@ -770,14 +756,9 @@ impl eframe::App for VideoViewerApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.reader.is_some() {
                 let response = self.canvas.show(ui);
-                // Update pixel info on hover
+                // Update pixel info on hover — pass absolute screen pos
                 if let Some(hover_pos) = response.hover_pos() {
-                    let image_origin = response.rect.min;
-                    let rel = egui::pos2(
-                        hover_pos.x - image_origin.x,
-                        hover_pos.y - image_origin.y,
-                    );
-                    if let Some((ix, iy)) = self.canvas.image_pos_from_screen(rel) {
+                    if let Some((ix, iy)) = self.canvas.image_pos_from_screen(hover_pos) {
                         if let (Some(ref raw), Some(ref reader)) = (&self.current_raw, &self.reader) {
                             let info = crate::core::pixel::get_pixel_info(
                                 raw,
