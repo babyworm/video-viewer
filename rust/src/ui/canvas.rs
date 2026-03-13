@@ -7,6 +7,8 @@ pub struct ImageCanvas {
     pub image_size: Option<(u32, u32)>,
     pub grid_size: u32,
     pub sub_grid_size: u32,
+    /// Actual image rect in screen coordinates (set during show()).
+    image_rect: Option<egui::Rect>,
 }
 
 impl ImageCanvas {
@@ -18,6 +20,7 @@ impl ImageCanvas {
             image_size: None,
             grid_size: 0,
             sub_grid_size: 0,
+            image_rect: None,
         }
     }
 
@@ -43,94 +46,113 @@ impl ImageCanvas {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) -> egui::Response {
-        if let Some(ref texture) = self.texture {
-            let (w, h) = self.image_size.unwrap_or((1, 1));
-            let display_size = egui::vec2(w as f32 * self.zoom, h as f32 * self.zoom);
+        // Allocate the full available space for interaction (zoom, pan, hover).
+        let available = ui.available_size();
+        let (response, painter) =
+            ui.allocate_painter(available, egui::Sense::click_and_drag().union(egui::Sense::hover()));
+        let panel_rect = response.rect;
 
-            let response = ui.add(
-                egui::Image::new(texture)
-                    .fit_to_exact_size(display_size)
+        if let (Some(ref texture), Some((w, h))) = (&self.texture, self.image_size) {
+            let img_w = w as f32 * self.zoom;
+            let img_h = h as f32 * self.zoom;
+
+            // Center image in panel, then apply pan offset.
+            let center_offset = egui::vec2(
+                (panel_rect.width() - img_w) / 2.0,
+                (panel_rect.height() - img_h) / 2.0,
+            );
+            let origin = panel_rect.min + center_offset + self.pan_offset;
+            let image_rect = egui::Rect::from_min_size(origin, egui::vec2(img_w, img_h));
+
+            // Paint the image.
+            painter.image(
+                texture.id(),
+                image_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
             );
 
-            // Grid overlay
-            let image_origin = response.rect.min;
-            let painter = ui.painter();
+            // Store for coordinate conversion.
+            self.image_rect = Some(image_rect);
 
-            if self.sub_grid_size > 0 {
-                let step = self.sub_grid_size as f32 * self.zoom;
-                let img_w = w as f32 * self.zoom;
-                let img_h = h as f32 * self.zoom;
-                let color = egui::Color32::from_rgb(200, 200, 0);
-                let stroke = egui::Stroke::new(0.5, color);
-                let mut x = step;
-                while x < img_w {
-                    painter.line_segment(
-                        [
-                            egui::pos2(image_origin.x + x, image_origin.y),
-                            egui::pos2(image_origin.x + x, image_origin.y + img_h),
-                        ],
-                        stroke,
-                    );
-                    x += step;
-                }
-                let mut y = step;
-                while y < img_h {
-                    painter.line_segment(
-                        [
-                            egui::pos2(image_origin.x, image_origin.y + y),
-                            egui::pos2(image_origin.x + img_w, image_origin.y + y),
-                        ],
-                        stroke,
-                    );
-                    y += step;
-                }
-            }
+            // Grid overlays (drawn on top of image).
+            self.draw_grid(&painter, image_rect, w, h);
 
-            if self.grid_size > 0 {
-                let step = self.grid_size as f32 * self.zoom;
-                let img_w = w as f32 * self.zoom;
-                let img_h = h as f32 * self.zoom;
-                let color = egui::Color32::from_rgb(0, 200, 0);
-                let stroke = egui::Stroke::new(1.0, color);
-                let mut x = step;
-                while x < img_w {
-                    painter.line_segment(
-                        [
-                            egui::pos2(image_origin.x + x, image_origin.y),
-                            egui::pos2(image_origin.x + x, image_origin.y + img_h),
-                        ],
-                        stroke,
-                    );
-                    x += step;
-                }
-                let mut y = step;
-                while y < img_h {
-                    painter.line_segment(
-                        [
-                            egui::pos2(image_origin.x, image_origin.y + y),
-                            egui::pos2(image_origin.x + img_w, image_origin.y + y),
-                        ],
-                        stroke,
-                    );
-                    y += step;
-                }
-            }
-
-            // Mouse wheel zoom
+            // Mouse wheel zoom (zoom towards cursor).
             let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll_delta != 0.0 {
                 let factor = if scroll_delta > 0.0 { 1.1_f32 } else { 1.0 / 1.1 };
-                self.zoom = (self.zoom * factor).clamp(0.1, 50.0);
+                let new_zoom = (self.zoom * factor).clamp(0.1, 50.0);
+                // Zoom towards the mouse cursor position.
+                if let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) {
+                    let rel = pointer - origin;
+                    self.pan_offset += rel * (1.0 - new_zoom / self.zoom);
+                }
+                self.zoom = new_zoom;
             }
 
-            // Middle-click drag for panning
+            // Middle-click drag for panning.
             if response.dragged_by(egui::PointerButton::Middle) {
                 self.pan_offset += response.drag_delta();
             }
-
-            response
         } else {
-            ui.allocate_response(ui.available_size(), egui::Sense::hover())
+            self.image_rect = None;
+        }
+
+        response
+    }
+
+    fn draw_grid(&self, painter: &egui::Painter, image_rect: egui::Rect, w: u32, h: u32) {
+        let origin = image_rect.min;
+        let img_w = w as f32 * self.zoom;
+        let img_h = h as f32 * self.zoom;
+
+        if self.sub_grid_size > 0 {
+            let step = self.sub_grid_size as f32 * self.zoom;
+            let color = egui::Color32::from_rgb(200, 200, 0);
+            let stroke = egui::Stroke::new(0.5, color);
+            let mut x = step;
+            while x < img_w {
+                painter.line_segment(
+                    [egui::pos2(origin.x + x, origin.y),
+                     egui::pos2(origin.x + x, origin.y + img_h)],
+                    stroke,
+                );
+                x += step;
+            }
+            let mut y = step;
+            while y < img_h {
+                painter.line_segment(
+                    [egui::pos2(origin.x, origin.y + y),
+                     egui::pos2(origin.x + img_w, origin.y + y)],
+                    stroke,
+                );
+                y += step;
+            }
+        }
+
+        if self.grid_size > 0 {
+            let step = self.grid_size as f32 * self.zoom;
+            let color = egui::Color32::from_rgb(0, 200, 0);
+            let stroke = egui::Stroke::new(1.0, color);
+            let mut x = step;
+            while x < img_w {
+                painter.line_segment(
+                    [egui::pos2(origin.x + x, origin.y),
+                     egui::pos2(origin.x + x, origin.y + img_h)],
+                    stroke,
+                );
+                x += step;
+            }
+            let mut y = step;
+            while y < img_h {
+                painter.line_segment(
+                    [egui::pos2(origin.x, origin.y + y),
+                     egui::pos2(origin.x + img_w, origin.y + y)],
+                    stroke,
+                );
+                y += step;
+            }
         }
     }
 
@@ -147,10 +169,14 @@ impl ImageCanvas {
         self.zoom
     }
 
+    /// Convert a screen position to image pixel coordinates.
+    /// `screen_pos` is in absolute screen coordinates (e.g., from hover_pos()).
     pub fn image_pos_from_screen(&self, screen_pos: egui::Pos2) -> Option<(u32, u32)> {
         let (w, h) = self.image_size?;
-        let x = (screen_pos.x / self.zoom) as i32;
-        let y = (screen_pos.y / self.zoom) as i32;
+        let image_rect = self.image_rect?;
+        let rel = screen_pos - image_rect.min;
+        let x = (rel.x / self.zoom) as i32;
+        let y = (rel.y / self.zoom) as i32;
         if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
             Some((x as u32, y as u32))
         } else {
