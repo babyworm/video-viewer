@@ -891,6 +891,8 @@ impl eframe::App for VideoViewerApp {
         if analysis_was_off && self.sidebar.show_analysis {
             self.update_analysis(ctx);
         }
+        // Analysis as a separate floating window.
+        self.sidebar.show_analysis_window(ctx);
 
         // --- Central panel (canvas) ---
         egui::CentralPanel::default().show(ctx, |ui| {
