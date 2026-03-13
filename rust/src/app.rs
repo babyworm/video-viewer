@@ -28,6 +28,8 @@ pub struct VideoViewerApp {
     pub current_raw: Option<Vec<u8>>,
     /// Current RGB frame data (for export).
     pub current_rgb: Option<Vec<u8>>,
+    /// Previous frame RGB (for metrics: PSNR, SSIM, frame diff).
+    prev_rgb: Option<Vec<u8>>,
     /// CLI-provided args for auto-open on startup.
     startup_input: Option<String>,
     startup_width: Option<u32>,
@@ -38,6 +40,8 @@ pub struct VideoViewerApp {
     /// Active dialog state.
     dialog_state: DialogState,
     /// Dialog instances (created on demand).
+    open_file_dialog: Option<dialogs::OpenFileDialog>,
+    save_file_dialog: Option<dialogs::SaveFileDialog>,
     params_dialog: Option<dialogs::ParametersDialog>,
     export_dialog: Option<dialogs::ExportDialog>,
     convert_dialog: Option<dialogs::ConvertDialog>,
@@ -78,12 +82,15 @@ impl VideoViewerApp {
             bookmarks: HashSet::new(),
             current_raw: None,
             current_rgb: None,
+            prev_rgb: None,
             startup_input: input,
             startup_width: width,
             startup_height: height,
             startup_format: format,
             status_error: None,
             dialog_state: DialogState::None,
+            open_file_dialog: None,
+            save_file_dialog: None,
             params_dialog: None,
             export_dialog: None,
             convert_dialog: None,
@@ -121,6 +128,10 @@ impl VideoViewerApp {
                 self.reader = Some(reader);
                 self.is_playing = false;
                 self.last_frame_time = None;
+                // Clear stale frame data to prevent cross-file metrics.
+                self.prev_rgb = None;
+                self.current_rgb = None;
+                self.current_raw = None;
                 // Use goto_frame so component view is applied correctly.
                 self.goto_frame(ctx, 0);
             }
@@ -161,10 +172,14 @@ impl VideoViewerApp {
             self.current_component, reader, &raw, &rgb, w, h,
         );
         self.canvas.set_image(ctx, &display_rgb, w, h);
+        // Store previous RGB for inter-frame metrics before overwriting.
+        self.prev_rgb = self.current_rgb.take();
         self.current_rgb = Some(rgb);
         self.current_raw = Some(raw);
         self.current_frame_idx = idx;
         self.status_error = None;
+        // Update analysis visualizations.
+        self.update_analysis(ctx);
         true
     }
 
@@ -272,24 +287,131 @@ impl VideoViewerApp {
         }
     }
 
+    /// Compute analysis data from the current RGB frame and feed it to the sidebar.
+    fn update_analysis(&mut self, ctx: &egui::Context) {
+        if !self.sidebar.show_analysis {
+            return;
+        }
+        let rgb = match &self.current_rgb {
+            Some(r) => r,
+            None => return,
+        };
+        let (w, h) = match &self.reader {
+            Some(r) => (r.width(), r.height()),
+            None => return,
+        };
+
+        // Histogram (RGB mode)
+        let hist_u32 = crate::analysis::histogram::calculate_histogram(rgb, w, h, "RGB");
+        let hist_f64: std::collections::HashMap<String, Vec<f64>> = hist_u32
+            .into_iter()
+            .map(|(k, v)| (k, v.into_iter().map(|c| c as f64).collect()))
+            .collect();
+        self.sidebar.histogram_data = Some(hist_f64);
+
+        // Vectorscope — cap at 50k points for egui_plot performance
+        let (cb, cr) = crate::analysis::vectorscope::calculate_vectorscope(rgb, w, h);
+        let max_points = 50_000;
+        let step = if cb.len() > max_points { cb.len() / max_points } else { 1 };
+        let scatter: Vec<[f64; 2]> = cb
+            .into_iter()
+            .zip(cr.into_iter())
+            .step_by(step)
+            .map(|(u, v)| [u as f64, v as f64])
+            .collect();
+        self.sidebar.vectorscope_data = Some(scatter);
+
+        // Waveform → render to egui texture
+        let wf = crate::analysis::waveform::calculate_waveform(rgb, w, h, "luma");
+        let wf_width = wf.first().map(|r| r.len()).unwrap_or(0);
+        let wf_height = wf.len();
+        if wf_width > 0 {
+            // Find max count for normalization
+            let max_count = wf.iter().flat_map(|row| row.iter()).copied().max().unwrap_or(1).max(1);
+            // Build grayscale image (bottom = level 0, top = level 255)
+            let mut pixels = vec![0u8; wf_width * wf_height * 3];
+            for level in 0..wf_height {
+                let src_row = wf_height - 1 - level; // flip vertically
+                for col in 0..wf_width {
+                    let count = wf[src_row][col];
+                    let intensity = ((count as f64 / max_count as f64).sqrt() * 255.0) as u8;
+                    let idx = (level * wf_width + col) * 3;
+                    // Green-tinted waveform
+                    pixels[idx] = intensity / 3;
+                    pixels[idx + 1] = intensity;
+                    pixels[idx + 2] = intensity / 3;
+                }
+            }
+            let color_image = egui::ColorImage::from_rgb([wf_width, wf_height], &pixels);
+            let tex = ctx.load_texture("waveform_tex", color_image, egui::TextureOptions::LINEAR);
+            self.sidebar.waveform_texture = Some(tex);
+        }
+
+        // Metrics: compare with previous frame
+        if let Some(ref prev) = self.prev_rgb {
+            if prev.len() == rgb.len() {
+                self.sidebar.psnr = Some(crate::analysis::metrics::calculate_psnr(prev, rgb, w, h));
+                self.sidebar.ssim = Some(crate::analysis::metrics::calculate_ssim(prev, rgb, w, h));
+                self.sidebar.frame_diff = Some(crate::analysis::metrics::calculate_frame_difference(prev, rgb));
+            } else {
+                self.sidebar.psnr = None;
+                self.sidebar.ssim = None;
+                self.sidebar.frame_diff = None;
+            }
+        } else {
+            self.sidebar.psnr = None;
+            self.sidebar.ssim = None;
+            self.sidebar.frame_diff = None;
+        }
+    }
+
     fn total_frames(&self) -> usize {
         self.reader.as_ref().map(|r| r.total_frames()).unwrap_or(0)
     }
 
-    fn save_frame_as_png(&self) {
+    fn save_frame_as_png_to(&mut self, path: &str) {
         if let (Some(rgb), Some(reader)) = (&self.current_rgb, &self.reader) {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("PNG", &["png"])
-                .set_file_name(&format!("frame_{:06}.png", self.current_frame_idx))
-                .save_file()
-            {
-                let w = reader.width();
-                let h = reader.height();
-                if let Some(img) = image::RgbImage::from_raw(w, h, rgb.clone()) {
-                    if let Err(e) = img.save(&path) {
-                        log::error!("Failed to save PNG: {e}");
-                    }
+            let w = reader.width();
+            let h = reader.height();
+            if let Some(img) = image::RgbImage::from_raw(w, h, rgb.clone()) {
+                if let Err(e) = img.save(path) {
+                    self.status_error = Some(format!("PNG save error: {e}"));
+                } else {
+                    self.status_error = None;
                 }
+            }
+        }
+    }
+
+    fn run_conversion(&mut self, out_format: &str, out_path: &str) {
+        use crate::conversion::converter::VideoConverter;
+        let reader = match self.reader.as_ref() {
+            Some(r) => r,
+            None => {
+                self.status_error = Some("No file loaded".to_string());
+                return;
+            }
+        };
+        let in_path = match &self.current_file {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        let src_fmt = reader.format_name().to_string();
+        let w = reader.width();
+        let h = reader.height();
+
+        let converter = VideoConverter::new();
+        match converter.convert(&in_path, w, h, &src_fmt, out_path, out_format, None) {
+            Ok((count, cancelled)) => {
+                if cancelled {
+                    self.status_error = Some("Conversion cancelled".to_string());
+                } else {
+                    self.status_error = None;
+                    log::info!("Converted {} frames to {}", count, out_path);
+                }
+            }
+            Err(e) => {
+                self.status_error = Some(format!("Convert error: {e}"));
             }
         }
     }
@@ -462,28 +584,21 @@ impl eframe::App for VideoViewerApp {
                 }
             }
         }
-        if keys.13 { self.save_frame_as_png(); }
+        if keys.13 {
+            // Ctrl+S: save frame
+            let name = format!("frame_{:06}.png", self.current_frame_idx);
+            self.save_file_dialog = Some(dialogs::SaveFileDialog::new("Save Frame", &name));
+            self.dialog_state = DialogState::SaveFile;
+        }
         if keys.14 { self.copy_frame_to_clipboard(); }
         if keys.15 {
-            // Ctrl+O: open file
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Video", &["yuv", "y4m", "rgb", "raw", "nv12", "nv21"])
-                .pick_file()
-            {
-                let path_str = path.display().to_string();
-                let hints = crate::core::hints::parse_filename_hints(&path_str);
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-                let (w, h, fmt) = if ext == "y4m" {
-                    (0, 0, String::new())
-                } else {
-                    (
-                        hints.width.unwrap_or(self.settings.defaults.width),
-                        hints.height.unwrap_or(self.settings.defaults.height),
-                        hints.format.unwrap_or_else(|| self.settings.defaults.format.clone()),
-                    )
-                };
-                self.open_file(ctx, path_str, w, h, &fmt);
-            }
+            // Ctrl+O: open file dialog
+            self.open_file_dialog = Some(dialogs::OpenFileDialog::new(
+                self.settings.defaults.width,
+                self.settings.defaults.height,
+                &self.settings.defaults.format,
+            ));
+            self.dialog_state = DialogState::OpenFile;
         }
 
         // --- Menu bar ---
@@ -492,28 +607,18 @@ impl eframe::App for VideoViewerApp {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open... (Ctrl+O)").clicked() {
                         ui.close_menu();
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Video", &["yuv", "y4m", "rgb", "raw", "nv12", "nv21"])
-                            .pick_file()
-                        {
-                            let path_str = path.display().to_string();
-                            let hints = crate::core::hints::parse_filename_hints(&path_str);
-                            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-                            let (w, h, fmt) = if ext == "y4m" {
-                                (0, 0, String::new())
-                            } else {
-                                (
-                                    hints.width.unwrap_or(self.settings.defaults.width),
-                                    hints.height.unwrap_or(self.settings.defaults.height),
-                                    hints.format.unwrap_or_else(|| self.settings.defaults.format.clone()),
-                                )
-                            };
-                            self.open_file(ctx, path_str, w, h, &fmt);
-                        }
+                        self.open_file_dialog = Some(dialogs::OpenFileDialog::new(
+                            self.settings.defaults.width,
+                            self.settings.defaults.height,
+                            &self.settings.defaults.format,
+                        ));
+                        self.dialog_state = DialogState::OpenFile;
                     }
                     if ui.button("Save Frame (Ctrl+S)").clicked() {
                         ui.close_menu();
-                        self.save_frame_as_png();
+                        let name = format!("frame_{:06}.png", self.current_frame_idx);
+                        self.save_file_dialog = Some(dialogs::SaveFileDialog::new("Save Frame", &name));
+                        self.dialog_state = DialogState::SaveFile;
                     }
                     if ui.button("Export Clip...").clicked() {
                         ui.close_menu();
@@ -746,11 +851,16 @@ impl eframe::App for VideoViewerApp {
         });
 
         // --- Sidebar (right panel) ---
+        let analysis_was_off = !self.sidebar.show_analysis;
         egui::SidePanel::right("sidebar")
             .default_width(250.0)
             .show(ctx, |ui| {
                 self.sidebar.show(ui);
             });
+        // If user just toggled analysis on, compute immediately.
+        if analysis_was_off && self.sidebar.show_analysis && self.sidebar.histogram_data.is_none() {
+            self.update_analysis(ctx);
+        }
 
         // --- Central panel (canvas) ---
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -788,6 +898,32 @@ impl eframe::App for VideoViewerApp {
 // Dialog rendering (separate impl block to keep update() manageable).
 impl VideoViewerApp {
     fn show_dialogs(&mut self, ctx: &egui::Context) {
+        // Open file dialog
+        if self.dialog_state == DialogState::OpenFile {
+            if let Some(ref mut dlg) = self.open_file_dialog {
+                if let Some(result) = dlg.show(ctx) {
+                    if let Some((path, w, h, fmt)) = result {
+                        self.open_file(ctx, path, w, h, &fmt);
+                    }
+                    self.dialog_state = DialogState::None;
+                    self.open_file_dialog = None;
+                }
+            }
+        }
+
+        // Save file dialog
+        if self.dialog_state == DialogState::SaveFile {
+            if let Some(ref mut dlg) = self.save_file_dialog {
+                if let Some(result) = dlg.show(ctx) {
+                    if let Some(path) = result {
+                        self.save_frame_as_png_to(&path);
+                    }
+                    self.dialog_state = DialogState::None;
+                    self.save_file_dialog = None;
+                }
+            }
+        }
+
         // Parameters dialog
         if self.dialog_state == DialogState::Parameters {
             if let Some(ref mut dlg) = self.params_dialog {
@@ -825,6 +961,19 @@ impl VideoViewerApp {
                     }
                     self.dialog_state = DialogState::None;
                     self.png_export_dialog = None;
+                }
+            }
+        }
+
+        // Convert dialog
+        if self.dialog_state == DialogState::Convert {
+            if let Some(ref mut dlg) = self.convert_dialog {
+                if let Some(result) = dlg.show(ctx) {
+                    if let Some((out_format, out_path)) = result {
+                        self.run_conversion(&out_format, &out_path);
+                    }
+                    self.dialog_state = DialogState::None;
+                    self.convert_dialog = None;
                 }
             }
         }
