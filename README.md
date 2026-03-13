@@ -2,6 +2,10 @@
 
 Raw/YUV/RGB video viewer built with Rust + egui. Supports 75+ pixel formats for inspecting uncompressed video data.
 
+<!-- TODO: Add screenshot
+![Video Viewer screenshot](assets/screenshot.png)
+-->
+
 ## Features
 
 - **75+ pixel formats**: YUV (I420, NV12, NV21, YUY2, UYVY, P010, ...), RGB (RGB24, BGR24, RGB565, RGBA32, ...), Bayer (8/10/12/16-bit), Grayscale
@@ -24,7 +28,22 @@ Raw/YUV/RGB video viewer built with Rust + egui. Supports 75+ pixel formats for 
 
 ## Installation
 
-### Prerequisites
+### Pre-built binaries
+
+Download the latest release for your platform from the [Releases](https://github.com/babyworm/video-viewer/releases) page:
+
+| Platform | File |
+|----------|------|
+| Linux x86_64 | `video-viewer-linux-x86_64.tar.gz` |
+| macOS Apple Silicon | `video-viewer-macos-aarch64.tar.gz` |
+| macOS Intel | `video-viewer-macos-x86_64.tar.gz` |
+| Windows x86_64 | `video-viewer-windows-x86_64.zip` |
+
+Extract and run — no installation required.
+
+### Build from source
+
+#### Prerequisites
 
 **Rust toolchain** (1.75+):
 
@@ -50,7 +69,7 @@ sudo pacman -S opencv clang libxcb libxkbcommon openssl gtk3
 brew install opencv llvm
 ```
 
-### Build
+#### Build
 
 ```bash
 cd rust
@@ -59,7 +78,7 @@ cargo build --release
 # Binary at rust/target/release/video-viewer
 ```
 
-### Run directly
+#### Run directly
 
 ```bash
 cd rust
