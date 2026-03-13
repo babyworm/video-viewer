@@ -178,25 +178,148 @@ impl ExportDialog {
 // Convert Dialog
 // ---------------------------------------------------------------------------
 
+/// Commonly used formats (by name prefix) shown at the top of the convert combo.
+const COMMON_FORMAT_PREFIXES: &[&str] = &[
+    "I420", "YV12", "NV12", "NV21", "YUYV", "UYVY",
+    "YUV422P", "YUV444P",
+    "RGB24", "BGR24", "Greyscale (8",
+];
+
+/// Entry in the convert format list — either a selectable format or a separator.
+#[derive(Clone)]
+enum ConvertFormatEntry {
+    Format { name: String, idx: usize },
+    Separator,
+}
+
 pub struct ConvertDialog {
     pub input_info: String,
+    /// Original input file path (for auto-generating output name).
+    input_path: String,
+    /// Input file stem (cached).
+    input_stem: String,
+    /// Selected index into `selectable_formats`.
     pub output_format_idx: usize,
-    pub format_names: Vec<String>,
+    /// Previous format index (to detect changes for auto-name update).
+    prev_format_idx: usize,
+    /// Ordered display entries (common formats, separator, rest).
+    entries: Vec<ConvertFormatEntry>,
+    /// Flat list of selectable format names (for result lookup).
+    selectable_formats: Vec<String>,
     pub output_path: String,
+    /// Whether user has manually typed in the output path text field.
+    user_typed_path: bool,
+    /// Output directory (updated by browser selection; defaults to input dir).
+    output_dir: PathBuf,
+    /// Inline directory browser.
+    dir_browser: Option<FileBrowser>,
+    /// Starting directory for browser.
+    initial_dir: PathBuf,
+    /// Conversion progress: None = idle, Some((current, total)) = running.
+    pub progress: Option<(usize, usize)>,
 }
 
 impl ConvertDialog {
-    pub fn new(input_info: &str) -> Self {
-        let format_names: Vec<String> = get_all_formats()
+    pub fn new(input_info: &str, input_path: Option<&str>) -> Self {
+        let all: Vec<String> = get_all_formats()
             .iter()
             .map(|f| f.name.clone())
             .collect();
+
+        // Partition into common and rest
+        let mut common = Vec::new();
+        let mut rest = Vec::new();
+        for name in &all {
+            if COMMON_FORMAT_PREFIXES.iter().any(|p| name.starts_with(p)) {
+                common.push(name.clone());
+            } else {
+                rest.push(name.clone());
+            }
+        }
+
+        // Build flat selectable list: common first, then rest
+        let mut selectable_formats = Vec::with_capacity(all.len());
+        selectable_formats.extend(common.iter().cloned());
+        selectable_formats.extend(rest.iter().cloned());
+
+        // Build display entries with separator
+        let mut entries = Vec::new();
+        for (i, name) in common.iter().enumerate() {
+            entries.push(ConvertFormatEntry::Format { name: name.clone(), idx: i });
+        }
+        if !common.is_empty() && !rest.is_empty() {
+            entries.push(ConvertFormatEntry::Separator);
+        }
+        let offset = common.len();
+        for (i, name) in rest.iter().enumerate() {
+            entries.push(ConvertFormatEntry::Format { name: name.clone(), idx: offset + i });
+        }
+
+        let initial_dir = input_path
+            .and_then(|p| Path::new(p).parent())
+            .filter(|p| p.is_dir())
+            .map(|p| p.to_path_buf())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("/"));
+
+        let input_stem = input_path
+            .map(|p| Path::new(p).file_stem().and_then(|s| s.to_str()).unwrap_or("output").to_string())
+            .unwrap_or_else(|| "output".to_string());
+
+        // Auto-generate initial output path
+        let default_output = Self::make_output_path(
+            input_path.unwrap_or(""),
+            selectable_formats.first().map(|s| s.as_str()).unwrap_or(""),
+        );
+
         Self {
             input_info: input_info.to_string(),
+            input_path: input_path.unwrap_or("").to_string(),
+            input_stem,
             output_format_idx: 0,
-            format_names,
-            output_path: String::new(),
+            prev_format_idx: usize::MAX, // force initial update
+            entries,
+            selectable_formats,
+            output_path: default_output,
+            user_typed_path: false,
+            output_dir: initial_dir.clone(),
+            dir_browser: None,
+            initial_dir,
+            progress: None,
         }
+    }
+
+    /// Generate output filename tag and extension from format name.
+    fn format_tag_ext(format_name: &str) -> (String, &'static str) {
+        let tag = format_name
+            .split_whitespace()
+            .next()
+            .unwrap_or("raw")
+            .to_lowercase();
+        let ext = if tag.contains("rgb") || tag.contains("bgr") || tag.contains("rgba") || tag.contains("argb") {
+            "rgb"
+        } else if tag.contains("grey") || tag.contains("gray") {
+            "gray"
+        } else if tag.contains("bayer") {
+            "raw"
+        } else {
+            "yuv"
+        };
+        (tag, ext)
+    }
+
+    /// Generate output path: `<input_stem>_<format_tag>.<ext>`
+    fn make_output_path(input_path: &str, format_name: &str) -> String {
+        if input_path.is_empty() {
+            return String::new();
+        }
+        let p = Path::new(input_path);
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+        let dir = p.parent().unwrap_or(Path::new("."));
+        let (tag, ext) = Self::format_tag_ext(format_name);
+        dir.join(format!("{}_{}.{}", stem, tag, ext))
+            .to_string_lossy()
+            .to_string()
     }
 
     pub fn show(&mut self, ctx: &egui::Context) -> Option<Option<(String, String)>> {
@@ -205,37 +328,160 @@ impl ConvertDialog {
 
         egui::Window::new("Convert")
             .open(&mut open)
-            .resizable(false)
+            .resizable(true)
+            .min_width(500.0)
             .show(ctx, |ui| {
                 ui.label(format!("Input: {}", self.input_info));
                 ui.separator();
 
-                egui::Grid::new("convert_grid").show(ui, |ui| {
+                // --- Output format ---
+                ui.horizontal(|ui| {
                     ui.label("Output format:");
                     let current = self
-                        .format_names
+                        .selectable_formats
                         .get(self.output_format_idx)
                         .cloned()
                         .unwrap_or_default();
                     egui::ComboBox::from_id_salt("convert_format")
                         .selected_text(&current)
                         .show_ui(ui, |ui| {
-                            for (idx, name) in self.format_names.iter().enumerate() {
-                                ui.selectable_value(&mut self.output_format_idx, idx, name);
+                            for entry in &self.entries {
+                                match entry {
+                                    ConvertFormatEntry::Format { name, idx } => {
+                                        ui.selectable_value(&mut self.output_format_idx, *idx, name.as_str());
+                                    }
+                                    ConvertFormatEntry::Separator => {
+                                        ui.separator();
+                                    }
+                                }
                             }
                         });
-                    ui.end_row();
-
-                    ui.label("Output path:");
-                    ui.text_edit_singleline(&mut self.output_path);
-                    ui.end_row();
                 });
+
+                // Auto-update output path when format changes (unless user typed manually)
+                if self.output_format_idx != self.prev_format_idx {
+                    self.prev_format_idx = self.output_format_idx;
+                    if !self.user_typed_path {
+                        let fmt_name = self.selectable_formats
+                            .get(self.output_format_idx)
+                            .cloned()
+                            .unwrap_or_default();
+                        let (tag, ext) = Self::format_tag_ext(&fmt_name);
+                        self.output_path = self.output_dir
+                            .join(format!("{}_{}.{}", self.input_stem, tag, ext))
+                            .to_string_lossy()
+                            .to_string();
+                    }
+                }
+
+                // --- Output path with Browse ---
+                ui.horizontal(|ui| {
+                    ui.label("Output path:");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.output_path)
+                            .desired_width(350.0)
+                            .hint_text("/path/to/output.yuv"),
+                    );
+                    if resp.changed() {
+                        self.user_typed_path = true;
+                    }
+                    let browse_label = if self.dir_browser.is_some() { "Close" } else { "Browse..." };
+                    if ui.button(browse_label).clicked() {
+                        if self.dir_browser.is_some() {
+                            self.dir_browser = None;
+                        } else {
+                            // Start from output path's dir, or initial_dir
+                            let start = if !self.output_path.is_empty() {
+                                Path::new(&self.output_path)
+                                    .parent()
+                                    .filter(|p| p.is_dir())
+                                    .map(|p| p.to_path_buf())
+                                    .unwrap_or_else(|| self.initial_dir.clone())
+                            } else {
+                                self.initial_dir.clone()
+                            };
+                            self.dir_browser = Some(FileBrowser::new(start));
+                        }
+                    }
+                });
+
+                // Directory browser with "Select this folder" button
+                if self.dir_browser.is_some() {
+                    ui.separator();
+
+                    // Collect needed values before borrowing browser
+                    let cur_dir_display = self.dir_browser.as_ref().unwrap()
+                        .current_dir.display().to_string();
+                    let cur_dir_clone = self.dir_browser.as_ref().unwrap()
+                        .current_dir.clone();
+                    let fmt_name = self.selectable_formats
+                        .get(self.output_format_idx)
+                        .cloned()
+                        .unwrap_or_default();
+                    let input_stem = Path::new(&self.input_path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("output")
+                        .to_string();
+                    let (tag, ext) = Self::format_tag_ext(&fmt_name);
+
+                    // "Select this folder" button
+                    let mut select_folder = false;
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("Dir: {}", cur_dir_display)).small());
+                        if ui.button("Select this folder").clicked() {
+                            select_folder = true;
+                        }
+                    });
+
+                    if select_folder {
+                        self.output_dir = cur_dir_clone.clone();
+                        self.output_path = cur_dir_clone
+                            .join(format!("{}_{}.{}", input_stem, tag, ext))
+                            .to_string_lossy()
+                            .to_string();
+                        self.user_typed_path = false; // allow format changes to update name
+                        self.dir_browser = None;
+                    }
+
+                    // File list (navigating dirs, or picking a file directly)
+                    if let Some(ref mut browser) = self.dir_browser {
+                        if let Some(selected) = browser.show(ui) {
+                            let selected_path = Path::new(&selected);
+                            if selected_path.is_dir() {
+                                self.output_dir = selected_path.to_path_buf();
+                                self.output_path = selected_path
+                                    .join(format!("{}_{}.{}", input_stem, tag, ext))
+                                    .to_string_lossy()
+                                    .to_string();
+                                self.user_typed_path = false;
+                            } else {
+                                // User picked a specific file — use it directly
+                                self.output_path = selected;
+                                self.user_typed_path = true;
+                            }
+                            self.dir_browser = None;
+                        }
+                    }
+                }
+
+                // --- Progress bar ---
+                if let Some((current, total)) = self.progress {
+                    ui.separator();
+                    let frac = if total > 0 { current as f32 / total as f32 } else { 0.0 };
+                    ui.add(egui::ProgressBar::new(frac).text(format!("{}/{} frames", current, total)));
+                }
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Convert").clicked() && !self.output_path.is_empty() {
+                    let is_running = self.progress.is_some();
+                    let can_convert = !self.output_path.is_empty() && !is_running;
+                    if ui
+                        .add_enabled(can_convert, egui::Button::new("Convert"))
+                        .clicked()
+                    {
                         let fmt = self
-                            .format_names
+                            .selectable_formats
                             .get(self.output_format_idx)
                             .cloned()
                             .unwrap_or_default();
@@ -443,7 +689,7 @@ const VIDEO_EXTENSIONS: &[&str] = &[
 ];
 
 struct FileBrowser {
-    current_dir: PathBuf,
+    pub current_dir: PathBuf,
     entries: Vec<DirEntry>,
     filter_video_only: bool,
     filter_text: String,
