@@ -741,23 +741,24 @@ impl VideoViewerApp {
         }
     }
 
-    fn start_test_download(&mut self, ctx: &egui::Context) {
-        const URL: &str = "https://media.xiph.org/video/derf/y4m/akiyo_cif.y4m";
+    fn start_test_download(&mut self, ctx: &egui::Context, filename: &str) {
+        let url = format!("https://media.xiph.org/video/derf/y4m/{}", filename);
         let status = Arc::clone(&self.test_download_status);
         let path_out = Arc::clone(&self.test_download_path);
         let dl_current = Arc::clone(&self.test_dl_current);
         let dl_total = Arc::clone(&self.test_dl_total);
         let ctx2 = ctx.clone();
-        *status.lock().unwrap() = Some("Connecting...".to_string());
+        *status.lock().unwrap() = Some(format!("Connecting ({filename})..."));
         dl_current.store(0, Ordering::Relaxed);
         dl_total.store(0, Ordering::Relaxed);
         self.test_downloading = true;
+        let filename_owned = filename.to_string();
         std::thread::spawn(move || {
             let dir = std::env::temp_dir().join("video-viewer-test");
             let _ = std::fs::create_dir_all(&dir);
-            let dest = dir.join("akiyo_cif.y4m");
+            let dest = dir.join(&filename_owned);
             let result = (|| -> Result<String, String> {
-                let resp = ureq::get(URL).call().map_err(|e| format!("Download error: {e}"))?;
+                let resp = ureq::get(&url).call().map_err(|e| format!("Download error: {e}"))?;
                 let total = resp.headers().get("content-length")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<usize>().ok())
@@ -1231,26 +1232,40 @@ impl eframe::App for VideoViewerApp {
                         self.show_shortcuts = true;
                     }
                     ui.separator();
-                    let dl_label = if self.test_downloading { "Downloading..." } else { "Download Test Video (akiyo_cif.y4m)" };
-                    if ui.add_enabled(!self.test_downloading, egui::Button::new(dl_label)).clicked() {
-                        ui.close_menu();
-                        self.start_test_download(ctx);
-                    }
-                    if self.test_downloading {
-                        let current = self.test_dl_current.load(Ordering::Relaxed);
-                        let total = self.test_dl_total.load(Ordering::Relaxed);
-                        if total > 0 {
-                            let frac = current as f32 / total as f32;
-                            let mb_cur = current as f64 / (1024.0 * 1024.0);
-                            let mb_tot = total as f64 / (1024.0 * 1024.0);
-                            ui.add(egui::ProgressBar::new(frac)
-                                .text(format!("{:.1}/{:.1} MB", mb_cur, mb_tot)));
+                    let test_videos: &[(&str, &str)] = &[
+                        ("akiyo (CIF)", "akiyo_cif.y4m"),
+                        ("bus (CIF)", "bus_cif.y4m"),
+                        ("carphone (QCIF)", "carphone_qcif.y4m"),
+                        ("foreman (QCIF)", "foreman_qcif.y4m"),
+                        ("garden (SIF)", "garden_sif.y4m"),
+                        ("harbour (CIF)", "harbour_cif.y4m"),
+                        ("mobile (CIF)", "mobile_cif.y4m"),
+                        ("tennis (SIF)", "tennis_sif.y4m"),
+                    ];
+                    ui.menu_button("Download Test Video", |ui| {
+                        for &(label, filename) in test_videos {
+                            if ui.add_enabled(!self.test_downloading, egui::Button::new(label)).clicked() {
+                                ui.close_menu();
+                                self.start_test_download(ctx, filename);
+                            }
+                        }
+                        ui.separator();
+                        if self.test_downloading {
+                            let current = self.test_dl_current.load(Ordering::Relaxed);
+                            let total = self.test_dl_total.load(Ordering::Relaxed);
+                            if total > 0 {
+                                let frac = current as f32 / total as f32;
+                                let mb_cur = current as f64 / (1024.0 * 1024.0);
+                                let mb_tot = total as f64 / (1024.0 * 1024.0);
+                                ui.add(egui::ProgressBar::new(frac)
+                                    .text(format!("{:.1}/{:.1} MB", mb_cur, mb_tot)));
+                            } else if let Some(ref status) = *self.test_download_status.lock().unwrap() {
+                                ui.label(egui::RichText::new(status).small());
+                            }
                         } else if let Some(ref status) = *self.test_download_status.lock().unwrap() {
                             ui.label(egui::RichText::new(status).small());
                         }
-                    } else if let Some(ref status) = *self.test_download_status.lock().unwrap() {
-                        ui.label(egui::RichText::new(status).small());
-                    }
+                    });
                     ui.separator();
                     if ui.button("About").clicked() {
                         ui.close_menu();
