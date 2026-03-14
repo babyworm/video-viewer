@@ -1357,7 +1357,7 @@ pub fn show_about_dialog(ctx: &egui::Context) -> bool {
         .collapsible(false)
         .show(ctx, |ui| {
             ui.heading("Video Viewer (Rust)");
-            ui.label("Version 0.4.0");
+            ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
             ui.separator();
             ui.label("YUV/Raw Video Viewer with egui");
             ui.label("Copyright (c) babyworm (Hyun-Gyu Kim)");
