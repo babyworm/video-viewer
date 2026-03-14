@@ -815,31 +815,38 @@ impl eframe::App for VideoViewerApp {
         }
 
         // --- Keyboard shortcuts ---
+        // Suppress shortcuts when a dialog is open (dialogs contain text fields, sliders, etc.).
+        let dialog_open = self.dialog_state != DialogState::None
+            || self.show_shortcuts
+            || self.show_about
+            || self.show_scene_detect_dialog;
         let keys = ctx.input(|i| {
+            // Plain/navigation keys: only fire when no dialog is open.
+            let plain = !dialog_open;
             (
-                i.key_pressed(egui::Key::Space),           // 0
-                !i.modifiers.ctrl && !i.modifiers.command && i.key_pressed(egui::Key::ArrowLeft),  // 1: prev frame (no modifier)
-                !i.modifiers.ctrl && !i.modifiers.command && i.key_pressed(egui::Key::ArrowRight), // 2: next frame (no modifier)
-                i.key_pressed(egui::Key::Home),            // 3
-                i.key_pressed(egui::Key::End),             // 4
-                i.key_pressed(egui::Key::F),               // 5
-                i.key_pressed(egui::Key::G),               // 6
-                !i.modifiers.ctrl && !i.modifiers.command && i.key_pressed(egui::Key::B),  // 7: bookmark (no modifier)
-                i.key_pressed(egui::Key::Num0),            // 8
-                i.key_pressed(egui::Key::Num1),            // 9
-                i.key_pressed(egui::Key::Num2),            // 10
-                i.key_pressed(egui::Key::Num3),            // 11
-                i.key_pressed(egui::Key::Num4),            // 12
-                i.modifiers.ctrl && i.key_pressed(egui::Key::S), // 13
-                i.modifiers.ctrl && i.key_pressed(egui::Key::C), // 14
-                i.modifiers.ctrl && i.key_pressed(egui::Key::O), // 15
-                i.modifiers.ctrl && i.key_pressed(egui::Key::Q), // 16
-                !i.modifiers.ctrl && !i.modifiers.command && i.key_pressed(egui::Key::M),  // 17: magnifier (no modifier)
-                i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::B), // 18: next bookmark
-                i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::B), // 19: prev bookmark
-                i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowLeft),  // 20: prev scene change
-                i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowRight), // 21: next scene change
-                !i.modifiers.ctrl && !i.modifiers.command && i.key_pressed(egui::Key::C), // 22: center image
+                plain && i.key_pressed(egui::Key::Space),  // 0
+                plain && !i.modifiers.ctrl && !i.modifiers.command && i.key_pressed(egui::Key::ArrowLeft),  // 1
+                plain && !i.modifiers.ctrl && !i.modifiers.command && i.key_pressed(egui::Key::ArrowRight), // 2
+                plain && i.key_pressed(egui::Key::Home),   // 3
+                plain && i.key_pressed(egui::Key::End),    // 4
+                plain && i.key_pressed(egui::Key::F),      // 5
+                plain && i.key_pressed(egui::Key::G),      // 6
+                plain && !i.modifiers.ctrl && !i.modifiers.command && i.key_pressed(egui::Key::B),  // 7
+                plain && i.key_pressed(egui::Key::Num0),   // 8
+                plain && i.key_pressed(egui::Key::Num1),   // 9
+                plain && i.key_pressed(egui::Key::Num2),   // 10
+                plain && i.key_pressed(egui::Key::Num3),   // 11
+                plain && i.key_pressed(egui::Key::Num4),   // 12
+                plain && i.modifiers.ctrl && i.key_pressed(egui::Key::S), // 13: Ctrl+S (save frame)
+                plain && i.modifiers.ctrl && i.key_pressed(egui::Key::C), // 14: Ctrl+C (frame copy)
+                plain && i.modifiers.ctrl && i.key_pressed(egui::Key::O), // 15: Ctrl+O (open file)
+                i.modifiers.ctrl && i.key_pressed(egui::Key::Q), // 16: Ctrl+Q (always: quit)
+                plain && !i.modifiers.ctrl && !i.modifiers.command && i.key_pressed(egui::Key::M),  // 17
+                plain && i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::B), // 18
+                plain && i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::B), // 19
+                plain && i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowLeft),  // 20
+                plain && i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowRight), // 21
+                plain && !i.modifiers.ctrl && !i.modifiers.command && i.key_pressed(egui::Key::C), // 22: center
             )
         });
 
@@ -899,7 +906,7 @@ impl eframe::App for VideoViewerApp {
                 }
             }
         }
-        if keys.13 && self.dialog_state == DialogState::None {
+        if keys.13 {
             // Ctrl+S: save frame
             let name = format!("frame_{:06}.png", self.current_frame_idx);
             self.save_file_dialog = Some(dialogs::SaveFileDialog::new("Save Frame", &name));
@@ -956,7 +963,7 @@ impl eframe::App for VideoViewerApp {
                 self.is_playing = false;
             }
         }
-        if keys.15 && self.dialog_state == DialogState::None {
+        if keys.15 {
             // Ctrl+O: open file dialog
             self.open_file_dialog = Some(dialogs::OpenFileDialog::new(
                 self.settings.defaults.width,
