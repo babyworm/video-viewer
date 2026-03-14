@@ -132,37 +132,36 @@ impl Sidebar {
                 let grid_id = ui.id().with("pixel_neighborhood");
                 let cursor_row = info.nb_cursor_row;
                 let cursor_col = info.nb_cursor_col;
-                let highlight_strong = egui::Color32::from_rgba_premultiplied(255, 255, 0, 80);
-                let highlight_weak = egui::Color32::from_rgba_premultiplied(255, 255, 0, 25);
+                let highlight_strong = egui::Color32::from_rgba_premultiplied(100, 100, 40, 40);
+                let highlight_weak = egui::Color32::from_rgba_premultiplied(80, 80, 30, 15);
                 egui::Grid::new(grid_id)
                     .spacing(egui::vec2(2.0, 1.0))
                     .show(ui, |ui| {
                         for (ri, row) in info.neighborhood.iter().enumerate() {
                             for (ci, cell) in row.iter().enumerate() {
-                                if cell.is_empty() {
-                                    ui.monospace("  ");
+                                let display = if cell.is_empty() { "--" } else { cell.as_str() };
+                                let is_cursor = ri == cursor_row && ci == cursor_col;
+                                let is_cross = ri == cursor_row || ci == cursor_col;
+                                let bg = if is_cursor {
+                                    Some(highlight_strong)
+                                } else if is_cross {
+                                    Some(highlight_weak)
                                 } else {
-                                    let is_cursor = ri == cursor_row && ci == cursor_col;
-                                    let is_cross = ri == cursor_row || ci == cursor_col;
-                                    let bg = if is_cursor {
-                                        Some(highlight_strong)
-                                    } else if is_cross {
-                                        Some(highlight_weak)
-                                    } else {
-                                        None
-                                    };
-                                    let text = if is_cursor {
-                                        egui::RichText::new(cell).monospace().size(10.0).strong()
-                                    } else {
-                                        egui::RichText::new(cell).monospace().size(10.0)
-                                    };
-                                    if let Some(color) = bg {
-                                        egui::Frame::NONE
-                                            .fill(color)
-                                            .show(ui, |ui| { ui.label(text); });
-                                    } else {
-                                        ui.label(text);
-                                    }
+                                    None
+                                };
+                                let text = if is_cursor {
+                                    egui::RichText::new(display).monospace().size(10.0).strong()
+                                } else if cell.is_empty() {
+                                    egui::RichText::new(display).monospace().size(10.0).weak()
+                                } else {
+                                    egui::RichText::new(display).monospace().size(10.0)
+                                };
+                                if let Some(color) = bg {
+                                    egui::Frame::NONE
+                                        .fill(color)
+                                        .show(ui, |ui| { ui.label(text); });
+                                } else {
+                                    ui.label(text);
                                 }
                             }
                             ui.end_row();
@@ -283,12 +282,15 @@ impl Sidebar {
         use egui_plot::{Bar, BarChart, Plot};
 
         if let Some(ref hist) = histogram_data {
+            let plot_height = (ui.available_height() - 40.0).max(120.0);
             let plot = Plot::new("histogram_plot")
-                .height(200.0)
+                .height(plot_height)
                 .allow_drag(false)
                 .allow_zoom(false)
                 .allow_scroll(false)
-                .show_axes([true, false]);
+                .show_axes([true, false])
+                .include_x(0.0)
+                .include_x(255.0);
 
             let channel_colors = [
                 ("Y", egui::Color32::WHITE),
@@ -342,7 +344,8 @@ impl Sidebar {
         }
         let s = shared.lock();
         if let Some(ref tex) = s.waveform_texture {
-            let size = egui::vec2(ui.available_width(), 200.0);
+            let wf_height = (ui.available_height() - 40.0).max(120.0);
+            let size = egui::vec2(ui.available_width(), wf_height);
             ui.image(egui::load::SizedTexture::new(tex.id(), size));
             ui.add_space(4.0);
             ui.weak("Luma intensity by column. Bright areas show where pixel values concentrate vertically.");
@@ -355,8 +358,9 @@ impl Sidebar {
         use egui_plot::{Plot, Points};
 
         if let Some(ref points) = vectorscope_data {
+            let plot_height = (ui.available_height() - 40.0).max(120.0);
             let plot = Plot::new("vectorscope_plot")
-                .height(200.0)
+                .height(plot_height)
                 .data_aspect(1.0)
                 .allow_drag(false)
                 .allow_zoom(false)
