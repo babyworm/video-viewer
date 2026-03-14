@@ -13,6 +13,7 @@ pub enum DialogState {
     Convert,
     PngExport,
     Settings,
+    BatchConvert,
 }
 
 // ---------------------------------------------------------------------------
@@ -563,6 +564,157 @@ impl PngExportDialog {
 
         if !open {
             return Some(None);
+        }
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Batch Convert Dialog
+// ---------------------------------------------------------------------------
+
+pub struct BatchConvertDialog {
+    pub files: Vec<String>,
+    pub output_dir: String,
+    pub output_format_idx: usize,
+    pub selectable_formats: Vec<String>,
+    pub new_file_path: String,
+    /// Width/height for raw files (ignored for Y4M).
+    pub width: u32,
+    pub height: u32,
+}
+
+impl BatchConvertDialog {
+    pub fn new(default_width: u32, default_height: u32) -> Self {
+        let common_formats = [
+            "I420", "NV12", "NV21", "YV12", "YUYV", "UYVY", "YUV422P",
+            "YUV444P", "RGB24", "BGR24",
+        ];
+        Self {
+            files: Vec::new(),
+            output_dir: String::new(),
+            output_format_idx: 0,
+            selectable_formats: common_formats.iter().map(|s| s.to_string()).collect(),
+            new_file_path: String::new(),
+            width: default_width,
+            height: default_height,
+        }
+    }
+
+    /// Returns Some(list of (input_path, output_format, output_path)) on Convert,
+    /// Some(empty vec) on Cancel, None if still open.
+    pub fn show(&mut self, ctx: &egui::Context) -> Option<Vec<(String, String, String)>> {
+        let mut result = None;
+        let mut open = true;
+
+        egui::Window::new("Batch Convert")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(500.0)
+            .show(ctx, |ui| {
+                // --- Add files ---
+                ui.horizontal(|ui| {
+                    ui.label("Add file:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_file_path)
+                            .desired_width(300.0)
+                            .hint_text("/path/to/video.yuv"),
+                    );
+                    if ui.button("+").clicked() && !self.new_file_path.is_empty() {
+                        self.files.push(self.new_file_path.clone());
+                        self.new_file_path.clear();
+                    }
+                });
+
+                // --- File list ---
+                ui.separator();
+                ui.label(format!("Files ({})", self.files.len()));
+                let mut remove_idx = None;
+                egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                    for (i, path) in self.files.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.monospace(
+                                std::path::Path::new(path)
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or(path),
+                            );
+                            if ui.small_button("x").clicked() {
+                                remove_idx = Some(i);
+                            }
+                        });
+                    }
+                });
+                if let Some(idx) = remove_idx {
+                    self.files.remove(idx);
+                }
+
+                ui.separator();
+
+                // --- Parameters ---
+                egui::Grid::new("batch_params").show(ui, |ui| {
+                    ui.label("Width:");
+                    ui.add(egui::DragValue::new(&mut self.width).range(1..=8192));
+                    ui.label("Height:");
+                    ui.add(egui::DragValue::new(&mut self.height).range(1..=8192));
+                    ui.end_row();
+
+                    ui.label("Output format:");
+                    let selected = self.selectable_formats
+                        .get(self.output_format_idx)
+                        .cloned()
+                        .unwrap_or_default();
+                    egui::ComboBox::from_id_salt("batch_out_fmt")
+                        .selected_text(&selected)
+                        .show_ui(ui, |ui| {
+                            for (idx, name) in self.selectable_formats.iter().enumerate() {
+                                ui.selectable_value(&mut self.output_format_idx, idx, name);
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("Output dir:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.output_dir)
+                            .desired_width(250.0)
+                            .hint_text("/path/to/output/"),
+                    );
+                    ui.end_row();
+                });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let can_convert = !self.files.is_empty() && !self.output_dir.is_empty();
+                    if ui
+                        .add_enabled(can_convert, egui::Button::new("Convert All"))
+                        .clicked()
+                    {
+                        let fmt = self.selectable_formats
+                            .get(self.output_format_idx)
+                            .cloned()
+                            .unwrap_or_default();
+                        let out_dir = std::path::Path::new(&self.output_dir);
+                        let jobs: Vec<(String, String, String)> = self.files.iter().map(|input| {
+                            let stem = std::path::Path::new(input)
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("output");
+                            let out_path = out_dir
+                                .join(format!("{}_{}.yuv", stem, fmt.to_lowercase()))
+                                .to_string_lossy()
+                                .to_string();
+                            (input.clone(), fmt.clone(), out_path)
+                        }).collect();
+                        result = Some(jobs);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(Vec::new());
+                    }
+                });
+            });
+
+        if !open {
+            return Some(Vec::new());
         }
         result
     }
@@ -1172,6 +1324,11 @@ pub fn show_shortcuts_dialog(ctx: &egui::Context) -> bool {
                         ("F", "Fit to view"),
                         ("G", "Cycle grid size"),
                         ("B", "Toggle bookmark"),
+                        ("M", "Toggle magnifier"),
+                        ("Ctrl+B", "Next bookmark"),
+                        ("Ctrl+Shift+B", "Previous bookmark"),
+                        ("Ctrl+Left", "Previous scene change"),
+                        ("Ctrl+Right", "Next scene change"),
                         ("Ctrl+S", "Save frame as PNG"),
                         ("Ctrl+C", "Copy frame to clipboard"),
                         ("Ctrl+O", "Open file"),
@@ -1199,7 +1356,7 @@ pub fn show_about_dialog(ctx: &egui::Context) -> bool {
         .collapsible(false)
         .show(ctx, |ui| {
             ui.heading("Video Viewer (Rust)");
-            ui.label("Version 0.1.0");
+            ui.label("Version 0.4.0");
             ui.separator();
             ui.label("YUV/Raw Video Viewer with egui");
             ui.label("Copyright (c) babyworm (Hyun-Gyu Kim)");

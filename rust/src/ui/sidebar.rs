@@ -1,4 +1,7 @@
+use std::sync::Arc;
+
 use eframe::egui;
+use parking_lot::Mutex;
 
 use crate::core::pixel::PixelInfo;
 
@@ -11,23 +14,50 @@ pub enum AnalysisTab {
     Metrics,
 }
 
-/// Sidebar panel showing pixel inspector and analysis toggle.
-pub struct Sidebar {
-    pub pixel_info: Option<PixelInfo>,
+/// Shared analysis data passed to the separate viewport via Arc<Mutex<>>.
+/// TextureHandle cannot cross viewports, so waveform is stored as ColorImage
+/// and loaded as a texture inside the viewport callback.
+pub struct AnalysisShared {
     pub active_tab: AnalysisTab,
-    pub show_analysis: bool,
-
-    // Optional analysis data (populated externally).
-    /// Per-channel histograms: key = channel name, value = 256 bin counts.
     pub histogram_data: Option<std::collections::HashMap<String, Vec<f64>>>,
-    /// Vectorscope scatter points (U, V) in display range.
     pub vectorscope_data: Option<Vec<[f64; 2]>>,
-    /// Waveform as an RGB texture.
-    pub waveform_texture: Option<egui::TextureHandle>,
-    /// Scalar metrics.
+    pub waveform_image: Option<egui::ColorImage>,
     pub psnr: Option<f64>,
     pub ssim: Option<f64>,
     pub frame_diff: Option<f64>,
+    /// Set to true by the viewport callback when the user closes the window.
+    pub close_requested: bool,
+    /// Set to true when the user switches tabs, so the main loop recomputes.
+    pub tab_changed: bool,
+    /// Generation counter — bumped when data changes so the viewport knows
+    /// to reload the waveform texture.
+    pub generation: u64,
+}
+
+impl AnalysisShared {
+    pub fn new() -> Self {
+        Self {
+            active_tab: AnalysisTab::Histogram,
+            histogram_data: None,
+            vectorscope_data: None,
+            waveform_image: None,
+            psnr: None,
+            ssim: None,
+            frame_diff: None,
+            close_requested: false,
+            tab_changed: false,
+            generation: 0,
+        }
+    }
+}
+
+/// Sidebar panel showing pixel inspector and analysis toggle.
+pub struct Sidebar {
+    pub pixel_info: Option<PixelInfo>,
+    pub show_analysis: bool,
+
+    /// Shared state for the analysis viewport.
+    pub analysis: Arc<Mutex<AnalysisShared>>,
 }
 
 impl Default for Sidebar {
@@ -40,14 +70,8 @@ impl Sidebar {
     pub fn new() -> Self {
         Self {
             pixel_info: None,
-            active_tab: AnalysisTab::Histogram,
             show_analysis: false,
-            histogram_data: None,
-            vectorscope_data: None,
-            waveform_texture: None,
-            psnr: None,
-            ssim: None,
-            frame_diff: None,
+            analysis: Arc::new(Mutex::new(AnalysisShared::new())),
         }
     }
 
@@ -114,61 +138,91 @@ impl Sidebar {
         ui.checkbox(&mut self.show_analysis, "Show Analysis (separate window)");
     }
 
-    /// Render the analysis as a floating egui::Window.
-    /// Uses constrain(false) so it can be positioned freely within the app.
-    /// (Separate OS viewport not supported on WSL2 due to X11 bridge limitations.)
+    /// Show analysis in a separate OS viewport window.
+    /// Uses `show_viewport_deferred` to create a real OS window that works
+    /// on both native platforms and WSLg (Wayland/XWayland).
     pub fn show_analysis_window(&mut self, ctx: &egui::Context) {
+        // Check if the viewport requested close.
+        {
+            let mut shared = self.analysis.lock();
+            if shared.close_requested {
+                shared.close_requested = false;
+                self.show_analysis = false;
+            }
+        }
+
         if !self.show_analysis {
             return;
         }
 
-        let mut open = self.show_analysis;
-        let mut active = self.active_tab;
+        let shared = Arc::clone(&self.analysis);
 
-        // Collect references to data before the closure to avoid borrowing self.
-        let histogram_data = &self.histogram_data;
-        let vectorscope_data = &self.vectorscope_data;
-        let waveform_texture = &self.waveform_texture;
-        let psnr = self.psnr;
-        let ssim = self.ssim;
-        let frame_diff = self.frame_diff;
-
-        egui::Window::new("Analysis")
-            .open(&mut open)
-            .default_size(egui::vec2(400.0, 350.0))
-            .default_pos(egui::pos2(50.0, 50.0))
-            .resizable(true)
-            .collapsible(true)
-            .constrain(false)
-            .show(ctx, |ui| {
-                // Tab bar
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut active, AnalysisTab::Histogram, "Histogram");
-                    ui.selectable_value(&mut active, AnalysisTab::Waveform, "Waveform");
-                    ui.selectable_value(&mut active, AnalysisTab::Vectorscope, "Vectorscope");
-                    ui.selectable_value(&mut active, AnalysisTab::Metrics, "Metrics");
-                });
-
-                ui.separator();
-
-                match active {
-                    AnalysisTab::Histogram => {
-                        Self::render_histogram(ui, histogram_data);
-                    }
-                    AnalysisTab::Waveform => {
-                        Self::render_waveform(ui, waveform_texture);
-                    }
-                    AnalysisTab::Vectorscope => {
-                        Self::render_vectorscope(ui, vectorscope_data);
-                    }
-                    AnalysisTab::Metrics => {
-                        Self::render_metrics(ui, psnr, ssim, frame_diff);
+        ctx.show_viewport_deferred(
+            egui::ViewportId::from_hash_of("analysis_viewport"),
+            egui::ViewportBuilder::default()
+                .with_title("Analysis")
+                .with_inner_size([450.0, 400.0]),
+            move |ctx, class| {
+                // If the viewport is being closed by the OS, signal it.
+                if matches!(class, egui::ViewportClass::Deferred) {
+                    let close = ctx.input(|i| i.viewport().close_requested());
+                    if close {
+                        shared.lock().close_requested = true;
+                        // Still show an empty CentralPanel so egui doesn't warn.
+                        egui::CentralPanel::default().show(ctx, |_| {});
+                        return;
                     }
                 }
-            });
 
-        self.show_analysis = open;
-        self.active_tab = active;
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // Snapshot shared state and release the lock before rendering.
+                    let (active_tab, histogram, vectorscope, waveform, generation, psnr, ssim, frame_diff) = {
+                        let data = shared.lock();
+                        (
+                            data.active_tab,
+                            data.histogram_data.clone(),
+                            data.vectorscope_data.clone(),
+                            data.waveform_image.clone(),
+                            data.generation,
+                            data.psnr,
+                            data.ssim,
+                            data.frame_diff,
+                        )
+                    };
+
+                    // Tab bar — writes back to shared state only on change.
+                    let mut tab = active_tab;
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut tab, AnalysisTab::Histogram, "Histogram");
+                        ui.selectable_value(&mut tab, AnalysisTab::Waveform, "Waveform");
+                        ui.selectable_value(&mut tab, AnalysisTab::Vectorscope, "Vectorscope");
+                        ui.selectable_value(&mut tab, AnalysisTab::Metrics, "Metrics");
+                    });
+                    if tab != active_tab {
+                        let mut s = shared.lock();
+                        s.active_tab = tab;
+                        s.tab_changed = true;
+                    }
+
+                    ui.separator();
+
+                    match tab {
+                        AnalysisTab::Histogram => {
+                            Self::render_histogram(ui, &histogram);
+                        }
+                        AnalysisTab::Waveform => {
+                            Self::render_waveform_from_image(ctx, ui, &waveform, generation);
+                        }
+                        AnalysisTab::Vectorscope => {
+                            Self::render_vectorscope(ui, &vectorscope);
+                        }
+                        AnalysisTab::Metrics => {
+                            Self::render_metrics(ui, psnr, ssim, frame_diff);
+                        }
+                    }
+                });
+            },
+        );
     }
 
     // ── Tab implementations (static to avoid borrow conflicts) ─────
@@ -209,15 +263,26 @@ impl Sidebar {
                     }
                 }
             });
+            ui.add_space(4.0);
+            ui.weak("R/G/B channel pixel value distribution (0-255). Peaks indicate dominant intensities.");
         } else {
             ui.label("No histogram data available.");
         }
     }
 
-    fn render_waveform(ui: &mut egui::Ui, waveform_texture: &Option<egui::TextureHandle>) {
-        if let Some(ref tex) = waveform_texture {
+    /// Render waveform from a ColorImage (loaded as texture in the viewport).
+    fn render_waveform_from_image(
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        waveform_image: &Option<egui::ColorImage>,
+        _generation: u64,
+    ) {
+        if let Some(ref img) = waveform_image {
+            let tex = ctx.load_texture("waveform_viewport", img.clone(), egui::TextureOptions::LINEAR);
             let size = egui::vec2(ui.available_width(), 200.0);
             ui.image(egui::load::SizedTexture::new(tex.id(), size));
+            ui.add_space(4.0);
+            ui.weak("Luma intensity by column. Bright areas show where pixel values concentrate vertically.");
         } else {
             ui.label("No waveform data available.");
         }
@@ -242,6 +307,8 @@ impl Sidebar {
                     .color(egui::Color32::LIGHT_GREEN);
                 plot_ui.points(scatter);
             });
+            ui.add_space(4.0);
+            ui.weak("Cb vs Cr chrominance scatter (BT.709). Center = neutral gray, spread = color saturation.");
         } else {
             ui.label("No vectorscope data available.");
         }
@@ -275,5 +342,7 @@ impl Sidebar {
                 }
                 ui.end_row();
             });
+        ui.add_space(4.0);
+        ui.weak("PSNR: signal-to-noise ratio (higher = more similar). SSIM: structural similarity (1.0 = identical).");
     }
 }
