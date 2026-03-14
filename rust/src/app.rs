@@ -781,7 +781,7 @@ impl VideoViewerApp {
             })();
             match result {
                 Ok(p) => {
-                    *status.lock().unwrap() = Some("Download complete!".to_string());
+                    *status.lock().unwrap() = Some(format!("Saved: {}", p));
                     *path_out.lock().unwrap() = Some(p);
                 }
                 Err(e) => {
