@@ -42,68 +42,54 @@ impl NavigationBar {
         scene_changes: &[usize],
     ) -> Option<NavigationAction> {
         let mut action: Option<NavigationAction> = None;
+        let max_frame = if total_frames > 0 { total_frames - 1 } else { 0 };
 
-        ui.horizontal(|ui| {
-            // --- Frame slider ---
-            let max_frame = if total_frames > 0 { total_frames - 1 } else { 0 };
-            let mut slider_val = current_frame as u32;
-            let slider = egui::Slider::new(&mut slider_val, 0..=max_frame as u32)
-                .show_value(false);
-            // Use most of available width, leaving room for buttons/labels.
-            let slider_width = (ui.available_width() - 350.0).max(200.0);
-            let slider_resp = ui.add_sized([slider_width, 20.0], slider);
-            if slider_resp.changed() {
-                action = Some(NavigationAction::Seek(slider_val as usize));
-            }
+        // Row 1: Frame slider (full width) with markers
+        let mut slider_val = current_frame as u32;
+        let slider = egui::Slider::new(&mut slider_val, 0..=max_frame as u32)
+            .show_value(false);
+        let slider_resp = ui.add_sized([ui.available_width(), 16.0], slider);
+        if slider_resp.changed() {
+            action = Some(NavigationAction::Seek(slider_val as usize));
+        }
+
+        // Draw scene change and bookmark markers on the slider
+        if total_frames > 1 {
             let slider_rect = slider_resp.rect;
-
-            // Draw scene change and bookmark markers on the slider
-            if total_frames > 1 {
-                let painter = ui.painter_at(slider_rect);
-                for &frame_idx in scene_changes {
-                    let x = slider_rect.left()
-                        + (frame_idx as f32 / max_frame as f32) * slider_rect.width();
-                    painter.line_segment(
-                        [
-                            egui::pos2(x, slider_rect.top()),
-                            egui::pos2(x, slider_rect.bottom()),
-                        ],
-                        egui::Stroke::new(2.0, egui::Color32::RED),
-                    );
-                }
-                for &frame_idx in bookmarks {
-                    let x = slider_rect.left()
-                        + (frame_idx as f32 / max_frame as f32) * slider_rect.width();
-                    painter.line_segment(
-                        [
-                            egui::pos2(x, slider_rect.top()),
-                            egui::pos2(x, slider_rect.bottom()),
-                        ],
-                        egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 200, 200)),
-                    );
-                }
+            let painter = ui.painter_at(slider_rect);
+            for &frame_idx in scene_changes {
+                let x = slider_rect.left()
+                    + (frame_idx as f32 / max_frame as f32) * slider_rect.width();
+                painter.line_segment(
+                    [egui::pos2(x, slider_rect.top()), egui::pos2(x, slider_rect.bottom())],
+                    egui::Stroke::new(2.0, egui::Color32::RED),
+                );
             }
+            for &frame_idx in bookmarks {
+                let x = slider_rect.left()
+                    + (frame_idx as f32 / max_frame as f32) * slider_rect.width();
+                painter.line_segment(
+                    [egui::pos2(x, slider_rect.top()), egui::pos2(x, slider_rect.bottom())],
+                    egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 200, 200)),
+                );
+            }
+        }
 
-            ui.separator();
-
-            // --- Frame label ---
+        // Row 2: Transport controls
+        ui.horizontal(|ui| {
             ui.label(format!("Frame {}/{}", current_frame, max_frame));
-
             ui.separator();
 
-            // --- Transport buttons ---
             if ui.small_button("|<").on_hover_text("First frame").clicked() {
                 action = Some(NavigationAction::FirstFrame);
             }
             if ui.small_button("<").on_hover_text("Previous frame").clicked() {
                 action = Some(NavigationAction::PrevFrame);
             }
-
             let play_label = if is_playing { "Pause" } else { "Play" };
             if ui.button(play_label).clicked() {
                 action = Some(NavigationAction::TogglePlay);
             }
-
             if ui.small_button(">").on_hover_text("Next frame").clicked() {
                 action = Some(NavigationAction::NextFrame);
             }
@@ -112,8 +98,6 @@ impl NavigationBar {
             }
 
             ui.separator();
-
-            // --- FPS combo ---
             ui.label("FPS:");
             let current_fps = FPS_OPTIONS[self.selected_fps_idx];
             egui::ComboBox::from_id_salt("fps_combo")
