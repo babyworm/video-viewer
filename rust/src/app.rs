@@ -82,6 +82,10 @@ pub struct VideoViewerApp {
     show_scene_detect_dialog: bool,
     scene_detect_algorithm: crate::analysis::scene::SceneAlgorithm,
     scene_detect_threshold: f64,
+    /// Test video download state.
+    test_download_status: Arc<std::sync::Mutex<Option<String>>>,
+    test_download_path: Arc<std::sync::Mutex<Option<String>>>,
+    test_downloading: bool,
 }
 
 impl VideoViewerApp {
@@ -149,6 +153,9 @@ impl VideoViewerApp {
             show_scene_detect_dialog: false,
             scene_detect_algorithm: crate::analysis::scene::SceneAlgorithm::Mad,
             scene_detect_threshold: 45.0,
+            test_download_status: Arc::new(std::sync::Mutex::new(None)),
+            test_download_path: Arc::new(std::sync::Mutex::new(None)),
+            test_downloading: false,
         }
     }
 
@@ -715,6 +722,37 @@ impl VideoViewerApp {
             }
         }
     }
+
+    fn start_test_download(&mut self, ctx: &egui::Context) {
+        const URL: &str = "https://media.xiph.org/video/derf/y4m/akiyo_cif.y4m";
+        let status = Arc::clone(&self.test_download_status);
+        let path_out = Arc::clone(&self.test_download_path);
+        let ctx2 = ctx.clone();
+        *status.lock().unwrap() = Some("Downloading...".to_string());
+        self.test_downloading = true;
+        std::thread::spawn(move || {
+            let dir = std::env::temp_dir().join("video-viewer-test");
+            let _ = std::fs::create_dir_all(&dir);
+            let dest = dir.join("akiyo_cif.y4m");
+            let result = (|| -> Result<String, String> {
+                let resp = ureq::get(URL).call().map_err(|e| format!("Download error: {e}"))?;
+                let mut reader = resp.into_body().into_reader();
+                let mut file = std::fs::File::create(&dest).map_err(|e| format!("File create error: {e}"))?;
+                std::io::copy(&mut reader, &mut file).map_err(|e| format!("Write error: {e}"))?;
+                Ok(dest.to_string_lossy().to_string())
+            })();
+            match result {
+                Ok(p) => {
+                    *status.lock().unwrap() = Some("Download complete!".to_string());
+                    *path_out.lock().unwrap() = Some(p);
+                }
+                Err(e) => {
+                    *status.lock().unwrap() = Some(e);
+                }
+            }
+            ctx2.request_repaint();
+        });
+    }
 }
 
 impl eframe::App for VideoViewerApp {
@@ -759,6 +797,16 @@ impl eframe::App for VideoViewerApp {
                 .clone()
                 .unwrap_or_else(|| self.settings.defaults.format.clone());
             self.open_file(ctx, path, w, h, &fmt);
+        }
+
+        // --- Poll test video download ---
+        if self.test_downloading {
+            let dl_path = self.test_download_path.lock().unwrap().take();
+            if let Some(path) = dl_path {
+                self.test_downloading = false;
+                // Y4M: width/height/format parsed from header automatically
+                self.open_file(ctx, path, 0, 0, "");
+            }
         }
 
         // --- Drag & drop ---
@@ -1159,6 +1207,16 @@ impl eframe::App for VideoViewerApp {
                         ui.close_menu();
                         self.show_shortcuts = true;
                     }
+                    ui.separator();
+                    let dl_label = if self.test_downloading { "Downloading..." } else { "Download Test Video (akiyo_cif.y4m)" };
+                    if ui.add_enabled(!self.test_downloading, egui::Button::new(dl_label)).clicked() {
+                        ui.close_menu();
+                        self.start_test_download(ctx);
+                    }
+                    if let Some(ref status) = *self.test_download_status.lock().unwrap() {
+                        ui.label(egui::RichText::new(status).small());
+                    }
+                    ui.separator();
                     if ui.button("About").clicked() {
                         ui.close_menu();
                         self.show_about = true;
