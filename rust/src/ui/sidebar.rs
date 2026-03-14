@@ -29,9 +29,20 @@ pub struct AnalysisShared {
     pub close_requested: bool,
     /// Set to true when the user switches tabs, so the main loop recomputes.
     pub tab_changed: bool,
-    /// Generation counter — bumped when data changes so the viewport knows
-    /// to reload the waveform texture.
+    /// Generation counter — bumped when any analysis data changes.
     pub generation: u64,
+    /// Waveform data generation — bumped only when waveform_image is updated.
+    pub waveform_data_gen: u64,
+    /// Cached waveform texture handle (avoids re-uploading every frame).
+    pub waveform_texture: Option<egui::TextureHandle>,
+    /// Generation at which the waveform texture was last loaded.
+    pub waveform_texture_gen: u64,
+}
+
+impl Default for AnalysisShared {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AnalysisShared {
@@ -47,6 +58,9 @@ impl AnalysisShared {
             close_requested: false,
             tab_changed: false,
             generation: 0,
+            waveform_data_gen: 0,
+            waveform_texture: None,
+            waveform_texture_gen: 0,
         }
     }
 }
@@ -176,14 +190,21 @@ impl Sidebar {
 
                 egui::CentralPanel::default().show(ctx, |ui| {
                     // Snapshot shared state and release the lock before rendering.
-                    let (active_tab, histogram, vectorscope, waveform, generation, psnr, ssim, frame_diff) = {
+                    // Only clone waveform_image when the waveform tab is active AND data changed.
+                    let (active_tab, histogram, vectorscope, waveform, psnr, ssim, frame_diff) = {
                         let data = shared.lock();
+                        let wf = if data.active_tab == AnalysisTab::Waveform
+                            && data.waveform_data_gen != data.waveform_texture_gen
+                        {
+                            data.waveform_image.clone()
+                        } else {
+                            None
+                        };
                         (
                             data.active_tab,
                             data.histogram_data.clone(),
                             data.vectorscope_data.clone(),
-                            data.waveform_image.clone(),
-                            data.generation,
+                            wf,
                             data.psnr,
                             data.ssim,
                             data.frame_diff,
@@ -211,7 +232,7 @@ impl Sidebar {
                             Self::render_histogram(ui, &histogram);
                         }
                         AnalysisTab::Waveform => {
-                            Self::render_waveform_from_image(ctx, ui, &waveform, generation);
+                            Self::render_waveform_from_image(ctx, ui, &shared, waveform);
                         }
                         AnalysisTab::Vectorscope => {
                             Self::render_vectorscope(ui, &vectorscope);
@@ -271,14 +292,28 @@ impl Sidebar {
     }
 
     /// Render waveform from a ColorImage (loaded as texture in the viewport).
+    /// Only re-uploads the texture when `generation` has changed.
     fn render_waveform_from_image(
         ctx: &egui::Context,
         ui: &mut egui::Ui,
-        waveform_image: &Option<egui::ColorImage>,
-        _generation: u64,
+        shared: &Arc<Mutex<AnalysisShared>>,
+        waveform_image: Option<egui::ColorImage>,
     ) {
-        if let Some(ref img) = waveform_image {
-            let tex = ctx.load_texture("waveform_viewport", img.clone(), egui::TextureOptions::LINEAR);
+        // Check if we need to reload the texture (compare against waveform-specific gen).
+        let needs_reload = {
+            let s = shared.lock();
+            s.waveform_texture.is_none() || s.waveform_texture_gen != s.waveform_data_gen
+        };
+        if needs_reload {
+            if let Some(img) = waveform_image {
+                let tex = ctx.load_texture("waveform_viewport", img, egui::TextureOptions::LINEAR);
+                let mut s = shared.lock();
+                s.waveform_texture = Some(tex);
+                s.waveform_texture_gen = s.waveform_data_gen;
+            }
+        }
+        let s = shared.lock();
+        if let Some(ref tex) = s.waveform_texture {
             let size = egui::vec2(ui.available_width(), 200.0);
             ui.image(egui::load::SizedTexture::new(tex.id(), size));
             ui.add_space(4.0);

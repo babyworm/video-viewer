@@ -68,7 +68,7 @@ pub fn detect_scene_changes_with_algorithm(
 }
 
 /// Mean absolute difference between two RGB buffers.
-fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
+pub fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
     }
