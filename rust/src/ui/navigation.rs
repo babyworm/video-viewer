@@ -16,8 +16,6 @@ pub enum NavigationAction {
 
 pub struct NavigationBar {
     pub selected_fps_idx: usize,
-    pub bookmarks: HashSet<usize>,
-    pub scene_changes: Vec<usize>,
 }
 
 impl NavigationBar {
@@ -26,8 +24,6 @@ impl NavigationBar {
         let default_idx = FPS_OPTIONS.iter().position(|&f| f == 30).unwrap_or(6);
         Self {
             selected_fps_idx: default_idx,
-            bookmarks: HashSet::new(),
-            scene_changes: Vec::new(),
         }
     }
 
@@ -42,6 +38,8 @@ impl NavigationBar {
         current_frame: usize,
         total_frames: usize,
         is_playing: bool,
+        bookmarks: &HashSet<usize>,
+        scene_changes: &[usize],
     ) -> Option<NavigationAction> {
         let mut action: Option<NavigationAction> = None;
 
@@ -60,7 +58,7 @@ impl NavigationBar {
             // Draw scene change and bookmark markers on the slider
             if total_frames > 1 {
                 let painter = ui.painter_at(slider_rect);
-                for &frame_idx in &self.scene_changes {
+                for &frame_idx in scene_changes {
                     let x = slider_rect.left()
                         + (frame_idx as f32 / max_frame as f32) * slider_rect.width();
                     painter.line_segment(
@@ -71,7 +69,7 @@ impl NavigationBar {
                         egui::Stroke::new(2.0, egui::Color32::RED),
                     );
                 }
-                for &frame_idx in &self.bookmarks {
+                for &frame_idx in bookmarks {
                     let x = slider_rect.left()
                         + (frame_idx as f32 / max_frame as f32) * slider_rect.width();
                     painter.line_segment(

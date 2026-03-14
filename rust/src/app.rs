@@ -12,6 +12,9 @@ use crate::ui::settings::Settings;
 use crate::ui::sidebar::Sidebar;
 use crate::ui::toolbar::{Toolbar, ToolbarAction, colorize_channel};
 
+/// Tagged scene detection output: (job_id, Ok(changes) | Err(message)).
+type SceneDetectOutput = Arc<std::sync::Mutex<Option<(usize, Result<Vec<usize>, String>)>>>;
+
 pub struct VideoViewerApp {
     pub current_file: Option<String>,
     pub reader: Option<VideoReader>,
@@ -69,8 +72,12 @@ pub struct VideoViewerApp {
     scene_changes: Vec<usize>,
     /// Whether scene detection is currently running in the background.
     scene_detect_running: bool,
-    scene_detect_done: Arc<AtomicBool>,
-    scene_detect_result: Arc<std::sync::Mutex<Option<Vec<usize>>>>,
+    /// Tagged result slot: (job_id, Ok(changes) | Err(message)).
+    scene_detect_output: SceneDetectOutput,
+    /// Monotonic job ID counter — incremented for each detection run.
+    scene_detect_job_id: usize,
+    /// The job ID of the currently expected detection run (shared with workers).
+    scene_detect_active_job: Arc<AtomicUsize>,
     /// Show the scene detection settings dialog.
     show_scene_detect_dialog: bool,
     scene_detect_algorithm: crate::analysis::scene::SceneAlgorithm,
@@ -136,8 +143,9 @@ impl VideoViewerApp {
             convert_running: false,
             scene_changes: Vec::new(),
             scene_detect_running: false,
-            scene_detect_done: Arc::new(AtomicBool::new(false)),
-            scene_detect_result: Arc::new(std::sync::Mutex::new(None)),
+            scene_detect_output: Arc::new(std::sync::Mutex::new(None)),
+            scene_detect_job_id: 0,
+            scene_detect_active_job: Arc::new(AtomicUsize::new(0)),
             show_scene_detect_dialog: false,
             scene_detect_algorithm: crate::analysis::scene::SceneAlgorithm::Mad,
             scene_detect_threshold: 45.0,
@@ -175,6 +183,11 @@ impl VideoViewerApp {
                 self.prev_rgb = None;
                 self.current_rgb = None;
                 self.current_raw = None;
+                // Invalidate scene changes from a previous file.
+                // Any in-flight detection will be discarded by the job ID check.
+                self.scene_changes.clear();
+                self.scene_detect_active_job.store(0, Ordering::Relaxed);
+                self.scene_detect_running = false;
                 // Use goto_frame so component view is applied correctly.
                 self.goto_frame(ctx, 0);
             }
@@ -445,6 +458,7 @@ impl VideoViewerApp {
                     let color_image = egui::ColorImage::from_rgb([wf_width, wf_height], &pixels);
                     let mut shared = self.sidebar.analysis.lock();
                     shared.waveform_image = Some(color_image);
+                    shared.waveform_data_gen += 1;
                     shared.generation += 1;
                 }
             }
@@ -528,40 +542,96 @@ impl VideoViewerApp {
     }
 
     fn run_scene_detection(&mut self, ctx: &egui::Context) {
-        let reader = match self.reader.as_mut() {
+        let reader = match self.reader.as_ref() {
             Some(r) => r,
             None => return,
         };
-        let total = reader.total_frames();
-        if total < 2 {
+        if reader.total_frames() < 2 {
             return;
         }
-        // Read all frames into RGB.
+        // Capture file info so the background thread can open its own reader.
+        let path = match &self.current_file {
+            Some(p) => p.clone(),
+            None => return,
+        };
         let w = reader.width();
         let h = reader.height();
-        let mut frames: Vec<Vec<u8>> = Vec::with_capacity(total);
-        for i in 0..total {
-            match reader.seek_frame(i).and_then(|raw| reader.convert_to_rgb(&raw)) {
-                Ok(rgb) => frames.push(rgb),
-                Err(_) => {
-                    self.status_error = Some(format!("Scene detect: failed to read frame {i}"));
-                    return;
-                }
-            }
-        }
+        let fmt = reader.format_name().to_string();
+        // Use the active reader's color matrix, not the current default setting.
+        let color_matrix = reader.color_matrix.clone();
         let algo = self.scene_detect_algorithm;
         let threshold = self.scene_detect_threshold;
-        let done = Arc::clone(&self.scene_detect_done);
-        let result = Arc::clone(&self.scene_detect_result);
-        done.store(false, Ordering::Relaxed);
+        let output = Arc::clone(&self.scene_detect_output);
+        let active_job = Arc::clone(&self.scene_detect_active_job);
+        // Assign a unique job ID so stale completions are ignored.
+        // Store under output lock so any in-flight publisher sees the new active_job.
+        self.scene_detect_job_id += 1;
+        let job_id = self.scene_detect_job_id;
+        {
+            let _lock = output.lock().unwrap();
+            active_job.store(job_id, Ordering::Release);
+        }
+        self.status_error = None; // Clear prior error banner
         let ctx2 = ctx.clone();
+        // Helper: only publish if this job is still the active one.
+        // The check is inside the lock to prevent TOCTOU races between workers.
+        let publish = move |out: &SceneDetectOutput,
+                            active: &Arc<AtomicUsize>,
+                            id: usize,
+                            val: Result<Vec<usize>, String>,
+                            ctx: &egui::Context| {
+            let mut slot = out.lock().unwrap();
+            if active.load(Ordering::Acquire) == id {
+                *slot = Some((id, val));
+                drop(slot);
+                ctx.request_repaint();
+            }
+        };
         std::thread::spawn(move || {
-            let changes = crate::analysis::scene::detect_scene_changes_with_algorithm(
-                &frames, w, h, threshold, algo,
-            );
-            *result.lock().unwrap() = Some(changes);
-            done.store(true, Ordering::Relaxed);
-            ctx2.request_repaint();
+            // Open a separate reader in the background thread to avoid blocking UI.
+            let mut bg_reader = match crate::core::reader::VideoReader::open(
+                &path, w, h, &fmt, &color_matrix,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    publish(&output, &active_job, job_id, Err(format!("Scene detect: failed to open file: {e}")), &ctx2);
+                    return;
+                }
+            };
+            let total = bg_reader.total_frames();
+            // Process frames pair-wise to avoid loading all into memory at once.
+            let mut changes = Vec::new();
+            let mut prev_rgb: Option<Vec<u8>> = None;
+            for i in 0..total {
+                // Early exit if this job has been superseded.
+                if active_job.load(Ordering::Acquire) != job_id {
+                    return;
+                }
+                let rgb = match bg_reader.seek_frame(i)
+                    .and_then(|raw| bg_reader.convert_to_rgb(&raw))
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        publish(&output, &active_job, job_id, Err(format!("Scene detect: failed to read frame {i}: {e}")), &ctx2);
+                        return;
+                    }
+                };
+                if let Some(ref prev) = prev_rgb {
+                    let diff = match algo {
+                        crate::analysis::scene::SceneAlgorithm::Mad =>
+                            crate::analysis::scene::mean_abs_diff(prev, &rgb),
+                        crate::analysis::scene::SceneAlgorithm::Histogram =>
+                            crate::analysis::scene::histogram_diff(prev, &rgb),
+                        crate::analysis::scene::SceneAlgorithm::Ssim =>
+                            crate::analysis::scene::ssim_diff(prev, &rgb, w, h),
+                    };
+                    if diff > threshold {
+                        changes.push(i);
+                    }
+                }
+                prev_rgb = Some(rgb);
+            }
+            publish(&output, &active_job, job_id, Ok(changes), &ctx2);
         });
         self.scene_detect_running = true;
     }
@@ -748,13 +818,13 @@ impl eframe::App for VideoViewerApp {
         let keys = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::Space),           // 0
-                i.key_pressed(egui::Key::ArrowLeft),       // 1
-                i.key_pressed(egui::Key::ArrowRight),      // 2
+                !i.modifiers.ctrl && !i.modifiers.command && i.key_pressed(egui::Key::ArrowLeft),  // 1: prev frame (no modifier)
+                !i.modifiers.ctrl && !i.modifiers.command && i.key_pressed(egui::Key::ArrowRight), // 2: next frame (no modifier)
                 i.key_pressed(egui::Key::Home),            // 3
                 i.key_pressed(egui::Key::End),             // 4
                 i.key_pressed(egui::Key::F),               // 5
                 i.key_pressed(egui::Key::G),               // 6
-                i.key_pressed(egui::Key::B),               // 7
+                !i.modifiers.ctrl && !i.modifiers.command && i.key_pressed(egui::Key::B),  // 7: bookmark (no modifier)
                 i.key_pressed(egui::Key::Num0),            // 8
                 i.key_pressed(egui::Key::Num1),            // 9
                 i.key_pressed(egui::Key::Num2),            // 10
@@ -764,7 +834,7 @@ impl eframe::App for VideoViewerApp {
                 i.modifiers.ctrl && i.key_pressed(egui::Key::C), // 14
                 i.modifiers.ctrl && i.key_pressed(egui::Key::O), // 15
                 i.modifiers.ctrl && i.key_pressed(egui::Key::Q), // 16
-                i.key_pressed(egui::Key::M),               // 17: toggle magnifier
+                !i.modifiers.ctrl && !i.modifiers.command && i.key_pressed(egui::Key::M),  // 17: magnifier (no modifier)
                 i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::B), // 18: next bookmark
                 i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::B), // 19: prev bookmark
                 i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowLeft),  // 20: prev scene change
@@ -1063,12 +1133,9 @@ impl eframe::App for VideoViewerApp {
                         ui.close_menu();
                         self.show_scene_detect_dialog = true;
                     }
-                    if !self.scene_changes.is_empty() {
-                        if ui.button("Clear Scene Changes").clicked() {
-                            ui.close_menu();
-                            self.scene_changes.clear();
-                            self.nav.scene_changes.clear();
-                        }
+                    if !self.scene_changes.is_empty() && ui.button("Clear Scene Changes").clicked() {
+                        ui.close_menu();
+                        self.scene_changes.clear();
                     }
                 });
                 ui.menu_button("Help", |ui| {
@@ -1192,14 +1259,11 @@ impl eframe::App for VideoViewerApp {
         });
 
         // --- Navigation bar (declared second → sits at bottom edge) ---
-        // Sync bookmarks and scene changes to the nav bar for marker display.
-        self.nav.bookmarks = self.bookmarks.clone();
-        self.nav.scene_changes = self.scene_changes.clone();
         let total = self.total_frames();
         let cur = self.current_frame_idx;
         let is_playing = self.is_playing;
         egui::TopBottomPanel::bottom("navigation").show(ctx, |ui| {
-            let action = self.nav.show(ui, cur, total, is_playing);
+            let action = self.nav.show(ui, cur, total, is_playing, &self.bookmarks, &self.scene_changes);
             if let Some(act) = action {
                 match act {
                     NavigationAction::Seek(idx) => {
@@ -1519,7 +1583,7 @@ impl VideoViewerApp {
                     ui.add_space(4.0);
                     ui.weak(match algo {
                         SceneAlgorithm::Mad => "Mean Absolute Difference: higher threshold = fewer detections.",
-                        SceneAlgorithm::Histogram => "Luma histogram correlation: lower threshold = fewer detections.",
+                        SceneAlgorithm::Histogram => "Luma histogram correlation: higher threshold = fewer detections.",
                         SceneAlgorithm::Ssim => "Structural similarity: higher threshold = fewer detections.",
                     });
                     ui.add_space(8.0);
@@ -1549,11 +1613,22 @@ impl VideoViewerApp {
             }
         }
 
-        // Poll scene detection background result.
-        if self.scene_detect_running && self.scene_detect_done.load(Ordering::Relaxed) {
-            self.scene_detect_running = false;
-            if let Some(result) = self.scene_detect_result.lock().unwrap().take() {
-                self.scene_changes = result;
+        // Poll scene detection background result using tagged job ID.
+        if self.scene_detect_running {
+            if let Some((job_id, result)) = self.scene_detect_output.lock().unwrap().take() {
+                if job_id == self.scene_detect_active_job.load(Ordering::Acquire) {
+                    self.scene_detect_running = false;
+                    match result {
+                        Ok(changes) => {
+                            self.scene_changes = changes;
+                            self.status_error = None;
+                        }
+                        Err(err) => {
+                            self.status_error = Some(err);
+                        }
+                    }
+                }
+                // else: stale job output — already consumed and discarded by take()
             }
         }
     }
