@@ -135,7 +135,7 @@ impl ImageCanvas {
             // Mouse wheel zoom — only when canvas panel is hovered.
             let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll_delta != 0.0 && response.hovered() {
-                let factor = if scroll_delta > 0.0 { 1.1_f32 } else { 1.0 / 1.1 };
+                let factor = if scroll_delta > 0.0 { 1.05_f32 } else { 1.0 / 1.05 };
                 let new_zoom = (self.zoom * factor).clamp(0.1, 50.0);
                 // Zoom anchor: cursor if over the image, otherwise image center.
                 let anchor = ui.input(|i| i.pointer.hover_pos())
