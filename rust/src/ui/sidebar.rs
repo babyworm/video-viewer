@@ -365,10 +365,10 @@ impl Sidebar {
                 .allow_drag(false)
                 .allow_zoom(false)
                 .allow_scroll(false)
-                .include_x(-128.0)
-                .include_x(128.0)
-                .include_y(-128.0)
-                .include_y(128.0);
+                .include_x(-300.0)
+                .include_x(300.0)
+                .include_y(-300.0)
+                .include_y(300.0);
 
             let pts: Vec<[f64; 2]> = points.clone();
 
