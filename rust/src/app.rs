@@ -1368,6 +1368,23 @@ impl eframe::App for VideoViewerApp {
         // --- Status bar (declared first → stacks above navigation) ---
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                // Download progress (shown inline in status bar)
+                if self.test_downloading {
+                    let current = self.test_dl_current.load(Ordering::Relaxed);
+                    let total = self.test_dl_total.load(Ordering::Relaxed);
+                    if total > 0 {
+                        let frac = current as f32 / total as f32;
+                        let mb_cur = current as f64 / (1024.0 * 1024.0);
+                        let mb_tot = total as f64 / (1024.0 * 1024.0);
+                        ui.add(egui::ProgressBar::new(frac)
+                            .text(format!("Downloading: {:.1}/{:.1} MB", mb_cur, mb_tot))
+                            .desired_width(250.0));
+                        ui.separator();
+                    } else {
+                        ui.label("Connecting...");
+                        ui.separator();
+                    }
+                }
                 if let Some(ref err) = self.status_error {
                     ui.colored_label(egui::Color32::RED, err);
                 } else if let Some(ref path) = self.current_file {
