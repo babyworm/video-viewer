@@ -201,6 +201,12 @@ impl VideoViewerApp {
                 self.scene_detect_running = false;
                 // Use goto_frame so component view is applied correctly.
                 self.goto_frame(ctx, 0);
+                // Apply auto-fit immediately so the image fills the canvas.
+                if self.auto_fit {
+                    let avail = ctx.available_rect().size();
+                    self.canvas.fit_to_view(avail);
+                    self.last_available_size = None; // force re-detect on next frame
+                }
             }
             Err(e) => {
                 self.status_error = Some(format!("Open error: {e}"));
