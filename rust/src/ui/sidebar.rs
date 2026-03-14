@@ -270,16 +270,23 @@ impl Sidebar {
                     // Tab bar + controls — writes back to shared state only on change.
                     let mut tab = active_tab;
                     let mut reset_view = false;
+                    let mut zoom_in = false;
+                    let mut zoom_out = false;
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut tab, AnalysisTab::Histogram, "Histogram");
                         ui.selectable_value(&mut tab, AnalysisTab::Waveform, "Waveform");
                         ui.selectable_value(&mut tab, AnalysisTab::Vectorscope, "Vectorscope");
                         ui.selectable_value(&mut tab, AnalysisTab::Metrics, "Metrics");
                         ui.separator();
-                        if ui.small_button("Reset View").clicked() {
+                        if ui.small_button("+").on_hover_text("Zoom in").clicked() {
+                            zoom_in = true;
+                        }
+                        if ui.small_button("-").on_hover_text("Zoom out").clicked() {
+                            zoom_out = true;
+                        }
+                        if ui.small_button("Reset").on_hover_text("Reset view").clicked() {
                             reset_view = true;
                         }
-                        ui.weak("Scroll: zoom, Drag: pan");
                     });
                     if tab != active_tab {
                         let mut s = shared.lock();
@@ -291,13 +298,13 @@ impl Sidebar {
 
                     match tab {
                         AnalysisTab::Histogram => {
-                            Self::render_histogram(ui, &histogram, reset_view);
+                            Self::render_histogram(ui, &histogram, reset_view, zoom_in, zoom_out);
                         }
                         AnalysisTab::Waveform => {
                             Self::render_waveform_from_image(ctx, ui, &shared, waveform);
                         }
                         AnalysisTab::Vectorscope => {
-                            Self::render_vectorscope(ui, &vectorscope, reset_view);
+                            Self::render_vectorscope(ui, &vectorscope, reset_view, zoom_in, zoom_out);
                         }
                         AnalysisTab::Metrics => {
                             Self::render_metrics(ui, psnr, ssim, frame_diff);
@@ -314,8 +321,23 @@ impl Sidebar {
         ui: &mut egui::Ui,
         histogram_data: &Option<std::collections::HashMap<String, Vec<f64>>>,
         reset_view: bool,
+        zoom_in: bool,
+        zoom_out: bool,
     ) {
         use egui_plot::{Bar, BarChart, Plot};
+
+        // Apply button-driven zoom via plot memory
+        if zoom_in || zoom_out {
+            let plot_id = ui.id().with("histogram_plot");
+            if let Some(mut mem) = egui_plot::PlotMemory::load(ui.ctx(), plot_id) {
+                let factor = if zoom_in { 0.8_f32 } else { 1.25 };
+                let mut tf = mem.transform();
+                let center = tf.frame().center();
+                tf.zoom(egui::vec2(factor, factor), center);
+                mem.set_transform(tf);
+                mem.store(ui.ctx(), plot_id);
+            }
+        }
 
         if let Some(ref hist) = histogram_data {
             let plot_height = (ui.available_height() - 40.0).max(120.0);
@@ -323,7 +345,7 @@ impl Sidebar {
                 .height(plot_height)
                 .allow_drag(true)
                 .allow_zoom(true)
-                .allow_scroll(false)
+                .allow_scroll(true)
                 .show_axes([true, true])
                 .include_x(0.0)
                 .include_x(255.0);
@@ -393,8 +415,21 @@ impl Sidebar {
         }
     }
 
-    fn render_vectorscope(ui: &mut egui::Ui, vectorscope_data: &Option<Vec<[f64; 2]>>, reset_view: bool) {
+    fn render_vectorscope(ui: &mut egui::Ui, vectorscope_data: &Option<Vec<[f64; 2]>>, reset_view: bool, zoom_in: bool, zoom_out: bool) {
         use egui_plot::{Line, Plot, PlotPoints, Points};
+
+        // Apply button-driven zoom via plot memory
+        if zoom_in || zoom_out {
+            let plot_id = ui.id().with("vectorscope_plot");
+            if let Some(mut mem) = egui_plot::PlotMemory::load(ui.ctx(), plot_id) {
+                let factor = if zoom_in { 0.8_f32 } else { 1.25 };
+                let mut tf = mem.transform();
+                let center = tf.frame().center();
+                tf.zoom(egui::vec2(factor, factor), center);
+                mem.set_transform(tf);
+                mem.store(ui.ctx(), plot_id);
+            }
+        }
 
         if let Some(ref points) = vectorscope_data {
             let plot_height = (ui.available_height() - 40.0).max(120.0);
@@ -403,11 +438,11 @@ impl Sidebar {
                 .data_aspect(1.0)
                 .allow_drag(true)
                 .allow_zoom(true)
-                .allow_scroll(false)
-                .include_x(-200.0)
-                .include_x(200.0)
-                .include_y(-200.0)
-                .include_y(200.0);
+                .allow_scroll(true)
+                .include_x(-128.0)
+                .include_x(128.0)
+                .include_y(-128.0)
+                .include_y(128.0);
             if reset_view {
                 plot = plot.reset();
             }
@@ -437,9 +472,9 @@ impl Sidebar {
                 }
                 // Cross axes through center
                 let axis_color = egui::Color32::from_rgb(60, 60, 60);
-                plot_ui.line(Line::new(PlotPoints::new(vec![[-200.0, 0.0], [200.0, 0.0]]))
+                plot_ui.line(Line::new(PlotPoints::new(vec![[-128.0, 0.0], [128.0, 0.0]]))
                     .color(axis_color).width(0.5));
-                plot_ui.line(Line::new(PlotPoints::new(vec![[0.0, -200.0], [0.0, 200.0]]))
+                plot_ui.line(Line::new(PlotPoints::new(vec![[0.0, -128.0], [0.0, 128.0]]))
                     .color(axis_color).width(0.5));
 
                 // Data points
