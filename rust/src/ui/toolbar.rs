@@ -26,6 +26,7 @@ pub enum ToolbarAction {
     ZoomOut,
     Zoom1to1,
     Zoom2to1,
+    CenterImage,
 }
 
 impl Toolbar {
@@ -105,6 +106,9 @@ impl Toolbar {
             // --- Zoom controls ---
             if ui.button("Fit").clicked() {
                 action = Some(ToolbarAction::FitToView);
+            }
+            if ui.button("Center").on_hover_text("Center image (C)").clicked() {
+                action = Some(ToolbarAction::CenterImage);
             }
             let auto_btn = egui::Button::new("Auto").selected(auto_fit);
             if ui.add(auto_btn).clicked() {

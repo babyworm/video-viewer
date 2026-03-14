@@ -839,6 +839,7 @@ impl eframe::App for VideoViewerApp {
                 i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::B), // 19: prev bookmark
                 i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowLeft),  // 20: prev scene change
                 i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowRight), // 21: next scene change
+                !i.modifiers.ctrl && !i.modifiers.command && i.key_pressed(egui::Key::C), // 22: center image
             )
         });
 
@@ -908,6 +909,10 @@ impl eframe::App for VideoViewerApp {
         // M: toggle magnifier
         if keys.17 {
             self.canvas.show_magnifier = !self.canvas.show_magnifier;
+        }
+        // C: center image
+        if keys.22 {
+            self.canvas.center_image();
         }
         // Ctrl+B: next bookmark
         if keys.18 {
@@ -1057,6 +1062,10 @@ impl eframe::App for VideoViewerApp {
                     if ui.button("Fit to View (F)").clicked() {
                         let avail = ctx.available_rect().size();
                         self.canvas.fit_to_view(avail);
+                        ui.close_menu();
+                    }
+                    if ui.button("Center Image (C)").clicked() {
+                        self.canvas.center_image();
                         ui.close_menu();
                     }
                     if ui.button("1:1 Zoom").clicked() {
@@ -1228,6 +1237,9 @@ impl eframe::App for VideoViewerApp {
                     ToolbarAction::Zoom2to1 => {
                         self.canvas.zoom = 2.0;
                         self.auto_fit = false;
+                    }
+                    ToolbarAction::CenterImage => {
+                        self.canvas.center_image();
                     }
                 }
             }

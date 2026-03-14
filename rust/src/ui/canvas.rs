@@ -220,6 +220,11 @@ impl ImageCanvas {
         }
     }
 
+    /// Center the image in the canvas without changing zoom level.
+    pub fn center_image(&mut self) {
+        self.pan_offset = egui::Vec2::ZERO;
+    }
+
     pub fn zoom_level(&self) -> f32 {
         self.zoom
     }
