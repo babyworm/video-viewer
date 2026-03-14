@@ -86,6 +86,8 @@ pub struct VideoViewerApp {
     test_download_status: Arc<std::sync::Mutex<Option<String>>>,
     test_download_path: Arc<std::sync::Mutex<Option<String>>>,
     test_downloading: bool,
+    test_dl_current: Arc<AtomicUsize>,
+    test_dl_total: Arc<AtomicUsize>,
 }
 
 impl VideoViewerApp {
@@ -156,6 +158,8 @@ impl VideoViewerApp {
             test_download_status: Arc::new(std::sync::Mutex::new(None)),
             test_download_path: Arc::new(std::sync::Mutex::new(None)),
             test_downloading: false,
+            test_dl_current: Arc::new(AtomicUsize::new(0)),
+            test_dl_total: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -727,8 +731,12 @@ impl VideoViewerApp {
         const URL: &str = "https://media.xiph.org/video/derf/y4m/akiyo_cif.y4m";
         let status = Arc::clone(&self.test_download_status);
         let path_out = Arc::clone(&self.test_download_path);
+        let dl_current = Arc::clone(&self.test_dl_current);
+        let dl_total = Arc::clone(&self.test_dl_total);
         let ctx2 = ctx.clone();
-        *status.lock().unwrap() = Some("Downloading...".to_string());
+        *status.lock().unwrap() = Some("Connecting...".to_string());
+        dl_current.store(0, Ordering::Relaxed);
+        dl_total.store(0, Ordering::Relaxed);
         self.test_downloading = true;
         std::thread::spawn(move || {
             let dir = std::env::temp_dir().join("video-viewer-test");
@@ -736,9 +744,25 @@ impl VideoViewerApp {
             let dest = dir.join("akiyo_cif.y4m");
             let result = (|| -> Result<String, String> {
                 let resp = ureq::get(URL).call().map_err(|e| format!("Download error: {e}"))?;
+                let total = resp.headers().get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
+                dl_total.store(total, Ordering::Relaxed);
+                *status.lock().unwrap() = Some("Downloading...".to_string());
+                use std::io::{Read, Write};
                 let mut reader = resp.into_body().into_reader();
                 let mut file = std::fs::File::create(&dest).map_err(|e| format!("File create error: {e}"))?;
-                std::io::copy(&mut reader, &mut file).map_err(|e| format!("Write error: {e}"))?;
+                let mut buf = [0u8; 32768];
+                let mut downloaded = 0usize;
+                loop {
+                    let n = reader.read(&mut buf).map_err(|e| format!("Read error: {e}"))?;
+                    if n == 0 { break; }
+                    file.write_all(&buf[..n]).map_err(|e| format!("Write error: {e}"))?;
+                    downloaded += n;
+                    dl_current.store(downloaded, Ordering::Relaxed);
+                    ctx2.request_repaint();
+                }
                 Ok(dest.to_string_lossy().to_string())
             })();
             match result {
@@ -1213,7 +1237,19 @@ impl eframe::App for VideoViewerApp {
                         ui.close_menu();
                         self.start_test_download(ctx);
                     }
-                    if let Some(ref status) = *self.test_download_status.lock().unwrap() {
+                    if self.test_downloading {
+                        let current = self.test_dl_current.load(Ordering::Relaxed);
+                        let total = self.test_dl_total.load(Ordering::Relaxed);
+                        if total > 0 {
+                            let frac = current as f32 / total as f32;
+                            let mb_cur = current as f64 / (1024.0 * 1024.0);
+                            let mb_tot = total as f64 / (1024.0 * 1024.0);
+                            ui.add(egui::ProgressBar::new(frac)
+                                .text(format!("{:.1}/{:.1} MB", mb_cur, mb_tot)));
+                        } else if let Some(ref status) = *self.test_download_status.lock().unwrap() {
+                            ui.label(egui::RichText::new(status).small());
+                        }
+                    } else if let Some(ref status) = *self.test_download_status.lock().unwrap() {
                         ui.label(egui::RichText::new(status).small());
                     }
                     ui.separator();
