@@ -1325,6 +1325,7 @@ pub fn show_shortcuts_dialog(ctx: &egui::Context) -> bool {
                         ("G", "Cycle grid size"),
                         ("B", "Toggle bookmark"),
                         ("M", "Toggle magnifier"),
+                        ("C", "Center image"),
                         ("Ctrl+B", "Next bookmark"),
                         ("Ctrl+Shift+B", "Previous bookmark"),
                         ("Ctrl+Left", "Previous scene change"),
