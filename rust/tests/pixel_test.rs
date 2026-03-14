@@ -218,47 +218,48 @@ fn test_pixel_info_hex_rgb24() {
 // --- Neighborhood ---
 
 #[test]
-fn test_neighborhood_3x3_center() {
-    // 3x3 I420 is awkward (odd dims); use 4x4 and check center pixel (1,1)
-    let w = 4u32;
-    let h = 4u32;
+fn test_neighborhood_8x8_center() {
+    // Use 16x16 so 8x8 grid fits comfortably around center pixel (8,8)
+    let w = 16u32;
+    let h = 16u32;
     let y_size = (w * h) as usize;
     let uv_size = (w / 2 * h / 2) as usize;
     let mut data = vec![0u8; y_size + uv_size * 2];
-    // Fill Y plane with sequential values for easy checking
+    // Fill Y plane with sequential values
     for i in 0..y_size {
-        data[i] = i as u8;
+        data[i] = (i % 256) as u8;
     }
 
     let fmt = get_format_by_fourcc("YU12").expect("YU12 format not found");
-    let info = get_pixel_info(&data, w, h, fmt, 1, 1, 0);
+    let info = get_pixel_info(&data, w, h, fmt, 8, 8, 0);
 
-    // 3x3 neighborhood centered at (1,1)
-    assert_eq!(info.neighborhood.len(), 3);
-    assert_eq!(info.neighborhood[0].len(), 3);
-
-    // Center cell [1][1] should be Y[1,1] = index 1*4+1 = 5 → "05"
-    assert_eq!(info.neighborhood[1][1], "05");
-    // Top-left [0][0] is Y[0,0] = 0 → "00"
-    assert_eq!(info.neighborhood[0][0], "00");
+    // 8x8 neighborhood
+    assert_eq!(info.neighborhood.len(), 8);
+    assert_eq!(info.neighborhood[0].len(), 8);
+    // Cursor at center (4,4) of 8x8 grid
+    assert_eq!(info.nb_cursor_row, 4);
+    assert_eq!(info.nb_cursor_col, 4);
+    // Center cell [4][4] should be Y[8,8] = index 8*16+8 = 136 → "88"
+    assert_eq!(info.neighborhood[4][4], "88");
 }
 
 #[test]
-fn test_neighborhood_3x3_edge() {
-    let w = 4u32;
-    let h = 4u32;
+fn test_neighborhood_8x8_edge() {
+    let w = 16u32;
+    let h = 16u32;
     let y_size = (w * h) as usize;
     let uv_size = (w / 2 * h / 2) as usize;
     let data = vec![42u8; y_size + uv_size * 2];
 
     let fmt = get_format_by_fourcc("YU12").expect("YU12 format not found");
-    // Pixel at top-left corner (0,0) — neighbors to the left and above are OOB
+    // Pixel at top-left corner (0,0) — neighbors above/left are OOB (empty string)
     let info = get_pixel_info(&data, w, h, fmt, 0, 0, 0);
 
-    assert_eq!(info.neighborhood.len(), 3);
-    // Row 0 (dy=-1): all "--" since py=-1
-    assert!(info.neighborhood[0].iter().all(|s| s == "--"));
-    // Row 1 (dy=0): first cell "--" (dx=-1), then valid
-    assert_eq!(info.neighborhood[1][0], "--");
-    assert_eq!(info.neighborhood[1][1], "2A"); // 42 = 0x2A
+    assert_eq!(info.neighborhood.len(), 8);
+    // Top-left rows (0..4) and columns (0..4) should have empty cells for OOB
+    assert!(info.neighborhood[0].iter().all(|s| s.is_empty() || s == "2A"));
+    // The OOB cells: row 0 col 0 is at pixel (-4,-4) → empty
+    assert!(info.neighborhood[0][0].is_empty());
+    // Cursor position [4][4] is the actual pixel (0,0) → "2A" (42)
+    assert_eq!(info.neighborhood[4][4], "2A");
 }

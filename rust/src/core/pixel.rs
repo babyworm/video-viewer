@@ -11,8 +11,12 @@ pub struct PixelInfo {
     pub raw_hex: String,
     /// Component values keyed by name ("Y","U","V" or "R","G","B").
     pub components: HashMap<String, u16>,
-    /// 3x3 neighborhood grid of hex strings, row-major. Out-of-bounds cells are "--".
+    /// 8x8 neighborhood grid of hex strings, row-major. Out-of-bounds cells are empty.
     pub neighborhood: Vec<Vec<String>>,
+    /// Current pixel's column index within the neighborhood grid.
+    pub nb_cursor_col: usize,
+    /// Current pixel's row index within the neighborhood grid.
+    pub nb_cursor_row: usize,
 }
 
 /// Extract the first-byte (luminance or single-channel) hex at a given pixel position.
@@ -401,65 +405,34 @@ pub fn get_pixel_info(
     format: &VideoFormat,
     x: u32,
     y: u32,
-    sub_grid_size: u32,
+    _sub_grid_size: u32,
 ) -> PixelInfo {
     let raw_hex = raw_hex_at(data, width, height, format, x, y);
     let components = extract_components(data, width, height, format, x, y);
 
-    // Build neighborhood grid
-    let neighborhood = if sub_grid_size > 0 {
-        let sg = sub_grid_size as i64;
-        let cell_x = (x as i64 / sg) * sg;
-        let cell_y = (y as i64 / sg) * sg;
-        let x_start = cell_x - 1;
-        let y_start = cell_y - 1;
-        let x_end = cell_x + sg;
-        let y_end = cell_y + sg;
-        let mut nb = Vec::new();
-        for py in y_start..=y_end {
-            let mut row = Vec::new();
-            for px in x_start..=x_end {
-                if px < 0 || py < 0 || px >= width as i64 || py >= height as i64 {
-                    row.push("--".to_string());
-                } else {
-                    row.push(pixel_first_byte_hex(
-                        data,
-                        width,
-                        height,
-                        format,
-                        px as u32,
-                        py as u32,
-                    ));
-                }
+    // Build 8x8 neighborhood grid centered on the current pixel.
+    const NB_SIZE: i64 = 8;
+    let half = NB_SIZE / 2; // 4
+    let x_start = x as i64 - half;
+    let y_start = y as i64 - half;
+    let nb_cursor_col = half as usize;
+    let nb_cursor_row = half as usize;
+    let mut neighborhood = Vec::with_capacity(NB_SIZE as usize);
+    for row_idx in 0..NB_SIZE {
+        let py = y_start + row_idx;
+        let mut row = Vec::with_capacity(NB_SIZE as usize);
+        for col_idx in 0..NB_SIZE {
+            let px = x_start + col_idx;
+            if px < 0 || py < 0 || px >= width as i64 || py >= height as i64 {
+                row.push(String::new());
+            } else {
+                row.push(pixel_first_byte_hex(
+                    data, width, height, format, px as u32, py as u32,
+                ));
             }
-            nb.push(row);
         }
-        nb
-    } else {
-        // Standard 3×3
-        let mut nb = Vec::new();
-        for dy in [-1i64, 0, 1] {
-            let mut row = Vec::new();
-            for dx in [-1i64, 0, 1] {
-                let px = x as i64 + dx;
-                let py = y as i64 + dy;
-                if px < 0 || py < 0 || px >= width as i64 || py >= height as i64 {
-                    row.push("--".to_string());
-                } else {
-                    row.push(pixel_first_byte_hex(
-                        data,
-                        width,
-                        height,
-                        format,
-                        px as u32,
-                        py as u32,
-                    ));
-                }
-            }
-            nb.push(row);
-        }
-        nb
-    };
+        neighborhood.push(row);
+    }
 
     PixelInfo {
         x,
@@ -467,5 +440,7 @@ pub fn get_pixel_info(
         raw_hex,
         components,
         neighborhood,
+        nb_cursor_col,
+        nb_cursor_row,
     }
 }
