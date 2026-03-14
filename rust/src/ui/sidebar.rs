@@ -126,16 +126,44 @@ impl Sidebar {
                     .join("  ");
                 ui.monospace(comp_str);
 
-                // Neighbourhood grid
+                // 8x8 Neighbourhood grid with highlight
                 ui.add_space(8.0);
-                ui.label("Neighborhood:");
+                ui.label("Neighborhood (8x8):");
                 let grid_id = ui.id().with("pixel_neighborhood");
+                let cursor_row = info.nb_cursor_row;
+                let cursor_col = info.nb_cursor_col;
+                let highlight_strong = egui::Color32::from_rgba_premultiplied(255, 255, 0, 80);
+                let highlight_weak = egui::Color32::from_rgba_premultiplied(255, 255, 0, 25);
                 egui::Grid::new(grid_id)
-                    .spacing(egui::vec2(4.0, 2.0))
+                    .spacing(egui::vec2(2.0, 1.0))
                     .show(ui, |ui| {
-                        for row in &info.neighborhood {
-                            for cell in row {
-                                ui.monospace(cell);
+                        for (ri, row) in info.neighborhood.iter().enumerate() {
+                            for (ci, cell) in row.iter().enumerate() {
+                                if cell.is_empty() {
+                                    ui.monospace("  ");
+                                } else {
+                                    let is_cursor = ri == cursor_row && ci == cursor_col;
+                                    let is_cross = ri == cursor_row || ci == cursor_col;
+                                    let bg = if is_cursor {
+                                        Some(highlight_strong)
+                                    } else if is_cross {
+                                        Some(highlight_weak)
+                                    } else {
+                                        None
+                                    };
+                                    let text = if is_cursor {
+                                        egui::RichText::new(cell).monospace().size(10.0).strong()
+                                    } else {
+                                        egui::RichText::new(cell).monospace().size(10.0)
+                                    };
+                                    if let Some(color) = bg {
+                                        egui::Frame::NONE
+                                            .fill(color)
+                                            .show(ui, |ui| { ui.label(text); });
+                                    } else {
+                                        ui.label(text);
+                                    }
+                                }
                             }
                             ui.end_row();
                         }
