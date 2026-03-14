@@ -1504,6 +1504,7 @@ impl eframe::App for VideoViewerApp {
             if self.reader.is_some() {
                 let response = self.canvas.show(ui);
                 // Update pixel info on hover — pass absolute screen pos
+                // Update pixel info on hover — keep last info when mouse leaves image
                 if let Some(hover_pos) = response.hover_pos() {
                     if let Some((ix, iy)) = self.canvas.image_pos_from_screen(hover_pos) {
                         if let (Some(ref raw), Some(ref reader)) = (&self.current_raw, &self.reader) {
@@ -1518,11 +1519,7 @@ impl eframe::App for VideoViewerApp {
                             );
                             self.sidebar.set_pixel_info(Some(info));
                         }
-                    } else {
-                        self.sidebar.set_pixel_info(None);
                     }
-                } else {
-                    self.sidebar.set_pixel_info(None);
                 }
             } else {
                 ui.centered_and_justified(|ui| {
