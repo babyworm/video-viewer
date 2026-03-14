@@ -7,6 +7,8 @@ pub struct ImageCanvas {
     pub image_size: Option<(u32, u32)>,
     pub grid_size: u32,
     pub sub_grid_size: u32,
+    /// Show a magnifier overlay when hovering the image.
+    pub show_magnifier: bool,
     /// Actual image rect in screen coordinates (set during show()).
     image_rect: Option<egui::Rect>,
 }
@@ -20,6 +22,7 @@ impl ImageCanvas {
             image_size: None,
             grid_size: 0,
             sub_grid_size: 0,
+            show_magnifier: false,
             image_rect: None,
         }
     }
@@ -81,16 +84,65 @@ impl ImageCanvas {
             // Grid overlays (drawn on top of image).
             self.draw_grid(&painter, image_rect, w, h);
 
-            // Mouse wheel zoom (zoom towards cursor) — only when canvas is hovered.
+            // Magnifier overlay: shows a zoomed-in region around the cursor.
+            if self.show_magnifier {
+                if let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) {
+                    if image_rect.contains(pointer) {
+                        let mag_factor = 8.0_f32;
+                        let mag_size = 160.0_f32; // display size of the magnifier
+                        // Source region in UV coordinates.
+                        let src_half = (mag_size / mag_factor) / 2.0;
+                        let rel = pointer - image_rect.min;
+                        let uv_center_x = rel.x / image_rect.width();
+                        let uv_center_y = rel.y / image_rect.height();
+                        let uv_half_x = src_half / image_rect.width();
+                        let uv_half_y = src_half / image_rect.height();
+                        let uv_min = egui::pos2(
+                            (uv_center_x - uv_half_x).clamp(0.0, 1.0),
+                            (uv_center_y - uv_half_y).clamp(0.0, 1.0),
+                        );
+                        let uv_max = egui::pos2(
+                            (uv_center_x + uv_half_x).clamp(0.0, 1.0),
+                            (uv_center_y + uv_half_y).clamp(0.0, 1.0),
+                        );
+                        // Position magnifier at top-right of cursor with offset.
+                        let mag_pos = egui::pos2(pointer.x + 20.0, pointer.y - mag_size - 10.0);
+                        // Clamp to panel bounds.
+                        let mag_pos = egui::pos2(
+                            mag_pos.x.clamp(panel_rect.left(), panel_rect.right() - mag_size),
+                            mag_pos.y.clamp(panel_rect.top(), panel_rect.bottom() - mag_size),
+                        );
+                        let mag_rect = egui::Rect::from_min_size(mag_pos, egui::vec2(mag_size, mag_size));
+                        // Background + border.
+                        painter.rect_filled(mag_rect, 2.0, egui::Color32::BLACK);
+                        painter.image(
+                            texture.id(),
+                            mag_rect.shrink(1.0),
+                            egui::Rect::from_min_max(uv_min, uv_max),
+                            egui::Color32::WHITE,
+                        );
+                        painter.rect_stroke(mag_rect, 2.0, egui::Stroke::new(1.0, egui::Color32::GRAY), egui::StrokeKind::Outside);
+                        // Crosshair in center.
+                        let center = mag_rect.center();
+                        let ch = 6.0;
+                        let ch_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(255, 255, 0, 180));
+                        painter.line_segment([egui::pos2(center.x - ch, center.y), egui::pos2(center.x + ch, center.y)], ch_stroke);
+                        painter.line_segment([egui::pos2(center.x, center.y - ch), egui::pos2(center.x, center.y + ch)], ch_stroke);
+                    }
+                }
+            }
+
+            // Mouse wheel zoom — only when canvas panel is hovered.
             let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll_delta != 0.0 && response.hovered() {
                 let factor = if scroll_delta > 0.0 { 1.1_f32 } else { 1.0 / 1.1 };
                 let new_zoom = (self.zoom * factor).clamp(0.1, 50.0);
-                // Zoom towards the mouse cursor position.
-                if let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) {
-                    let rel = pointer - origin;
-                    self.pan_offset += rel * (1.0 - new_zoom / self.zoom);
-                }
+                // Zoom anchor: cursor if over the image, otherwise image center.
+                let anchor = ui.input(|i| i.pointer.hover_pos())
+                    .filter(|p| image_rect.contains(*p))
+                    .unwrap_or(image_rect.center());
+                let rel = anchor - origin;
+                self.pan_offset += rel * (1.0 - new_zoom / self.zoom);
                 self.zoom = new_zoom;
             }
 

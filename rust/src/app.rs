@@ -49,6 +49,7 @@ pub struct VideoViewerApp {
     convert_dialog: Option<dialogs::ConvertDialog>,
     png_export_dialog: Option<dialogs::PngExportDialog>,
     settings_dialog: Option<dialogs::SettingsDialog>,
+    batch_convert_dialog: Option<dialogs::BatchConvertDialog>,
     show_shortcuts: bool,
     show_about: bool,
     /// Frame timestamps for render FPS calculation (rolling window).
@@ -64,6 +65,16 @@ pub struct VideoViewerApp {
     convert_done: Arc<AtomicBool>,
     convert_error: Arc<std::sync::Mutex<Option<String>>>,
     convert_running: bool,
+    /// Scene change indices detected by analysis.
+    scene_changes: Vec<usize>,
+    /// Whether scene detection is currently running in the background.
+    scene_detect_running: bool,
+    scene_detect_done: Arc<AtomicBool>,
+    scene_detect_result: Arc<std::sync::Mutex<Option<Vec<usize>>>>,
+    /// Show the scene detection settings dialog.
+    show_scene_detect_dialog: bool,
+    scene_detect_algorithm: crate::analysis::scene::SceneAlgorithm,
+    scene_detect_threshold: f64,
 }
 
 impl VideoViewerApp {
@@ -111,6 +122,7 @@ impl VideoViewerApp {
             convert_dialog: None,
             png_export_dialog: None,
             settings_dialog: None,
+            batch_convert_dialog: None,
             show_shortcuts: false,
             show_about: false,
             frame_times: VecDeque::new(),
@@ -122,6 +134,13 @@ impl VideoViewerApp {
             convert_done: Arc::new(AtomicBool::new(false)),
             convert_error: Arc::new(std::sync::Mutex::new(None)),
             convert_running: false,
+            scene_changes: Vec::new(),
+            scene_detect_running: false,
+            scene_detect_done: Arc::new(AtomicBool::new(false)),
+            scene_detect_result: Arc::new(std::sync::Mutex::new(None)),
+            show_scene_detect_dialog: false,
+            scene_detect_algorithm: crate::analysis::scene::SceneAlgorithm::Mad,
+            scene_detect_threshold: 45.0,
         }
     }
 
@@ -361,7 +380,8 @@ impl VideoViewerApp {
         }
     }
 
-    /// Compute analysis data from the current RGB frame and feed it to the sidebar.
+    /// Compute analysis data from the current RGB frame and feed it to the
+    /// shared analysis state (consumed by the separate analysis viewport).
     /// Only computes data for the currently active tab to avoid unnecessary work.
     fn update_analysis(&mut self, ctx: &egui::Context) {
         use crate::ui::sidebar::AnalysisTab;
@@ -378,14 +398,18 @@ impl VideoViewerApp {
             None => return,
         };
 
-        match self.sidebar.active_tab {
+        let active_tab = self.sidebar.analysis.lock().active_tab;
+
+        match active_tab {
             AnalysisTab::Histogram => {
                 let hist_u32 = crate::analysis::histogram::calculate_histogram(rgb, w, h, "RGB");
                 let hist_f64: std::collections::HashMap<String, Vec<f64>> = hist_u32
                     .into_iter()
                     .map(|(k, v)| (k, v.into_iter().map(|c| c as f64).collect()))
                     .collect();
-                self.sidebar.histogram_data = Some(hist_f64);
+                let mut shared = self.sidebar.analysis.lock();
+                shared.histogram_data = Some(hist_f64);
+                shared.generation += 1;
             }
             AnalysisTab::Vectorscope => {
                 let (cb, cr) = crate::analysis::vectorscope::calculate_vectorscope(rgb, w, h);
@@ -397,7 +421,9 @@ impl VideoViewerApp {
                     .step_by(step)
                     .map(|(u, v)| [u as f64, v as f64])
                     .collect();
-                self.sidebar.vectorscope_data = Some(scatter);
+                let mut shared = self.sidebar.analysis.lock();
+                shared.vectorscope_data = Some(scatter);
+                shared.generation += 1;
             }
             AnalysisTab::Waveform => {
                 let wf = crate::analysis::waveform::calculate_waveform(rgb, w, h, "luma");
@@ -417,28 +443,34 @@ impl VideoViewerApp {
                         }
                     }
                     let color_image = egui::ColorImage::from_rgb([wf_width, wf_height], &pixels);
-                    let tex = ctx.load_texture("waveform_tex", color_image, egui::TextureOptions::LINEAR);
-                    self.sidebar.waveform_texture = Some(tex);
+                    let mut shared = self.sidebar.analysis.lock();
+                    shared.waveform_image = Some(color_image);
+                    shared.generation += 1;
                 }
             }
             AnalysisTab::Metrics => {
+                let mut shared = self.sidebar.analysis.lock();
                 if let Some(ref prev) = self.prev_rgb {
                     if prev.len() == rgb.len() {
-                        self.sidebar.psnr = Some(crate::analysis::metrics::calculate_psnr(prev, rgb, w, h));
-                        self.sidebar.ssim = Some(crate::analysis::metrics::calculate_ssim(prev, rgb, w, h));
-                        self.sidebar.frame_diff = Some(crate::analysis::metrics::calculate_frame_difference(prev, rgb));
+                        shared.psnr = Some(crate::analysis::metrics::calculate_psnr(prev, rgb, w, h));
+                        shared.ssim = Some(crate::analysis::metrics::calculate_ssim(prev, rgb, w, h));
+                        shared.frame_diff = Some(crate::analysis::metrics::calculate_frame_difference(prev, rgb));
                     } else {
-                        self.sidebar.psnr = None;
-                        self.sidebar.ssim = None;
-                        self.sidebar.frame_diff = None;
+                        shared.psnr = None;
+                        shared.ssim = None;
+                        shared.frame_diff = None;
                     }
                 } else {
-                    self.sidebar.psnr = None;
-                    self.sidebar.ssim = None;
-                    self.sidebar.frame_diff = None;
+                    shared.psnr = None;
+                    shared.ssim = None;
+                    shared.frame_diff = None;
                 }
+                shared.generation += 1;
             }
         }
+
+        // Request repaint of the analysis viewport so it picks up new data.
+        ctx.request_repaint_of(egui::ViewportId::from_hash_of("analysis_viewport"));
     }
 
     fn total_frames(&self) -> usize {
@@ -464,6 +496,74 @@ impl VideoViewerApp {
         } else {
             self.status_error = Some("No frame loaded to save".to_string());
         }
+    }
+
+    fn run_batch_single(&mut self, input: &str, width: u32, height: u32, out_format: &str, out_path: &str) {
+        use crate::core::reader::VideoReader;
+        use crate::conversion::converter::VideoConverter;
+
+        let color_matrix = &self.settings.defaults.color_matrix;
+        let reader = match VideoReader::open(input, width, height, "I420", color_matrix) {
+            Ok(r) => r,
+            Err(e) => {
+                self.status_error = Some(format!("Batch: failed to open {input}: {e}"));
+                return;
+            }
+        };
+        let src_format = reader.format_name().to_string();
+        let converter = VideoConverter::new();
+        match converter.convert(
+            input,
+            (reader.width(), reader.height()),
+            &src_format,
+            out_path,
+            out_format,
+            None,
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                self.status_error = Some(format!("Batch: conversion failed for {input}: {e}"));
+            }
+        }
+    }
+
+    fn run_scene_detection(&mut self, ctx: &egui::Context) {
+        let reader = match self.reader.as_mut() {
+            Some(r) => r,
+            None => return,
+        };
+        let total = reader.total_frames();
+        if total < 2 {
+            return;
+        }
+        // Read all frames into RGB.
+        let w = reader.width();
+        let h = reader.height();
+        let mut frames: Vec<Vec<u8>> = Vec::with_capacity(total);
+        for i in 0..total {
+            match reader.seek_frame(i).and_then(|raw| reader.convert_to_rgb(&raw)) {
+                Ok(rgb) => frames.push(rgb),
+                Err(_) => {
+                    self.status_error = Some(format!("Scene detect: failed to read frame {i}"));
+                    return;
+                }
+            }
+        }
+        let algo = self.scene_detect_algorithm;
+        let threshold = self.scene_detect_threshold;
+        let done = Arc::clone(&self.scene_detect_done);
+        let result = Arc::clone(&self.scene_detect_result);
+        done.store(false, Ordering::Relaxed);
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let changes = crate::analysis::scene::detect_scene_changes_with_algorithm(
+                &frames, w, h, threshold, algo,
+            );
+            *result.lock().unwrap() = Some(changes);
+            done.store(true, Ordering::Relaxed);
+            ctx2.request_repaint();
+        });
+        self.scene_detect_running = true;
     }
 
     fn run_conversion(&mut self, out_format: &str, out_path: &str) {
@@ -664,6 +764,11 @@ impl eframe::App for VideoViewerApp {
                 i.modifiers.ctrl && i.key_pressed(egui::Key::C), // 14
                 i.modifiers.ctrl && i.key_pressed(egui::Key::O), // 15
                 i.modifiers.ctrl && i.key_pressed(egui::Key::Q), // 16
+                i.key_pressed(egui::Key::M),               // 17: toggle magnifier
+                i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::B), // 18: next bookmark
+                i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::B), // 19: prev bookmark
+                i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowLeft),  // 20: prev scene change
+                i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowRight), // 21: next scene change
             )
         });
 
@@ -730,6 +835,52 @@ impl eframe::App for VideoViewerApp {
             self.dialog_state = DialogState::SaveFile;
         }
         if keys.14 { self.copy_frame_to_clipboard(); }
+        // M: toggle magnifier
+        if keys.17 {
+            self.canvas.show_magnifier = !self.canvas.show_magnifier;
+        }
+        // Ctrl+B: next bookmark
+        if keys.18 {
+            let cur = self.current_frame_idx;
+            if let Some(&next) = self.bookmarks.iter()
+                .filter(|&&b| b > cur)
+                .min()
+            {
+                self.goto_frame(ctx, next);
+                self.is_playing = false;
+            }
+        }
+        // Ctrl+Shift+B: previous bookmark
+        if keys.19 {
+            let cur = self.current_frame_idx;
+            if let Some(&prev) = self.bookmarks.iter()
+                .filter(|&&b| b < cur)
+                .max()
+            {
+                self.goto_frame(ctx, prev);
+                self.is_playing = false;
+            }
+        }
+        // Ctrl+Left: previous scene change
+        if keys.20 {
+            let cur = self.current_frame_idx;
+            if let Some(&prev) = self.scene_changes.iter().rev()
+                .find(|&&s| s < cur)
+            {
+                self.goto_frame(ctx, prev);
+                self.is_playing = false;
+            }
+        }
+        // Ctrl+Right: next scene change
+        if keys.21 {
+            let cur = self.current_frame_idx;
+            if let Some(&next) = self.scene_changes.iter()
+                .find(|&&s| s > cur)
+            {
+                self.goto_frame(ctx, next);
+                self.is_playing = false;
+            }
+        }
         if keys.15 && self.dialog_state == DialogState::None {
             // Ctrl+O: open file dialog
             self.open_file_dialog = Some(dialogs::OpenFileDialog::new(
@@ -848,6 +999,7 @@ impl eframe::App for VideoViewerApp {
                     }
                     ui.separator();
                     ui.checkbox(&mut self.loop_playback, "Loop Playback");
+                    ui.checkbox(&mut self.canvas.show_magnifier, "Magnifier (M)");
                     ui.checkbox(&mut self.sidebar.show_analysis, "Show Analysis");
                     ui.separator();
                     let mut dark = self.settings.display.dark_theme;
@@ -892,9 +1044,31 @@ impl eframe::App for VideoViewerApp {
                         ));
                         self.dialog_state = DialogState::Convert;
                     }
+                    if ui.button("Batch Convert...").clicked() {
+                        ui.close_menu();
+                        self.batch_convert_dialog = Some(dialogs::BatchConvertDialog::new(
+                            self.settings.defaults.width,
+                            self.settings.defaults.height,
+                        ));
+                        self.dialog_state = DialogState::BatchConvert;
+                    }
+                    ui.separator();
                     if ui.button("Copy Frame (Ctrl+C)").clicked() {
                         ui.close_menu();
                         self.copy_frame_to_clipboard();
+                    }
+                });
+                ui.menu_button("Analysis", |ui| {
+                    if ui.button("Detect Scene Changes...").clicked() {
+                        ui.close_menu();
+                        self.show_scene_detect_dialog = true;
+                    }
+                    if !self.scene_changes.is_empty() {
+                        if ui.button("Clear Scene Changes").clicked() {
+                            ui.close_menu();
+                            self.scene_changes.clear();
+                            self.nav.scene_changes.clear();
+                        }
                     }
                 });
                 ui.menu_button("Help", |ui| {
@@ -1018,6 +1192,9 @@ impl eframe::App for VideoViewerApp {
         });
 
         // --- Navigation bar (declared second → sits at bottom edge) ---
+        // Sync bookmarks and scene changes to the nav bar for marker display.
+        self.nav.bookmarks = self.bookmarks.clone();
+        self.nav.scene_changes = self.scene_changes.clone();
         let total = self.total_frames();
         let cur = self.current_frame_idx;
         let is_playing = self.is_playing;
@@ -1071,6 +1248,15 @@ impl eframe::App for VideoViewerApp {
         // If user just toggled analysis on, always recompute (data may be stale).
         if analysis_was_off && self.sidebar.show_analysis {
             self.update_analysis(ctx);
+        }
+        // If the user switched tabs in the viewport, recompute immediately.
+        {
+            let mut shared = self.sidebar.analysis.lock();
+            if shared.tab_changed {
+                shared.tab_changed = false;
+                drop(shared);
+                self.update_analysis(ctx);
+            }
         }
         // Analysis as a separate floating window.
         self.sidebar.show_analysis_window(ctx);
@@ -1268,6 +1454,23 @@ impl VideoViewerApp {
             }
         }
 
+        // Batch convert dialog
+        if self.dialog_state == DialogState::BatchConvert {
+            if let Some(ref mut dlg) = self.batch_convert_dialog {
+                if let Some(jobs) = dlg.show(ctx) {
+                    if !jobs.is_empty() {
+                        let w = dlg.width;
+                        let h = dlg.height;
+                        for (input, out_fmt, out_path) in &jobs {
+                            self.run_batch_single(input, w, h, out_fmt, out_path);
+                        }
+                    }
+                    self.dialog_state = DialogState::None;
+                    self.batch_convert_dialog = None;
+                }
+            }
+        }
+
         // Shortcuts dialog
         if self.show_shortcuts {
             self.show_shortcuts = dialogs::show_shortcuts_dialog(ctx);
@@ -1276,6 +1479,82 @@ impl VideoViewerApp {
         // About dialog
         if self.show_about {
             self.show_about = dialogs::show_about_dialog(ctx);
+        }
+
+        // Scene detection dialog
+        if self.show_scene_detect_dialog {
+            let mut open = true;
+            let mut start_detect = false;
+            let mut algo = self.scene_detect_algorithm;
+            let mut thresh = self.scene_detect_threshold;
+
+            egui::Window::new("Detect Scene Changes")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    use crate::analysis::scene::SceneAlgorithm;
+
+                    ui.horizontal(|ui| {
+                        ui.label("Algorithm:");
+                        egui::ComboBox::from_id_salt("scene_algo")
+                            .selected_text(format!("{}", algo))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut algo, SceneAlgorithm::Mad, "MAD");
+                                ui.selectable_value(&mut algo, SceneAlgorithm::Histogram, "Histogram");
+                                ui.selectable_value(&mut algo, SceneAlgorithm::Ssim, "SSIM");
+                            });
+                    });
+                    // Reset threshold to default when algorithm changes.
+                    if algo != self.scene_detect_algorithm {
+                        thresh = algo.default_threshold();
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Threshold:");
+                        ui.add(egui::DragValue::new(&mut thresh).speed(0.1));
+                        if ui.small_button("Reset").clicked() {
+                            thresh = algo.default_threshold();
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.weak(match algo {
+                        SceneAlgorithm::Mad => "Mean Absolute Difference: higher threshold = fewer detections.",
+                        SceneAlgorithm::Histogram => "Luma histogram correlation: lower threshold = fewer detections.",
+                        SceneAlgorithm::Ssim => "Structural similarity: higher threshold = fewer detections.",
+                    });
+                    ui.add_space(8.0);
+                    let has_file = self.reader.is_some();
+                    ui.add_enabled_ui(has_file && !self.scene_detect_running, |ui| {
+                        if ui.button("Detect").clicked() {
+                            start_detect = true;
+                        }
+                    });
+                    if self.scene_detect_running {
+                        ui.spinner();
+                        ui.label("Detecting...");
+                    }
+                    if !self.scene_changes.is_empty() {
+                        ui.label(format!("{} scene changes found.", self.scene_changes.len()));
+                    }
+                });
+
+            self.scene_detect_algorithm = algo;
+            self.scene_detect_threshold = thresh;
+            if !open {
+                self.show_scene_detect_dialog = false;
+            }
+
+            if start_detect {
+                self.run_scene_detection(ctx);
+            }
+        }
+
+        // Poll scene detection background result.
+        if self.scene_detect_running && self.scene_detect_done.load(Ordering::Relaxed) {
+            self.scene_detect_running = false;
+            if let Some(result) = self.scene_detect_result.lock().unwrap().take() {
+                self.scene_changes = result;
+            }
         }
     }
 

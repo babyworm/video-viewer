@@ -51,8 +51,37 @@ impl NavigationBar {
             let mut slider_val = current_frame as u32;
             let slider = egui::Slider::new(&mut slider_val, 0..=max_frame as u32)
                 .show_value(false);
-            if ui.add_sized([300.0, 20.0], slider).changed() {
+            let slider_resp = ui.add_sized([300.0, 20.0], slider);
+            if slider_resp.changed() {
                 action = Some(NavigationAction::Seek(slider_val as usize));
+            }
+            let slider_rect = slider_resp.rect;
+
+            // Draw scene change and bookmark markers on the slider
+            if total_frames > 1 {
+                let painter = ui.painter_at(slider_rect);
+                for &frame_idx in &self.scene_changes {
+                    let x = slider_rect.left()
+                        + (frame_idx as f32 / max_frame as f32) * slider_rect.width();
+                    painter.line_segment(
+                        [
+                            egui::pos2(x, slider_rect.top()),
+                            egui::pos2(x, slider_rect.bottom()),
+                        ],
+                        egui::Stroke::new(2.0, egui::Color32::RED),
+                    );
+                }
+                for &frame_idx in &self.bookmarks {
+                    let x = slider_rect.left()
+                        + (frame_idx as f32 / max_frame as f32) * slider_rect.width();
+                    painter.line_segment(
+                        [
+                            egui::pos2(x, slider_rect.top()),
+                            egui::pos2(x, slider_rect.bottom()),
+                        ],
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 200, 200)),
+                    );
+                }
             }
 
             ui.separator();
