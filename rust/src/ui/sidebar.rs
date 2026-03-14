@@ -394,7 +394,7 @@ impl Sidebar {
     }
 
     fn render_vectorscope(ui: &mut egui::Ui, vectorscope_data: &Option<Vec<[f64; 2]>>, reset_view: bool) {
-        use egui_plot::{Plot, Points};
+        use egui_plot::{Line, Plot, PlotPoints, Points};
 
         if let Some(ref points) = vectorscope_data {
             let plot_height = (ui.available_height() - 40.0).max(120.0);
@@ -404,10 +404,10 @@ impl Sidebar {
                 .allow_drag(true)
                 .allow_zoom(true)
                 .allow_scroll(false)
-                .include_x(-300.0)
-                .include_x(300.0)
-                .include_y(-300.0)
-                .include_y(300.0);
+                .include_x(-200.0)
+                .include_x(200.0)
+                .include_y(-200.0)
+                .include_y(200.0);
             if reset_view {
                 plot = plot.reset();
             }
@@ -415,13 +415,41 @@ impl Sidebar {
             let pts: Vec<[f64; 2]> = points.clone();
 
             plot.show(ui, |plot_ui| {
+                // ±128 boundary box (dashed lines)
+                let b = 128.0_f64;
+                let dash_color = egui::Color32::from_rgb(100, 100, 100);
+                let boundary_lines = [
+                    // Top: (-128,128) to (128,128)
+                    vec![[-b, b], [b, b]],
+                    // Bottom: (-128,-128) to (128,-128)
+                    vec![[-b, -b], [b, -b]],
+                    // Left: (-128,-128) to (-128,128)
+                    vec![[-b, -b], [-b, b]],
+                    // Right: (128,-128) to (128,128)
+                    vec![[b, -b], [b, b]],
+                ];
+                for line_pts in &boundary_lines {
+                    let line = Line::new(PlotPoints::new(line_pts.to_vec()))
+                        .color(dash_color)
+                        .width(1.0)
+                        .style(egui_plot::LineStyle::dashed_dense());
+                    plot_ui.line(line);
+                }
+                // Cross axes through center
+                let axis_color = egui::Color32::from_rgb(60, 60, 60);
+                plot_ui.line(Line::new(PlotPoints::new(vec![[-200.0, 0.0], [200.0, 0.0]]))
+                    .color(axis_color).width(0.5));
+                plot_ui.line(Line::new(PlotPoints::new(vec![[0.0, -200.0], [0.0, 200.0]]))
+                    .color(axis_color).width(0.5));
+
+                // Data points
                 let scatter = Points::new(pts)
                     .radius(1.0)
                     .color(egui::Color32::LIGHT_GREEN);
                 plot_ui.points(scatter);
             });
             ui.add_space(4.0);
-            ui.weak("Cb vs Cr chrominance scatter (BT.709). Center = neutral gray, spread = color saturation.");
+            ui.weak("Cb vs Cr (BT.709, centered). Dashed box = ±128 range.");
         } else {
             ui.label("No vectorscope data available.");
         }

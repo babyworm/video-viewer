@@ -39,8 +39,9 @@ pub fn calculate_vectorscope(rgb: &[u8], w: u32, h: u32) -> (Vec<f32>, Vec<f32>)
         let g = rgb[base + 1] as f32;
         let b = rgb[base + 2] as f32;
 
-        let cb = -0.1146 * r - 0.3854 * g + 0.5000 * b + 128.0;
-        let cr = 0.5000 * r - 0.4542 * g - 0.0458 * b + 128.0;
+        // Center at 0: Cb/Cr range is -128..+128
+        let cb = -0.1146 * r - 0.3854 * g + 0.5000 * b;
+        let cr = 0.5000 * r - 0.4542 * g - 0.0458 * b;
 
         cb_values.push(cb);
         cr_values.push(cr);

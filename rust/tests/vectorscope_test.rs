@@ -2,7 +2,7 @@ use video_viewer::analysis::vectorscope::calculate_vectorscope;
 
 #[test]
 fn test_vectorscope_neutral_gray() {
-    // RGB(128, 128, 128) → Cb ≈ 128, Cr ≈ 128 (neutral)
+    // RGB(128, 128, 128) → Cb ≈ 0, Cr ≈ 0 (neutral, centered)
     let w = 4u32;
     let h = 4u32;
     let rgb = vec![128u8; (w * h * 3) as usize];
@@ -12,18 +12,18 @@ fn test_vectorscope_neutral_gray() {
     assert_eq!(cb.len(), (w * h) as usize);
     assert_eq!(cr.len(), (w * h) as usize);
 
-    // All values should be near 128 (neutral point)
+    // All values should be near 0 (neutral center)
     for &v in &cb {
-        assert!((v - 128.0).abs() < 1.0, "Cb = {} expected ~128", v);
+        assert!(v.abs() < 1.0, "Cb = {} expected ~0", v);
     }
     for &v in &cr {
-        assert!((v - 128.0).abs() < 1.0, "Cr = {} expected ~128", v);
+        assert!(v.abs() < 1.0, "Cr = {} expected ~0", v);
     }
 }
 
 #[test]
 fn test_vectorscope_pure_red() {
-    // RGB(255, 0, 0) → high Cr, low Cb
+    // RGB(255, 0, 0) → high Cr, negative Cb
     let w = 4u32;
     let h = 4u32;
     let pixel_count = (w * h) as usize;
@@ -34,19 +34,19 @@ fn test_vectorscope_pure_red() {
 
     let (cb, cr) = calculate_vectorscope(&rgb, w, h);
 
-    // Cr = 0.5*255 - 0.4542*0 - 0.0458*0 + 128 = 255.5
-    // Cb = -0.1146*255 - 0.3854*0 + 0.5*0 + 128 = 98.777
+    // Cr = 0.5*255 = 127.5
     for &v in &cr {
-        assert!(v > 200.0, "Cr = {} expected > 200 for pure red", v);
+        assert!(v > 100.0, "Cr = {} expected > 100 for pure red", v);
     }
+    // Cb = -0.1146*255 = -29.2
     for &v in &cb {
-        assert!(v < 128.0, "Cb = {} expected < 128 for pure red", v);
+        assert!(v < 0.0, "Cb = {} expected < 0 for pure red", v);
     }
 }
 
 #[test]
 fn test_vectorscope_pure_blue() {
-    // RGB(0, 0, 255) → high Cb, low Cr
+    // RGB(0, 0, 255) → high Cb, negative Cr
     let w = 4u32;
     let h = 4u32;
     let pixel_count = (w * h) as usize;
@@ -57,13 +57,13 @@ fn test_vectorscope_pure_blue() {
 
     let (cb, cr) = calculate_vectorscope(&rgb, w, h);
 
-    // Cb = 0.5*255 + 128 = 255.5
+    // Cb = 0.5*255 = 127.5
     for &v in &cb {
-        assert!(v > 200.0, "Cb = {} expected > 200 for pure blue", v);
+        assert!(v > 100.0, "Cb = {} expected > 100 for pure blue", v);
     }
-    // Cr = -0.0458*255 + 128 ≈ 116.3
+    // Cr = -0.0458*255 ≈ -11.7
     for &v in &cr {
-        assert!(v < 128.0, "Cr = {} expected < 128 for pure blue", v);
+        assert!(v < 0.0, "Cr = {} expected < 0 for pure blue", v);
     }
 }
 
@@ -86,6 +86,6 @@ fn test_vectorscope_subsampling() {
 
     // Should be subsampled: output < total pixels
     assert!(cb.len() < pixel_count, "Expected subsampling, got {} == {}", cb.len(), pixel_count);
-    assert!(cb.len() > 0);
+    assert!(!cb.is_empty());
     assert_eq!(cb.len(), cr.len());
 }
