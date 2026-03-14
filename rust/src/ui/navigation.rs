@@ -49,7 +49,9 @@ impl NavigationBar {
             let mut slider_val = current_frame as u32;
             let slider = egui::Slider::new(&mut slider_val, 0..=max_frame as u32)
                 .show_value(false);
-            let slider_resp = ui.add_sized([300.0, 20.0], slider);
+            // Use most of available width, leaving room for buttons/labels.
+            let slider_width = (ui.available_width() - 350.0).max(200.0);
+            let slider_resp = ui.add_sized([slider_width, 20.0], slider);
             if slider_resp.changed() {
                 action = Some(NavigationAction::Seek(slider_val as usize));
             }
