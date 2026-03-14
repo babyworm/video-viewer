@@ -238,13 +238,19 @@ impl Sidebar {
                         )
                     };
 
-                    // Tab bar — writes back to shared state only on change.
+                    // Tab bar + controls — writes back to shared state only on change.
                     let mut tab = active_tab;
+                    let mut reset_view = false;
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut tab, AnalysisTab::Histogram, "Histogram");
                         ui.selectable_value(&mut tab, AnalysisTab::Waveform, "Waveform");
                         ui.selectable_value(&mut tab, AnalysisTab::Vectorscope, "Vectorscope");
                         ui.selectable_value(&mut tab, AnalysisTab::Metrics, "Metrics");
+                        ui.separator();
+                        if ui.small_button("Reset View").clicked() {
+                            reset_view = true;
+                        }
+                        ui.weak("Scroll: zoom, Drag: pan");
                     });
                     if tab != active_tab {
                         let mut s = shared.lock();
@@ -256,13 +262,13 @@ impl Sidebar {
 
                     match tab {
                         AnalysisTab::Histogram => {
-                            Self::render_histogram(ui, &histogram);
+                            Self::render_histogram(ui, &histogram, reset_view);
                         }
                         AnalysisTab::Waveform => {
                             Self::render_waveform_from_image(ctx, ui, &shared, waveform);
                         }
                         AnalysisTab::Vectorscope => {
-                            Self::render_vectorscope(ui, &vectorscope);
+                            Self::render_vectorscope(ui, &vectorscope, reset_view);
                         }
                         AnalysisTab::Metrics => {
                             Self::render_metrics(ui, psnr, ssim, frame_diff);
@@ -278,19 +284,23 @@ impl Sidebar {
     fn render_histogram(
         ui: &mut egui::Ui,
         histogram_data: &Option<std::collections::HashMap<String, Vec<f64>>>,
+        reset_view: bool,
     ) {
         use egui_plot::{Bar, BarChart, Plot};
 
         if let Some(ref hist) = histogram_data {
             let plot_height = (ui.available_height() - 40.0).max(120.0);
-            let plot = Plot::new("histogram_plot")
+            let mut plot = Plot::new("histogram_plot")
                 .height(plot_height)
-                .allow_drag(false)
-                .allow_zoom(false)
+                .allow_drag(true)
+                .allow_zoom(true)
                 .allow_scroll(false)
-                .show_axes([true, false])
+                .show_axes([true, true])
                 .include_x(0.0)
                 .include_x(255.0);
+            if reset_view {
+                plot = plot.reset();
+            }
 
             let channel_colors = [
                 ("Y", egui::Color32::WHITE),
@@ -354,21 +364,24 @@ impl Sidebar {
         }
     }
 
-    fn render_vectorscope(ui: &mut egui::Ui, vectorscope_data: &Option<Vec<[f64; 2]>>) {
+    fn render_vectorscope(ui: &mut egui::Ui, vectorscope_data: &Option<Vec<[f64; 2]>>, reset_view: bool) {
         use egui_plot::{Plot, Points};
 
         if let Some(ref points) = vectorscope_data {
             let plot_height = (ui.available_height() - 40.0).max(120.0);
-            let plot = Plot::new("vectorscope_plot")
+            let mut plot = Plot::new("vectorscope_plot")
                 .height(plot_height)
                 .data_aspect(1.0)
-                .allow_drag(false)
-                .allow_zoom(false)
+                .allow_drag(true)
+                .allow_zoom(true)
                 .allow_scroll(false)
                 .include_x(-300.0)
                 .include_x(300.0)
                 .include_y(-300.0)
                 .include_y(300.0);
+            if reset_view {
+                plot = plot.reset();
+            }
 
             let pts: Vec<[f64; 2]> = points.clone();
 
