@@ -68,6 +68,8 @@ impl AnalysisShared {
 /// Sidebar panel showing pixel inspector and analysis toggle.
 pub struct Sidebar {
     pub pixel_info: Option<PixelInfo>,
+    /// Whether the mouse is currently over the image (values shown vs "--").
+    pub pixel_active: bool,
     pub show_analysis: bool,
 
     /// Shared state for the analysis viewport.
@@ -84,6 +86,7 @@ impl Sidebar {
     pub fn new() -> Self {
         Self {
             pixel_info: None,
+            pixel_active: false,
             show_analysis: false,
             analysis: Arc::new(Mutex::new(AnalysisShared::new())),
         }
@@ -108,23 +111,37 @@ impl Sidebar {
             ui.set_min_height(min_inspector_height);
 
             if let Some(ref info) = self.pixel_info {
+                let active = self.pixel_active;
+
                 // Position
-                ui.monospace(format!("X: {}  Y: {}", info.x, info.y));
+                if active {
+                    ui.monospace(format!("X: {}  Y: {}", info.x, info.y));
+                } else {
+                    ui.monospace("X: --  Y: --");
+                }
 
                 // Raw hex
-                ui.monospace(format!("Raw: {}", info.raw_hex));
+                if active {
+                    ui.monospace(format!("Raw: {}", info.raw_hex));
+                } else {
+                    ui.monospace("Raw: --");
+                }
 
                 // Components
                 ui.add_space(4.0);
                 ui.label("Components:");
-                let mut keys: Vec<&String> = info.components.keys().collect();
-                keys.sort();
-                let comp_str: String = keys
-                    .iter()
-                    .map(|k| format!("{}: {}", k, info.components[*k]))
-                    .collect::<Vec<_>>()
-                    .join("  ");
-                ui.monospace(comp_str);
+                if active {
+                    let mut keys: Vec<&String> = info.components.keys().collect();
+                    keys.sort();
+                    let comp_str: String = keys
+                        .iter()
+                        .map(|k| format!("{}: {}", k, info.components[*k]))
+                        .collect::<Vec<_>>()
+                        .join("  ");
+                    ui.monospace(comp_str);
+                } else {
+                    ui.monospace("--");
+                }
 
                 // 8x8 Neighbourhood grid with highlight
                 ui.add_space(8.0);
@@ -132,30 +149,42 @@ impl Sidebar {
                 let grid_id = ui.id().with("pixel_neighborhood");
                 let cursor_row = info.nb_cursor_row;
                 let cursor_col = info.nb_cursor_col;
-                let highlight_strong = egui::Color32::from_rgba_premultiplied(100, 100, 40, 40);
-                let highlight_weak = egui::Color32::from_rgba_premultiplied(80, 80, 30, 15);
+                // Current pixel: bright yellow bg + black text
+                let cursor_bg = egui::Color32::from_rgb(220, 200, 60);
+                // Crosshair: very subtle tint
+                let cross_bg = egui::Color32::from_rgba_premultiplied(60, 60, 40, 15);
                 egui::Grid::new(grid_id)
                     .spacing(egui::vec2(2.0, 1.0))
                     .show(ui, |ui| {
                         for (ri, row) in info.neighborhood.iter().enumerate() {
                             for (ci, cell) in row.iter().enumerate() {
-                                let display = if cell.is_empty() { "--" } else { cell.as_str() };
+                                let has_value = active && !cell.is_empty();
+                                let display = if has_value { cell.as_str() } else { "--" };
                                 let is_cursor = ri == cursor_row && ci == cursor_col;
                                 let is_cross = ri == cursor_row || ci == cursor_col;
-                                let bg = if is_cursor {
-                                    Some(highlight_strong)
-                                } else if is_cross {
-                                    Some(highlight_weak)
-                                } else {
-                                    None
-                                };
-                                let text = if is_cursor {
-                                    egui::RichText::new(display).monospace().size(10.0).strong()
-                                } else if cell.is_empty() {
+
+                                let text = if is_cursor && active {
+                                    // Current pixel: black text on yellow
+                                    egui::RichText::new(display).monospace().size(10.0)
+                                        .strong().color(egui::Color32::BLACK)
+                                } else if is_cross && active {
+                                    // Crosshair: white text
+                                    egui::RichText::new(display).monospace().size(10.0)
+                                        .color(egui::Color32::WHITE)
+                                } else if !has_value {
                                     egui::RichText::new(display).monospace().size(10.0).weak()
                                 } else {
                                     egui::RichText::new(display).monospace().size(10.0)
                                 };
+
+                                let bg = if is_cursor && active {
+                                    Some(cursor_bg)
+                                } else if is_cross && active {
+                                    Some(cross_bg)
+                                } else {
+                                    None
+                                };
+
                                 if let Some(color) = bg {
                                     egui::Frame::NONE
                                         .fill(color)
