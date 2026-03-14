@@ -1265,6 +1265,11 @@ impl eframe::App for VideoViewerApp {
                         } else if let Some(ref status) = *self.test_download_status.lock().unwrap() {
                             ui.label(egui::RichText::new(status).small());
                         }
+                        ui.separator();
+                        if ui.button("Visit derf Collection...").clicked() {
+                            ui.close_menu();
+                            ctx.open_url(egui::OpenUrl::new_tab("https://media.xiph.org/video/derf/"));
+                        }
                     });
                     ui.separator();
                     if ui.button("About").clicked() {
