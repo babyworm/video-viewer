@@ -58,10 +58,10 @@ Download the latest release for your platform from the [Releases](https://github
 
 | Platform | File |
 |----------|------|
-| Linux x86_64 | `video-viewer-linux-x86_64.tar.gz` |
-| macOS Apple Silicon | `video-viewer-macos-aarch64.tar.gz` |
-| macOS Intel | `video-viewer-macos-x86_64.tar.gz` |
-| Windows x86_64 | `video-viewer-windows-x86_64.zip` |
+| Linux x86_64 | `video-viewer-vX.Y.Z-linux-x86_64.tar.gz` |
+| macOS Apple Silicon | `video-viewer-vX.Y.Z-macos-aarch64.tar.gz` |
+| macOS Intel | `video-viewer-vX.Y.Z-macos-x86_64.tar.gz` |
+| Windows x86_64 | `video-viewer-vX.Y.Z-windows-x86_64.zip` |
 
 Extract and run — no installation required.
 

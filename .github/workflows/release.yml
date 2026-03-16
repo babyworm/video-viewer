@@ -18,17 +18,19 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: video-viewer-linux-x86_64
+            suffix: linux-x86_64
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: video-viewer-macos-aarch64
+            suffix: macos-aarch64
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact: video-viewer-macos-x86_64
+            suffix: macos-x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: video-viewer-windows-x86_64
+            suffix: windows-x86_64
     runs-on: ${{ matrix.os }}
+    env:
+      ARTIFACT: video-viewer-${{ github.ref_name }}-${{ matrix.suffix }}
     steps:
       - uses: actions/checkout@v4
 
@@ -63,29 +65,29 @@ jobs:
         run: |
           mkdir -p dist
           cp rust/target/${{ matrix.target }}/release/video-viewer dist/
-          cd dist && tar czf ../${{ matrix.artifact }}.tar.gz video-viewer
+          cd dist && tar czf ../${{ env.ARTIFACT }}.tar.gz video-viewer
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |
           mkdir -p dist
           cp rust/target/${{ matrix.target }}/release/video-viewer dist/
-          cd dist && tar czf ../${{ matrix.artifact }}.tar.gz video-viewer
+          cd dist && tar czf ../${{ env.ARTIFACT }}.tar.gz video-viewer
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
           New-Item -ItemType Directory -Force -Path dist
           Copy-Item rust/target/${{ matrix.target }}/release/video-viewer.exe dist/
-          Compress-Archive -Path dist/video-viewer.exe -DestinationPath ${{ matrix.artifact }}.zip
+          Compress-Archive -Path dist/video-viewer.exe -DestinationPath ${{ env.ARTIFACT }}.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
+          name: ${{ env.ARTIFACT }}
           path: |
-            ${{ matrix.artifact }}.tar.gz
-            ${{ matrix.artifact }}.zip
+            ${{ env.ARTIFACT }}.tar.gz
+            ${{ env.ARTIFACT }}.zip
 
   release:
     needs: build
@@ -95,10 +97,10 @@ jobs:
         with:
           merge-multiple: true
 
-      - name: Create GitHub Release
+      - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          append_body: true
           files: |
             *.tar.gz
             *.zip
