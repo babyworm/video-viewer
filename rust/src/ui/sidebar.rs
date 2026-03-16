@@ -74,6 +74,11 @@ pub struct Sidebar {
 
     /// Shared state for the analysis viewport.
     pub analysis: Arc<Mutex<AnalysisShared>>,
+
+    /// Current grid overlay size (0 = off). Mirrors toolbar value.
+    pub grid_size: u32,
+    /// Current sub-grid overlay size (0 = off). Mirrors toolbar value.
+    pub sub_grid_size: u32,
 }
 
 impl Default for Sidebar {
@@ -89,6 +94,8 @@ impl Sidebar {
             pixel_active: false,
             show_analysis: false,
             analysis: Arc::new(Mutex::new(AnalysisShared::new())),
+            grid_size: 0,
+            sub_grid_size: 0,
         }
     }
 
@@ -153,8 +160,10 @@ impl Sidebar {
                 let cursor_bg = egui::Color32::from_rgb(220, 200, 60);
                 // Crosshair: very subtle tint
                 let cross_bg = egui::Color32::from_rgba_premultiplied(60, 60, 40, 15);
-                egui::Grid::new(grid_id)
-                    .spacing(egui::vec2(2.0, 1.0))
+                let spacing_x = 2.0_f32;
+                let spacing_y = 1.0_f32;
+                let grid_resp = egui::Grid::new(grid_id)
+                    .spacing(egui::vec2(spacing_x, spacing_y))
                     .show(ui, |ui| {
                         for (ri, row) in info.neighborhood.iter().enumerate() {
                             for (ci, cell) in row.iter().enumerate() {
@@ -196,6 +205,57 @@ impl Sidebar {
                             ui.end_row();
                         }
                     });
+
+                // Draw grid/subgrid boundary lines over the neighborhood
+                let gs = self.grid_size;
+                let sgs = self.sub_grid_size;
+                if (gs > 0 || sgs > 0) && active {
+                    let rect = grid_resp.response.rect;
+                    let painter = ui.painter();
+                    let nb: usize = 8;
+                    // Cell dimensions (uniform monospace content)
+                    let cell_w = (rect.width() - (nb - 1) as f32 * spacing_x) / nb as f32;
+                    let cell_h = (rect.height() - (nb - 1) as f32 * spacing_y) / nb as f32;
+
+                    let half = 4_i64;
+                    let px_x0 = info.x as i64 - half;
+                    let px_y0 = info.y as i64 - half;
+
+                    let grid_color = egui::Color32::from_rgb(0, 200, 0);
+                    let sub_grid_color = egui::Color32::from_rgb(200, 200, 0);
+
+                    // Vertical boundaries (between columns c and c+1)
+                    for c in 0..(nb - 1) {
+                        let pixel_next = px_x0 + c as i64 + 1;
+                        if pixel_next <= 0 { continue; }
+                        let is_grid = gs > 0 && pixel_next % gs as i64 == 0;
+                        let is_sub = sgs > 0 && pixel_next % sgs as i64 == 0;
+                        if is_grid || is_sub {
+                            let color = if is_grid { grid_color } else { sub_grid_color };
+                            let x = rect.min.x + (c as f32 + 1.0) * cell_w + (c as f32 + 0.5) * spacing_x;
+                            painter.line_segment(
+                                [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
+                                egui::Stroke::new(2.0, color),
+                            );
+                        }
+                    }
+
+                    // Horizontal boundaries (between rows r and r+1)
+                    for r in 0..(nb - 1) {
+                        let pixel_next = px_y0 + r as i64 + 1;
+                        if pixel_next <= 0 { continue; }
+                        let is_grid = gs > 0 && pixel_next % gs as i64 == 0;
+                        let is_sub = sgs > 0 && pixel_next % sgs as i64 == 0;
+                        if is_grid || is_sub {
+                            let color = if is_grid { grid_color } else { sub_grid_color };
+                            let y = rect.min.y + (r as f32 + 1.0) * cell_h + (r as f32 + 0.5) * spacing_y;
+                            painter.line_segment(
+                                [egui::pos2(rect.min.x, y), egui::pos2(rect.max.x, y)],
+                                egui::Stroke::new(2.0, color),
+                            );
+                        }
+                    }
+                }
             } else {
                 ui.label("Hover over the image to inspect pixels.");
             }

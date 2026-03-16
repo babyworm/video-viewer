@@ -6,22 +6,48 @@ Raw/YUV/RGB video viewer built with Rust + egui. Supports 75+ pixel formats for 
 
 ## Features
 
+### Pixel Formats & Decoding
 - **75+ pixel formats**: YUV (I420, NV12, NV21, YUY2, UYVY, P010, ...), RGB (RGB24, BGR24, RGB565, RGBA32, ...), Bayer (8/10/12/16-bit), Grayscale
-- **Channel separation**: View individual Y/U/V or R/G/B channels with false color display
-- **Split view**: 2x2 grid showing Full + 3 channels simultaneously (key `4`)
-- **Keyboard shortcuts**: `0`-`4` for channel switching, `Space` for play/pause, arrow keys for navigation
-- **A/B comparison**: Side-by-side, overlay, and diff modes for comparing two videos
-- **Analysis tools**: Histogram, waveform, vectorscope, PSNR, SSIM
-- **Pixel inspector**: Hover to see pixel values in all color spaces
-- **Bookmarks & scene detection**: Mark frames and auto-detect scene changes
 - **Y4M support**: Auto-detect parameters from Y4M headers (resolution, format, fps)
 - **Smart auto-detection**: Resolution guessing from file size, filename metadata extraction (resolution, format, fps patterns)
+- **BT.601 / BT.709**: Selectable YUV-RGB color matrix
+
+### Viewing & Navigation
+- **Channel separation**: View individual Y/U/V or R/G/B channels with false color display
+- **Split view**: 2x2 grid showing Full + 3 channels simultaneously (key `4`)
+- **Zoom**: Mouse wheel zoom (anchored to cursor), +/- buttons, 1:1 and 2:1 presets
+- **Pan**: Middle-click drag to pan the image
+- **Auto-fit**: Automatically fit image when window resizes
+- **Center image**: Reset pan offset (key `C`)
+
+### Pixel Inspector
+- **8x8 neighborhood grid**: Hover over the image to see a grid of surrounding pixel values with cursor highlight and crosshair
+- **Grid boundary visualization**: When grid/sub-grid overlays are active, the neighborhood grid shows colored boundary lines matching the canvas overlay (green for grid, yellow for sub-grid)
+- **Component values**: Displays Y/U/V or R/G/B values and raw hex bytes at the cursor position
+- **Magnifier**: Toggleable 8x magnifier overlay following the cursor (key `M`)
+
+### Analysis Tools
+- **Histogram**: RGB and luma intensity distribution with interactive zoom and drag
+- **Waveform**: Luma waveform monitor showing pixel value distribution by column
+- **Vectorscope**: BT.709 Cb vs Cr scatter plot centered at origin with ±128 boundary box
+- **Metrics**: PSNR, SSIM, and frame difference between consecutive frames
+- **Zoom controls**: +/- buttons and scroll zoom on all analysis plots, with Reset View
+
+### Grid Overlay
+- **Main grid**: Configurable block boundary overlay (16/32/64/128 pixels), cycled with `G`
+- **Sub-grid**: Secondary overlay (4/8/16 pixels) for finer block structure inspection
+- **Pixel inspector integration**: Grid/sub-grid boundaries are visualized in the 8x8 neighborhood display
+
+### Comparison & Export
+- **A/B comparison**: Side-by-side, overlay, and diff modes for comparing two videos
 - **Format conversion**: Convert between formats with background progress tracking
 - **Frame export**: Save frames as PNG
-- **BT.601 / BT.709**: Selectable YUV-RGB color matrix
-- **Grid overlay**: Macroblock boundary overlay with configurable sizes (16/32/64/128)
+
+### Other
+- **Bookmarks & scene detection**: Mark frames and auto-detect scene changes
+- **Test video download**: Download standard test sequences (foreman, akiyo, bus, etc.) from the derf YUV collection
+- **Keyboard shortcuts**: Comprehensive shortcuts for all operations (see table below)
 - **Dark/Light theme**: Toggle with menu
-- **Auto-fit**: Automatically fit image when window resizes
 - **Custom title bar**: Integrated menu bar as window title bar
 
 ## Installation
@@ -124,8 +150,12 @@ video-viewer input.yuv -W 1920 -H 1080 --vi I420 --vo NV12 -o output.nv12
 | `3` | Channel 3 (V/B) |
 | `4` | Split view (2x2) |
 | `F` | Fit to view |
+| `C` | Center image |
 | `G` | Cycle grid overlay (off/16/32/64/128) |
+| `M` | Toggle magnifier |
 | `B` | Toggle bookmark |
+| Scroll wheel | Zoom in/out (anchored to cursor) |
+| Middle-click drag | Pan image |
 | `Ctrl+O` | Open file |
 | `Ctrl+S` | Save frame as PNG |
 | `Ctrl+C` | Copy frame to clipboard |
@@ -201,7 +231,7 @@ rust/
 │   ├── ui/              # Canvas, toolbar, sidebar, dialogs, comparison
 │   ├── analysis/        # Histogram, waveform, vectorscope, metrics, scene
 │   └── conversion/      # Format converter, chroma resampling
-├── tests/               # Integration tests (110 tests)
+├── tests/               # Integration tests (140+ tests)
 scripts/
 └── generate_test_data.py  # Test data generator (Python)
 test_data/                 # Sample QCIF files (I420, NV12, RGB565, YUYV)

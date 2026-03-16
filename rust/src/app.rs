@@ -1328,9 +1328,11 @@ impl eframe::App for VideoViewerApp {
                     }
                     ToolbarAction::ToggleGrid => {
                         self.canvas.set_grid_size(self.toolbar.grid_size);
+                        self.sidebar.grid_size = self.toolbar.grid_size;
                     }
                     ToolbarAction::ToggleSubGrid => {
                         self.canvas.set_sub_grid_size(self.toolbar.sub_grid_size);
+                        self.sidebar.sub_grid_size = self.toolbar.sub_grid_size;
                     }
                     ToolbarAction::FitToView => {
                         let avail = ctx.available_rect().size();
