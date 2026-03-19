@@ -16,3 +16,11 @@
 
 # RTL agent team (not related to this project)
 .rtl-agent-team/
+.venv/
+.omx/
+__pycache__/
+
+# RTL agent team (not related to this project)
+.rtl-agent-team/
+.venv/
+.omx/
