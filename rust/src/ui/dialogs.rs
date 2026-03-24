@@ -1361,6 +1361,7 @@ pub fn show_about_dialog(ctx: &egui::Context) -> bool {
             ui.separator();
             ui.label("YUV/Raw Video Viewer with egui");
             ui.label("Copyright (c) babyworm (Hyun-Gyu Kim)");
+            ui.hyperlink_to("Github: /babyworm/video-viewer", "https://github.com/babyworm/video-viewer");
             ui.separator();
             ui.label("Built with egui, rayon");
         });
