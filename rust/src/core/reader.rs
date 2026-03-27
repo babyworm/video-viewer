@@ -271,6 +271,29 @@ impl VideoReader {
             }
 
             // ----------------------------------------------------------
+            // P010 / P016 / P210  (high-bit semi-planar, MSB-aligned)
+            // ----------------------------------------------------------
+            FormatType::YuvSemiPlanar
+                if matches!(self.format.fourcc.as_str(), "P010" | "P016" | "P210") =>
+            {
+                let (h_sub, v_sub) = (
+                    self.format.subsampling.0 as usize,
+                    self.format.subsampling.1 as usize,
+                );
+                Ok(colorspace::yuv_to_rgb_semi_planar_highbit(
+                    raw, w, h, (h_sub, v_sub),
+                    self.format.bit_depth, false, bt709,
+                ))
+            }
+
+            // ----------------------------------------------------------
+            // Y210  (10-bit packed 4:2:2, MSB-aligned)
+            // ----------------------------------------------------------
+            FormatType::YuvPacked if self.format.fourcc == "Y210" => {
+                Ok(colorspace::yuv_to_rgb_y210(raw, w, h, bt709))
+            }
+
+            // ----------------------------------------------------------
             // YUYV / UYVY  (4:2:2 packed)
             // ----------------------------------------------------------
             FormatType::YuvPacked
@@ -306,6 +329,29 @@ impl VideoReader {
             // ----------------------------------------------------------
             FormatType::Grey if self.format.bit_depth == 8 => {
                 Ok(colorspace::grey_to_rgb(raw, w, h))
+            }
+
+            // ----------------------------------------------------------
+            // Greyscale 10/12/16-bit (LSB-aligned in u16 LE)
+            // ----------------------------------------------------------
+            FormatType::Grey if self.format.bit_depth > 8 => {
+                Ok(colorspace::grey_highbit_to_rgb(raw, w, h, self.format.bit_depth))
+            }
+
+            // ----------------------------------------------------------
+            // YUV planar 10-bit (LSB-aligned in u16 LE)
+            // ----------------------------------------------------------
+            FormatType::YuvPlanar
+                if matches!(self.format.fourcc.as_str(), "0T20" | "2T22" | "4T44") =>
+            {
+                let (h_sub, v_sub) = (
+                    self.format.subsampling.0 as usize,
+                    self.format.subsampling.1 as usize,
+                );
+                Ok(colorspace::yuv_to_rgb_planar_highbit(
+                    raw, w, h, (h_sub, v_sub),
+                    self.format.bit_depth, bt709,
+                ))
             }
 
             // ----------------------------------------------------------
@@ -350,8 +396,50 @@ impl VideoReader {
 
         match self.format.format_type {
             FormatType::YuvPlanar => {
-                let y_size = w * h;
                 let fc = self.format.fourcc.as_str();
+                let highbit = matches!(fc, "0T20" | "2T22" | "4T44");
+
+                if highbit {
+                    // 10-bit planar: each sample is u16 LE, LSB-aligned
+                    let (h_sub, v_sub) = (
+                        self.format.subsampling.0 as usize,
+                        self.format.subsampling.1 as usize,
+                    );
+                    let bit_depth = self.format.bit_depth;
+                    let shift = bit_depth - 8;
+                    let mask = (1u16 << bit_depth) - 1;
+
+                    let y_samples = w * h;
+                    let uv_w = w / h_sub;
+                    let uv_h = h / v_sub;
+                    let uv_samples = uv_w * uv_h;
+
+                    let y_off = 0usize;
+                    let u_off = y_samples * 2;
+                    let v_off = u_off + uv_samples * 2;
+
+                    let mut y_ch = vec![0u8; y_samples];
+                    for i in 0..y_samples {
+                        let val = u16::from_le_bytes([raw[y_off + i * 2], raw[y_off + i * 2 + 1]]);
+                        y_ch[i] = ((val & mask) >> shift) as u8;
+                    }
+                    channels.insert("Y".to_string(), y_ch);
+
+                    let mut u_small = vec![0u8; uv_samples];
+                    let mut v_small = vec![0u8; uv_samples];
+                    for i in 0..uv_samples {
+                        let uval = u16::from_le_bytes([raw[u_off + i * 2], raw[u_off + i * 2 + 1]]);
+                        let vval = u16::from_le_bytes([raw[v_off + i * 2], raw[v_off + i * 2 + 1]]);
+                        u_small[i] = ((uval & mask) >> shift) as u8;
+                        v_small[i] = ((vval & mask) >> shift) as u8;
+                    }
+                    channels.insert("U".to_string(), nearest_upsample(&u_small, uv_w, uv_h, w, h));
+                    channels.insert("V".to_string(), nearest_upsample(&v_small, uv_w, uv_h, w, h));
+
+                    return channels;
+                }
+
+                let y_size = w * h;
 
                 let y = raw[..y_size].to_vec();
                 channels.insert("Y".to_string(), y);
@@ -401,36 +489,67 @@ impl VideoReader {
             }
 
             FormatType::YuvSemiPlanar => {
-                let y_size = w * h;
-                let y = raw[..y_size].to_vec();
-                channels.insert("Y".to_string(), y);
-
                 let fc = self.format.fourcc.as_str();
-                // NV12/NV21: interleaved UV after Y plane
-                if matches!(fc, "NV12" | "NV21") {
-                    let uv_len = y_size / 2;
-                    let uv_data = &raw[y_size..y_size + uv_len];
-                    let uv_w = w / 2;
-                    let uv_h = h / 2;
+                let highbit = matches!(fc, "P010" | "P016" | "P210");
+
+                if highbit {
+                    // High-bit semi-planar: Y plane is w*h u16 LE samples
+                    let y_plane_bytes = w * h * 2;
+                    let mut y = vec![0u8; w * h];
+                    for i in 0..(w * h) {
+                        let val = u16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]);
+                        y[i] = (val >> 8) as u8;
+                    }
+                    channels.insert("Y".to_string(), y);
+
+                    let (h_sub, v_sub) = (
+                        self.format.subsampling.0 as usize,
+                        self.format.subsampling.1 as usize,
+                    );
+                    let uv_w = w / h_sub;
+                    let uv_h = h / v_sub;
                     let mut u_small = vec![0u8; uv_w * uv_h];
                     let mut v_small = vec![0u8; uv_w * uv_h];
                     for i in 0..(uv_w * uv_h) {
-                        if fc == "NV12" {
-                            u_small[i] = uv_data[i * 2];
-                            v_small[i] = uv_data[i * 2 + 1];
-                        } else {
-                            v_small[i] = uv_data[i * 2];
-                            u_small[i] = uv_data[i * 2 + 1];
-                        }
+                        let base = y_plane_bytes + i * 4;
+                        let uv0 = u16::from_le_bytes([raw[base], raw[base + 1]]);
+                        let uv1 = u16::from_le_bytes([raw[base + 2], raw[base + 3]]);
+                        u_small[i] = (uv0 >> 8) as u8;
+                        v_small[i] = (uv1 >> 8) as u8;
                     }
                     channels.insert("U".to_string(), nearest_upsample(&u_small, uv_w, uv_h, w, h));
                     channels.insert("V".to_string(), nearest_upsample(&v_small, uv_w, uv_h, w, h));
                 } else {
-                    // Fallback: convert to RGB then split as YUV
-                    if let Ok(rgb) = self.convert_to_rgb(raw) {
-                        if let Some(yuv) = rgb_to_ycbcr(&rgb, w, h) {
-                            channels.insert("U".to_string(), yuv.1);
-                            channels.insert("V".to_string(), yuv.2);
+                    let y_size = w * h;
+                    let y = raw[..y_size].to_vec();
+                    channels.insert("Y".to_string(), y);
+
+                    // NV12/NV21: interleaved UV after Y plane
+                    if matches!(fc, "NV12" | "NV21") {
+                        let uv_len = y_size / 2;
+                        let uv_data = &raw[y_size..y_size + uv_len];
+                        let uv_w = w / 2;
+                        let uv_h = h / 2;
+                        let mut u_small = vec![0u8; uv_w * uv_h];
+                        let mut v_small = vec![0u8; uv_w * uv_h];
+                        for i in 0..(uv_w * uv_h) {
+                            if fc == "NV12" {
+                                u_small[i] = uv_data[i * 2];
+                                v_small[i] = uv_data[i * 2 + 1];
+                            } else {
+                                v_small[i] = uv_data[i * 2];
+                                u_small[i] = uv_data[i * 2 + 1];
+                            }
+                        }
+                        channels.insert("U".to_string(), nearest_upsample(&u_small, uv_w, uv_h, w, h));
+                        channels.insert("V".to_string(), nearest_upsample(&v_small, uv_w, uv_h, w, h));
+                    } else {
+                        // Fallback: convert to RGB then split as YUV
+                        if let Ok(rgb) = self.convert_to_rgb(raw) {
+                            if let Some(yuv) = rgb_to_ycbcr(&rgb, w, h) {
+                                channels.insert("U".to_string(), yuv.1);
+                                channels.insert("V".to_string(), yuv.2);
+                            }
                         }
                     }
                 }

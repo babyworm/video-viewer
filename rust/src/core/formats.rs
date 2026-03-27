@@ -38,6 +38,10 @@ impl VideoFormat {
                     "YU12" | "YV12" | "YM12" | "YM21" => y_size * 3 / 2,
                     "422P" | "YM16" | "YM61" => y_size * 2,
                     "Y444" | "444P" => y_size * 3,
+                    // 10-bit planar: each sample in 16-bit LE word
+                    "0T20" => y_size * 3,       // Y*2 + U*0.5 + V*0.5
+                    "2T22" => y_size * 4,       // Y*2 + U*1 + V*1
+                    "4T44" => y_size * 6,       // Y*2 + U*2 + V*2
                     "YUV9" | "YVU9" => {
                         y_size + (w / 4) * (h / 4) * 2
                     }
@@ -59,7 +63,8 @@ impl VideoFormat {
                     "NV12" | "NV21" | "NM12" | "NM21" => y_size * 3 / 2,
                     "NV16" | "NV61" => y_size * 2,
                     "NV24" | "NV42" => y_size * 3,
-                    "P010" | "P016" => y_size * 3, // 16-bit per sample
+                    "P010" | "P016" => y_size * 3, // 16-bit per sample, 4:2:0
+                    "P210" => y_size * 4,          // 16-bit per sample, 4:2:2
                     _ => y_size * 3 / 2,
                 }
             }
@@ -125,6 +130,11 @@ const FORMAT_DEFS: &[FormatEntry] = &[
     FormatEntry { name: "VUYA (4:4:4)", format_type: FormatType::YuvPacked, fourcc: "VUYA", bit_depth: 8, subsampling: (1, 1), bpp: 0, planes: 1, v4l2_name: "V4L2_PIX_FMT_VUYA32" },
     FormatEntry { name: "Y210 (10-bit 4:2:2)", format_type: FormatType::YuvPacked, fourcc: "Y210", bit_depth: 10, subsampling: (2, 1), bpp: 0, planes: 1, v4l2_name: "V4L2_PIX_FMT_Y210" },
 
+    // --- Planar YUV (10-bit, 16-bit LE samples, LSB-aligned) ---
+    FormatEntry { name: "YUV420P10LE (10-bit 4:2:0)", format_type: FormatType::YuvPlanar, fourcc: "0T20", bit_depth: 10, subsampling: (2, 2), bpp: 0, planes: 1, v4l2_name: "" },
+    FormatEntry { name: "YUV422P10LE (10-bit 4:2:2)", format_type: FormatType::YuvPlanar, fourcc: "2T22", bit_depth: 10, subsampling: (2, 1), bpp: 0, planes: 1, v4l2_name: "" },
+    FormatEntry { name: "YUV444P10LE (10-bit 4:4:4)", format_type: FormatType::YuvPlanar, fourcc: "4T44", bit_depth: 10, subsampling: (1, 1), bpp: 0, planes: 1, v4l2_name: "" },
+
     // --- Planar YUV ---
     FormatEntry { name: "I420 (4:2:0)", format_type: FormatType::YuvPlanar, fourcc: "YU12", bit_depth: 8, subsampling: (2, 2), bpp: 0, planes: 1, v4l2_name: "V4L2_PIX_FMT_YUV420" },
     FormatEntry { name: "YV12 (4:2:0)", format_type: FormatType::YuvPlanar, fourcc: "YV12", bit_depth: 8, subsampling: (2, 2), bpp: 0, planes: 1, v4l2_name: "V4L2_PIX_FMT_YVU420" },
@@ -145,6 +155,7 @@ const FORMAT_DEFS: &[FormatEntry] = &[
     FormatEntry { name: "NV42 (4:4:4)", format_type: FormatType::YuvSemiPlanar, fourcc: "NV42", bit_depth: 8, subsampling: (1, 1), bpp: 0, planes: 1, v4l2_name: "V4L2_PIX_FMT_NV42" },
     FormatEntry { name: "P010 (10-bit NV12)", format_type: FormatType::YuvSemiPlanar, fourcc: "P010", bit_depth: 10, subsampling: (2, 2), bpp: 0, planes: 1, v4l2_name: "V4L2_PIX_FMT_P010" },
     FormatEntry { name: "P016 (16-bit NV12)", format_type: FormatType::YuvSemiPlanar, fourcc: "P016", bit_depth: 16, subsampling: (2, 2), bpp: 0, planes: 1, v4l2_name: "V4L2_PIX_FMT_P016" },
+    FormatEntry { name: "P210 (10-bit NV16)", format_type: FormatType::YuvSemiPlanar, fourcc: "P210", bit_depth: 10, subsampling: (2, 1), bpp: 0, planes: 1, v4l2_name: "" },
     FormatEntry { name: "NV12M (4:2:0 Multi)", format_type: FormatType::YuvSemiPlanar, fourcc: "NM12", bit_depth: 8, subsampling: (2, 2), bpp: 0, planes: 2, v4l2_name: "V4L2_PIX_FMT_NV12M" },
     FormatEntry { name: "NV21M (4:2:0 Multi)", format_type: FormatType::YuvSemiPlanar, fourcc: "NM21", bit_depth: 8, subsampling: (2, 2), bpp: 0, planes: 2, v4l2_name: "V4L2_PIX_FMT_NV21M" },
 

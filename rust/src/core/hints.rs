@@ -61,6 +61,17 @@ fn format_aliases() -> &'static HashMap<&'static str, &'static str> {
         m.insert("bgr",     "BGR24");
         m.insert("grey",    "Greyscale (8-bit)");
         m.insert("gray",    "Greyscale (8-bit)");
+        // 10-bit formats
+        m.insert("yuv420p10le", "YUV420P10LE");
+        m.insert("yuv420p10",   "YUV420P10LE");
+        m.insert("yuv422p10le", "YUV422P10LE");
+        m.insert("yuv422p10",   "YUV422P10LE");
+        m.insert("yuv444p10le", "YUV444P10LE");
+        m.insert("yuv444p10",   "YUV444P10LE");
+        m.insert("p010",        "P010");
+        m.insert("p016",        "P016");
+        m.insert("p210",        "P210");
+        m.insert("y210",        "Y210");
         m
     })
 }

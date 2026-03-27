@@ -18,12 +18,20 @@ impl Y4mHeader {
     }
 
     /// Map Y4M colorspace token to a display format name.
+    ///
+    /// Y4M colorspace tokens: "420", "420p10", "420p12", "422", "422p10", "444", "444p10", etc.
     pub fn to_format_name(&self) -> &str {
-        match self.colorspace.as_str() {
-            cs if cs.starts_with("420") => "I420",
-            cs if cs.starts_with("422") => "YUV422P",
-            cs if cs.starts_with("444") => "YUV444P",
-            cs if cs.starts_with("mono") => "Greyscale (8-bit)",
+        let cs = self.colorspace.as_str();
+        match cs {
+            // 10-bit variants (e.g. "420p10", "420mpeg2p10")
+            _ if cs.contains("420") && cs.contains("p10") => "YUV420P10LE",
+            _ if cs.contains("422") && cs.contains("p10") => "YUV422P10LE",
+            _ if cs.contains("444") && cs.contains("p10") => "YUV444P10LE",
+            // 8-bit variants
+            _ if cs.starts_with("420") => "I420",
+            _ if cs.starts_with("422") => "YUV422P",
+            _ if cs.starts_with("444") => "YUV444P",
+            _ if cs.starts_with("mono") => "Greyscale (8-bit)",
             _ => "I420",
         }
     }

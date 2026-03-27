@@ -34,20 +34,76 @@ fn pixel_first_byte_hex(
     }
     let idx = (py as usize) * (width as usize) + (px as usize);
     match format.format_type {
-        FormatType::YuvPlanar | FormatType::YuvSemiPlanar | FormatType::Grey => {
-            if idx < data.len() {
+        FormatType::YuvPlanar => {
+            if format.bit_depth > 8 {
+                // 10-bit planar: Y samples are u16 LE
+                let offset = idx * 2;
+                if offset + 1 < data.len() {
+                    let val = u16::from_le_bytes([data[offset], data[offset + 1]]);
+                    let shifted = ((val & 0x3FF) >> 2) as u8;
+                    format!("{:02X}", shifted)
+                } else {
+                    "--".to_string()
+                }
+            } else if idx < data.len() {
+                format!("{:02X}", data[idx])
+            } else {
+                "--".to_string()
+            }
+        }
+        FormatType::YuvSemiPlanar => {
+            if format.bit_depth > 8 {
+                // P010/P210: Y samples are u16 LE, MSB-aligned
+                let offset = idx * 2;
+                if offset + 1 < data.len() {
+                    let val = u16::from_le_bytes([data[offset], data[offset + 1]]);
+                    format!("{:02X}", (val >> 8) as u8)
+                } else {
+                    "--".to_string()
+                }
+            } else if idx < data.len() {
+                format!("{:02X}", data[idx])
+            } else {
+                "--".to_string()
+            }
+        }
+        FormatType::Grey => {
+            if format.bit_depth > 8 {
+                let offset = idx * 2;
+                if offset + 1 < data.len() {
+                    let val = u16::from_le_bytes([data[offset], data[offset + 1]]);
+                    let shifted = (val >> (format.bit_depth - 8)) as u8;
+                    format!("{:02X}", shifted)
+                } else {
+                    "--".to_string()
+                }
+            } else if idx < data.len() {
                 format!("{:02X}", data[idx])
             } else {
                 "--".to_string()
             }
         }
         FormatType::YuvPacked => {
-            // 2 bytes per pixel; first byte is Y (or U for UYVY)
-            let offset = idx * 2;
-            if offset < data.len() {
-                format!("{:02X}", data[offset])
+            if format.bit_depth > 8 {
+                // Y210: 8 bytes per pixel pair, Y samples at u16 offsets 0 and 4
+                let pair_idx = px as usize / 2;
+                let is_odd = (px % 2) == 1;
+                let base = (py as usize * (width as usize) / 2 + pair_idx) * 8;
+                let y_off = if is_odd { base + 4 } else { base };
+                if y_off + 1 < data.len() {
+                    let val = u16::from_le_bytes([data[y_off], data[y_off + 1]]);
+                    format!("{:02X}", (val >> 8) as u8)
+                } else {
+                    "--".to_string()
+                }
             } else {
-                "--".to_string()
+                // 2 bytes per pixel; first byte is Y (or U for UYVY)
+                let offset = idx * 2;
+                if offset < data.len() {
+                    format!("{:02X}", data[offset])
+                } else {
+                    "--".to_string()
+                }
             }
         }
         FormatType::Rgb => {
@@ -88,28 +144,56 @@ fn raw_hex_at(data: &[u8], width: u32, height: u32, format: &VideoFormat, x: u32
 
     let bytes: Vec<u8> = match format.format_type {
         FormatType::YuvPlanar => {
-            // Return Y byte only (planar chroma lives at different offsets)
-            if idx < data.len() {
+            if format.bit_depth > 8 {
+                // 10-bit planar: Y sample is u16 LE
+                let offset = idx * 2;
+                if offset + 1 < data.len() {
+                    vec![data[offset], data[offset + 1]]
+                } else {
+                    vec![]
+                }
+            } else if idx < data.len() {
                 vec![data[idx]]
             } else {
                 vec![]
             }
         }
         FormatType::YuvSemiPlanar => {
-            if idx < data.len() {
+            if format.bit_depth > 8 {
+                let offset = idx * 2;
+                if offset + 1 < data.len() {
+                    vec![data[offset], data[offset + 1]]
+                } else {
+                    vec![]
+                }
+            } else if idx < data.len() {
                 vec![data[idx]]
             } else {
                 vec![]
             }
         }
         FormatType::YuvPacked => {
-            let offset = idx * 2;
-            if offset + 1 < data.len() {
-                vec![data[offset], data[offset + 1]]
-            } else if offset < data.len() {
-                vec![data[offset]]
+            if format.bit_depth > 8 {
+                // Y210: 8 bytes per pixel pair
+                let pair_idx = (x as usize) / 2;
+                let base = ((y as usize) * (width as usize) / 2 + pair_idx) * 8;
+                if base + 7 < data.len() {
+                    // Show all 4 u16 values for the pair
+                    let is_odd = (x % 2) == 1;
+                    let y_off = if is_odd { base + 4 } else { base };
+                    vec![data[y_off], data[y_off + 1], data[base + 2], data[base + 3], data[base + 6], data[base + 7]]
+                } else {
+                    vec![]
+                }
             } else {
-                vec![]
+                let offset = idx * 2;
+                if offset + 1 < data.len() {
+                    vec![data[offset], data[offset + 1]]
+                } else if offset < data.len() {
+                    vec![data[offset]]
+                } else {
+                    vec![]
+                }
             }
         }
         FormatType::Rgb => {
@@ -161,103 +245,178 @@ fn extract_components(
 
     match format.format_type {
         FormatType::YuvPlanar => {
-            let y_idx = py * w + px;
-            if y_idx >= data.len() {
-                return components;
-            }
-            components.insert("Y".to_string(), data[y_idx] as u16);
+            if format.bit_depth > 8 {
+                // 10-bit planar: each sample is u16 LE, LSB-aligned
+                let (sx, sy) = (format.subsampling.0 as usize, format.subsampling.1 as usize);
+                let y_samples = w * h;
+                let uv_w = w / sx;
+                let uv_samples = uv_w * (h / sy);
 
-            let (sx, sy) = (format.subsampling.0 as usize, format.subsampling.1 as usize);
-            let c_w = w / sx;
-            let c_x = px / sx;
-            let c_y = py / sy;
-            let c_idx = c_y * c_w + c_x;
-            let uv_size = c_w * (h / sy);
+                let y_byte = (py * w + px) * 2;
+                if y_byte + 1 < data.len() {
+                    let val = u16::from_le_bytes([data[y_byte], data[y_byte + 1]]);
+                    components.insert("Y".to_string(), val & 0x3FF);
+                }
 
-            match format.fourcc.as_str() {
-                "YU12" | "422P" => {
-                    let u_idx = y_size + c_idx;
-                    let v_idx = y_size + uv_size + c_idx;
-                    if u_idx < data.len() {
-                        components.insert("U".to_string(), data[u_idx] as u16);
-                    }
-                    if v_idx < data.len() {
-                        components.insert("V".to_string(), data[v_idx] as u16);
-                    }
+                let c_x = px / sx;
+                let c_y = py / sy;
+                let c_idx = c_y * uv_w + c_x;
+                let u_byte = y_samples * 2 + c_idx * 2;
+                let v_byte = y_samples * 2 + uv_samples * 2 + c_idx * 2;
+                if u_byte + 1 < data.len() {
+                    let val = u16::from_le_bytes([data[u_byte], data[u_byte + 1]]);
+                    components.insert("U".to_string(), val & 0x3FF);
                 }
-                "YV12" => {
-                    let v_idx = y_size + c_idx;
-                    let u_idx = y_size + uv_size + c_idx;
-                    if v_idx < data.len() {
-                        components.insert("V".to_string(), data[v_idx] as u16);
-                    }
-                    if u_idx < data.len() {
-                        components.insert("U".to_string(), data[u_idx] as u16);
-                    }
+                if v_byte + 1 < data.len() {
+                    let val = u16::from_le_bytes([data[v_byte], data[v_byte + 1]]);
+                    components.insert("V".to_string(), val & 0x3FF);
                 }
-                "444P" | "Y444" => {
-                    let u_idx = y_size + py * w + px;
-                    let v_idx = y_size * 2 + py * w + px;
-                    if u_idx < data.len() {
-                        components.insert("U".to_string(), data[u_idx] as u16);
-                    }
-                    if v_idx < data.len() {
-                        components.insert("V".to_string(), data[v_idx] as u16);
-                    }
+            } else {
+                let y_idx = py * w + px;
+                if y_idx >= data.len() {
+                    return components;
                 }
-                _ => {
-                    // Generic planar: U then V
-                    let u_idx = y_size + c_idx;
-                    let v_idx = y_size + uv_size + c_idx;
-                    if u_idx < data.len() {
-                        components.insert("U".to_string(), data[u_idx] as u16);
+                components.insert("Y".to_string(), data[y_idx] as u16);
+
+                let (sx, sy) = (format.subsampling.0 as usize, format.subsampling.1 as usize);
+                let c_w = w / sx;
+                let c_x = px / sx;
+                let c_y = py / sy;
+                let c_idx = c_y * c_w + c_x;
+                let uv_size = c_w * (h / sy);
+
+                match format.fourcc.as_str() {
+                    "YU12" | "422P" => {
+                        let u_idx = y_size + c_idx;
+                        let v_idx = y_size + uv_size + c_idx;
+                        if u_idx < data.len() {
+                            components.insert("U".to_string(), data[u_idx] as u16);
+                        }
+                        if v_idx < data.len() {
+                            components.insert("V".to_string(), data[v_idx] as u16);
+                        }
                     }
-                    if v_idx < data.len() {
-                        components.insert("V".to_string(), data[v_idx] as u16);
+                    "YV12" => {
+                        let v_idx = y_size + c_idx;
+                        let u_idx = y_size + uv_size + c_idx;
+                        if v_idx < data.len() {
+                            components.insert("V".to_string(), data[v_idx] as u16);
+                        }
+                        if u_idx < data.len() {
+                            components.insert("U".to_string(), data[u_idx] as u16);
+                        }
+                    }
+                    "444P" | "Y444" => {
+                        let u_idx = y_size + py * w + px;
+                        let v_idx = y_size * 2 + py * w + px;
+                        if u_idx < data.len() {
+                            components.insert("U".to_string(), data[u_idx] as u16);
+                        }
+                        if v_idx < data.len() {
+                            components.insert("V".to_string(), data[v_idx] as u16);
+                        }
+                    }
+                    _ => {
+                        // Generic planar: U then V
+                        let u_idx = y_size + c_idx;
+                        let v_idx = y_size + uv_size + c_idx;
+                        if u_idx < data.len() {
+                            components.insert("U".to_string(), data[u_idx] as u16);
+                        }
+                        if v_idx < data.len() {
+                            components.insert("V".to_string(), data[v_idx] as u16);
+                        }
                     }
                 }
             }
         }
 
         FormatType::YuvSemiPlanar => {
-            let y_idx = py * w + px;
-            if y_idx >= data.len() {
-                return components;
-            }
-            components.insert("Y".to_string(), data[y_idx] as u16);
-
-            let (sx, sy) = (format.subsampling.0 as usize, format.subsampling.1 as usize);
-            let c_w = w / sx;
-            let c_x = px / sx;
-            let c_y = py / sy;
-            let uv_idx = (c_y * c_w + c_x) * 2;
-
-            match format.fourcc.as_str() {
-                "NV12" | "NV16" | "NM12" => {
-                    let u_pos = y_size + uv_idx;
-                    let v_pos = y_size + uv_idx + 1;
-                    if u_pos < data.len() {
-                        components.insert("U".to_string(), data[u_pos] as u16);
-                    }
-                    if v_pos < data.len() {
-                        components.insert("V".to_string(), data[v_pos] as u16);
-                    }
+            let fc = format.fourcc.as_str();
+            if format.bit_depth > 8 {
+                // P010/P016/P210: Y is u16 LE MSB-aligned, UV interleaved u16 LE pairs
+                let y_byte = (py * w + px) * 2;
+                if y_byte + 1 < data.len() {
+                    let val = u16::from_le_bytes([data[y_byte], data[y_byte + 1]]);
+                    // Report the full N-bit value (MSB-aligned: shift right by 16-N)
+                    let shift = 16 - format.bit_depth;
+                    components.insert("Y".to_string(), val >> shift);
                 }
-                _ => {
-                    // NV21, NV61, NM21 — V then U
-                    let v_pos = y_size + uv_idx;
-                    let u_pos = y_size + uv_idx + 1;
-                    if v_pos < data.len() {
-                        components.insert("V".to_string(), data[v_pos] as u16);
+
+                let y_plane_bytes = w * h * 2;
+                let (sx, sy) = (format.subsampling.0 as usize, format.subsampling.1 as usize);
+                let uv_w = w / sx;
+                let c_x = px / sx;
+                let c_y = py / sy;
+                let uv_base = y_plane_bytes + (c_y * uv_w + c_x) * 4;
+                let shift = 16 - format.bit_depth;
+                if uv_base + 3 < data.len() {
+                    let u_val = u16::from_le_bytes([data[uv_base], data[uv_base + 1]]);
+                    let v_val = u16::from_le_bytes([data[uv_base + 2], data[uv_base + 3]]);
+                    components.insert("U".to_string(), u_val >> shift);
+                    components.insert("V".to_string(), v_val >> shift);
+                }
+            } else {
+                let y_idx = py * w + px;
+                if y_idx >= data.len() {
+                    return components;
+                }
+                components.insert("Y".to_string(), data[y_idx] as u16);
+
+                let (sx, sy) = (format.subsampling.0 as usize, format.subsampling.1 as usize);
+                let c_w = w / sx;
+                let c_x = px / sx;
+                let c_y = py / sy;
+                let uv_idx = (c_y * c_w + c_x) * 2;
+
+                match fc {
+                    "NV12" | "NV16" | "NM12" => {
+                        let u_pos = y_size + uv_idx;
+                        let v_pos = y_size + uv_idx + 1;
+                        if u_pos < data.len() {
+                            components.insert("U".to_string(), data[u_pos] as u16);
+                        }
+                        if v_pos < data.len() {
+                            components.insert("V".to_string(), data[v_pos] as u16);
+                        }
                     }
-                    if u_pos < data.len() {
-                        components.insert("U".to_string(), data[u_pos] as u16);
+                    _ => {
+                        // NV21, NV61, NM21 — V then U
+                        let v_pos = y_size + uv_idx;
+                        let u_pos = y_size + uv_idx + 1;
+                        if v_pos < data.len() {
+                            components.insert("V".to_string(), data[v_pos] as u16);
+                        }
+                        if u_pos < data.len() {
+                            components.insert("U".to_string(), data[u_pos] as u16);
+                        }
                     }
                 }
             }
         }
 
         FormatType::YuvPacked => {
+            if format.bit_depth > 8 && format.fourcc == "Y210" {
+                // Y210: [Y0:u16, Cb:u16, Y1:u16, Cr:u16] per pixel pair, MSB-aligned
+                let pair_idx = px / 2;
+                let base = (py * w / 2 + pair_idx) * 8;
+                let is_odd = (px % 2) == 1;
+                let y_off = if is_odd { base + 4 } else { base };
+                if y_off + 1 < data.len() {
+                    let val = u16::from_le_bytes([data[y_off], data[y_off + 1]]);
+                    components.insert("Y".to_string(), val >> 6);
+                }
+                if base + 3 < data.len() {
+                    let val = u16::from_le_bytes([data[base + 2], data[base + 3]]);
+                    components.insert("U".to_string(), val >> 6);
+                }
+                if base + 7 < data.len() {
+                    let val = u16::from_le_bytes([data[base + 6], data[base + 7]]);
+                    components.insert("V".to_string(), val >> 6);
+                }
+                return components;
+            }
+
             // YUYV layout: [Y0 U0 Y1 V0] per pair of pixels
             let pair_idx = px / 2;
             let offset = (py * w + pair_idx * 2) * 2; // 4 bytes per pixel pair
