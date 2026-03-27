@@ -823,6 +823,7 @@ impl VideoViewerApp {
         self.sideband_file = Some(file);
         self.sideband_path = Some(path.to_string());
         self.sideband_overlay_mode = SidebandOverlayMode::QpDelta; // auto-enable
+        self.status_error = None; // clear any prior error
         Ok(())
     }
 

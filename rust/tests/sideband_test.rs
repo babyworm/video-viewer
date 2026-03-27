@@ -5,11 +5,13 @@ use video_viewer::core::sideband::SidebandFile;
 // ---------------------------------------------------------------------------
 
 /// Build a sideband binary header for a given CTU count.
+/// Uses extended header for num_ctus >= 255 to match parser semantics
+/// (parser treats byte 0xFF as extended header escape).
 fn write_header(buf: &mut Vec<u8>, num_ctus: usize) {
     buf.push(b'I');
     buf.push(b'P');
     buf.push(0x00); // version
-    if num_ctus <= 255 {
+    if num_ctus < 255 {
         buf.push(num_ctus as u8);
     } else {
         buf.push(0xFF);
