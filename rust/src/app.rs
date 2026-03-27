@@ -96,6 +96,7 @@ pub struct VideoViewerApp {
     pub sideband_opacity: f32,
     pub sideband_show_values: bool,
     sideband_panel: crate::analysis::isp_sideband::SidebandPanel,
+    sideband_dialog: Option<dialogs::SidebandFileDialog>,
 }
 
 impl VideoViewerApp {
@@ -174,6 +175,7 @@ impl VideoViewerApp {
             sideband_opacity: 0.5,
             sideband_show_values: false,
             sideband_panel: crate::analysis::isp_sideband::SidebandPanel::new(),
+            sideband_dialog: None,
         }
     }
 
@@ -1534,24 +1536,11 @@ impl eframe::App for VideoViewerApp {
         if let Some(action) = sb_action {
             match action {
                 crate::analysis::isp_sideband::SidebandAction::LoadRequested => {
-                    // Use a simple file path input via the native file dialog pattern.
-                    // For now, try loading "sideband.bin" from the same directory as the video.
-                    let candidate = self.current_file.as_ref().and_then(|p| {
-                        std::path::Path::new(p).parent().map(|dir| {
-                            dir.join("sideband.bin").to_string_lossy().to_string()
-                        })
-                    });
-                    if let Some(path) = candidate {
-                        if std::path::Path::new(&path).exists() {
-                            if let Err(e) = self.load_sideband(&path) {
-                                self.status_error = Some(format!("Sideband load error: {}", e));
-                            }
-                        } else {
-                            self.status_error = Some("No sideband.bin found next to video file. Place sideband.bin in the same directory.".to_string());
-                        }
-                    } else {
-                        self.status_error = Some("Open a video file first, then load sideband.".to_string());
-                    }
+                    let initial_dir = self.current_file.as_ref()
+                        .and_then(|f| std::path::Path::new(f).parent())
+                        .and_then(|p| p.to_str());
+                    self.sideband_dialog = Some(dialogs::SidebandFileDialog::new(initial_dir));
+                    self.dialog_state = dialogs::DialogState::SidebandFile;
                 }
                 crate::analysis::isp_sideband::SidebandAction::Unload => {
                     self.unload_sideband();
@@ -1695,6 +1684,21 @@ impl VideoViewerApp {
                     }
                     self.dialog_state = DialogState::None;
                     self.params_dialog = None;
+                }
+            }
+        }
+
+        // Sideband file dialog
+        if self.dialog_state == DialogState::SidebandFile {
+            if let Some(ref mut dlg) = self.sideband_dialog {
+                if let Some(result) = dlg.show(ctx) {
+                    if let Some(path) = result {
+                        if let Err(e) = self.load_sideband(&path) {
+                            self.status_error = Some(format!("Sideband load error: {}", e));
+                        }
+                    }
+                    self.dialog_state = DialogState::None;
+                    self.sideband_dialog = None;
                 }
             }
         }

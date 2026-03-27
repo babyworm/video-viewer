@@ -44,7 +44,7 @@ impl SidebandPanel {
                 return Some(SidebandAction::Unload);
             }
         } else {
-            if ui.button("Auto-load sideband.bin").clicked() {
+            if ui.button("Load sideband file...").clicked() {
                 return Some(SidebandAction::LoadRequested);
             }
             ui.label("No sideband file loaded");
