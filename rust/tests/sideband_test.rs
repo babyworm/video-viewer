@@ -331,3 +331,54 @@ fn test_1080p_ctu_count() {
     let sb = SidebandFile::from_bytes(&bin).unwrap();
     assert_eq!(sb.frame(0).unwrap().num_ctus(), 510);
 }
+
+#[test]
+fn test_truncated_extended_header() {
+    // 0xFF marker but missing the 2-byte extended count
+    let data = [b'I', b'P', 0x00, 0xFF, 0x01]; // only 1 byte after 0xFF, need 2
+    let err = SidebandFile::from_bytes(&data).unwrap_err();
+    assert!(
+        err.contains("truncated"),
+        "expected truncated error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_trailing_bytes_after_valid_frame() {
+    // Valid frame followed by garbage that doesn't form a valid header
+    let mut buf = build_neutral_frame(0, 1);
+    buf.extend_from_slice(&[0xDE, 0xAD]); // trailing garbage, not "IP"
+    let err = SidebandFile::from_bytes(&buf).unwrap_err();
+    assert!(
+        err.contains("invalid magic") || err.contains("truncated"),
+        "expected parse error on trailing bytes, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_multi_frame_different_ctu_counts() {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&build_neutral_frame(0, 4));
+    buf.extend_from_slice(&build_neutral_frame(1, 510)); // 1080p
+    buf.extend_from_slice(&build_neutral_frame(2, 0));   // empty CTU frame
+
+    let sb = SidebandFile::from_bytes(&buf).unwrap();
+    assert_eq!(sb.num_frames(), 3);
+    assert_eq!(sb.frame(0).unwrap().num_ctus(), 4);
+    assert_eq!(sb.frame(1).unwrap().num_ctus(), 510);
+    assert_eq!(sb.frame(2).unwrap().num_ctus(), 0);
+}
+
+#[test]
+fn test_unsupported_version() {
+    // Version > 0 should be rejected
+    let data = [b'I', b'P', 0x01, 0x00]; // version=1
+    let err = SidebandFile::from_bytes(&data).unwrap_err();
+    assert!(
+        err.contains("unsupported sideband version"),
+        "expected version error, got: {}",
+        err
+    );
+}

@@ -17,7 +17,11 @@ pub struct SidebandOverlayParams<'a> {
 
 /// Draw the sideband CTU overlay on top of the image.
 pub fn draw_sideband_overlay(params: &SidebandOverlayParams) {
-    if params.mode == SidebandOverlayMode::None {
+    if params.mode == SidebandOverlayMode::None
+        || params.ctu_size == 0
+        || params.image_width == 0
+        || params.image_height == 0
+    {
         return;
     }
 

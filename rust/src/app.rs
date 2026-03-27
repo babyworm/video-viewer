@@ -204,6 +204,8 @@ impl VideoViewerApp {
                 self.reader = Some(reader);
                 self.is_playing = false;
                 self.last_frame_time = None;
+                // Clear sideband overlay from previous file.
+                self.unload_sideband();
                 // Clear stale frame data to prevent cross-file metrics.
                 self.prev_rgb = None;
                 self.current_rgb = None;
