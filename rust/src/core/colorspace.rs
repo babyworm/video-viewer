@@ -388,7 +388,7 @@ pub fn yuv_to_rgb_nv15_nv20(
     bt709: bool,
 ) -> Vec<u8> {
     let (h_sub, v_sub) = subsampling;
-    let y_plane_bytes = (w * h * 10 + 7) / 8; // = w*h*5/4
+    let y_plane_bytes = (w * h * 10).div_ceil(8); // = w*h*5/4
     let uv_w = w / h_sub;
     let uv_h = h / v_sub;
     // UV plane: interleaved U,V → total uv_w*2 samples per row (treated as linear)
@@ -466,8 +466,8 @@ pub fn grey_10bpack_to_rgb(raw: &[u8], w: usize, h: usize) -> Vec<u8> {
     let mut rgb = vec![0u8; count * 3];
     for g in 0..groups {
         let samples = unpack_10bit_be_4samples(raw, g * 5);
-        for k in 0..4 {
-            let v = (samples[k] >> 2) as u8;
+        for (k, &s) in samples.iter().enumerate() {
+            let v = (s >> 2) as u8;
             let o = (g * 4 + k) * 3;
             rgb[o] = v;
             rgb[o + 1] = v;
