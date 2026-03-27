@@ -9,11 +9,11 @@ use std::io::Write;
 fn make_i420_frame(y_val: u8, u_val: u8, v_val: u8) -> Vec<u8> {
     let mut frame = Vec::with_capacity(24);
     // Y plane: 4x4
-    frame.extend(std::iter::repeat(y_val).take(16));
+    frame.extend(std::iter::repeat_n(y_val, 16));
     // U plane: 2x2
-    frame.extend(std::iter::repeat(u_val).take(4));
+    frame.extend(std::iter::repeat_n(u_val, 4));
     // V plane: 2x2
-    frame.extend(std::iter::repeat(v_val).take(4));
+    frame.extend(std::iter::repeat_n(v_val, 4));
     frame
 }
 

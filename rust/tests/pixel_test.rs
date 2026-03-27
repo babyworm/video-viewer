@@ -226,8 +226,8 @@ fn test_neighborhood_8x8_center() {
     let uv_size = (w / 2 * h / 2) as usize;
     let mut data = vec![0u8; y_size + uv_size * 2];
     // Fill Y plane with sequential values
-    for i in 0..y_size {
-        data[i] = (i % 256) as u8;
+    for (i, d) in data.iter_mut().enumerate().take(y_size) {
+        *d = (i % 256) as u8;
     }
 
     let fmt = get_format_by_fourcc("YU12").expect("YU12 format not found");

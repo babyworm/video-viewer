@@ -1,60 +1,63 @@
 use egui::{Color32, Painter, Pos2, Rect};
 use crate::core::sideband::{SidebandCtu, SidebandFrame, SidebandOverlayMode};
 
+/// Parameters for drawing sideband CTU overlay.
+pub struct SidebandOverlayParams<'a> {
+    pub painter: &'a Painter,
+    pub image_rect: Rect,
+    pub frame: &'a SidebandFrame,
+    pub mode: SidebandOverlayMode,
+    pub opacity: f32,
+    pub show_values: bool,
+    pub image_width: u32,
+    pub image_height: u32,
+    pub ctu_size: u32,
+    pub zoom: f32,
+}
+
 /// Draw the sideband CTU overlay on top of the image.
-pub fn draw_sideband_overlay(
-    painter: &Painter,
-    image_rect: Rect,
-    frame: &SidebandFrame,
-    mode: SidebandOverlayMode,
-    opacity: f32,
-    show_values: bool,
-    image_width: u32,
-    image_height: u32,
-    ctu_size: u32,
-    zoom: f32,
-    offset: Pos2, // pan offset
-) {
-    if mode == SidebandOverlayMode::None {
+pub fn draw_sideband_overlay(params: &SidebandOverlayParams) {
+    if params.mode == SidebandOverlayMode::None {
         return;
     }
 
-    let ctu_cols = (image_width + ctu_size - 1) / ctu_size;
-    let _ctu_rows = (image_height + ctu_size - 1) / ctu_size;
-    let alpha = (opacity * 180.0) as u8; // max ~70% alpha
+    let ctu_cols = params.image_width.div_ceil(params.ctu_size);
+    let ctu_rows = params.image_height.div_ceil(params.ctu_size);
+    let max_ctus = (ctu_cols * ctu_rows) as usize;
+    let alpha = (params.opacity * 180.0) as u8; // max ~70% alpha
 
-    for (idx, ctu) in frame.ctus.iter().enumerate() {
+    for (idx, ctu) in params.frame.ctus.iter().take(max_ctus).enumerate() {
         let col = idx as u32 % ctu_cols;
         let row = idx as u32 / ctu_cols;
 
-        let x0 = image_rect.left() + col as f32 * ctu_size as f32 * zoom + offset.x;
-        let y0 = image_rect.top() + row as f32 * ctu_size as f32 * zoom + offset.y;
-        let x1 = x0 + ctu_size as f32 * zoom;
-        let y1 = y0 + ctu_size as f32 * zoom;
+        let x0 = params.image_rect.left() + col as f32 * params.ctu_size as f32 * params.zoom;
+        let y0 = params.image_rect.top() + row as f32 * params.ctu_size as f32 * params.zoom;
+        let x1 = x0 + params.ctu_size as f32 * params.zoom;
+        let y1 = y0 + params.ctu_size as f32 * params.zoom;
 
         let ctu_rect = Rect::from_min_max(
             Pos2::new(x0, y0),
-            Pos2::new(x1.min(image_rect.right()), y1.min(image_rect.bottom())),
+            Pos2::new(x1.min(params.image_rect.right()), y1.min(params.image_rect.bottom())),
         );
 
         // Clip to image area
-        if !image_rect.intersects(ctu_rect) {
+        if !params.image_rect.intersects(ctu_rect) {
             continue;
         }
 
-        let (value, color) = get_ctu_color(ctu, mode);
+        let (value, color) = get_ctu_color(ctu, params.mode);
         let fill = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha);
-        painter.rect_filled(ctu_rect, 0.0, fill);
+        params.painter.rect_filled(ctu_rect, 0.0, fill);
 
         // Show value label when zoomed in enough
-        if show_values && zoom >= 2.0 {
-            let label = format_value(value, mode);
+        if params.show_values && params.zoom >= 2.0 {
+            let label = format_value(value, params.mode);
             let center = ctu_rect.center();
-            painter.text(
+            params.painter.text(
                 center,
                 egui::Align2::CENTER_CENTER,
                 label,
-                egui::FontId::proportional(10.0 * zoom.min(4.0)),
+                egui::FontId::proportional(10.0 * params.zoom.min(4.0)),
                 Color32::WHITE,
             );
         }
@@ -135,6 +138,6 @@ fn format_value(value: f64, mode: SidebandOverlayMode) -> String {
                 format!("{}", value as i8)
             }
         }
-        _ => format!("{}", value as i64),
+        _ => format!("{}", value.round() as i64),
     }
 }

@@ -1,7 +1,7 @@
-/// Sideband binary parser for ISP parameter overlay.
-///
-/// Reads the binary format produced by `isp_emulator` (IspParam.h compatible).
-/// Self-contained: no external dependencies beyond `std`.
+//! Sideband binary parser for ISP parameter overlay.
+//!
+//! Reads the binary format produced by `isp_emulator` (IspParam.h compatible).
+//! Self-contained: no external dependencies beyond `std`.
 
 use std::fmt;
 
@@ -184,48 +184,30 @@ fn parse_one_frame(data: &[u8], offset: usize) -> Result<(SidebandFrame, usize),
         ));
     }
 
-    let _version = data[offset + 2];
+    let version = data[offset + 2];
+    if version > 0 {
+        return Err(format!(
+            "unsupported sideband version {} at offset {}",
+            version, offset
+        ));
+    }
 
-    // CTU count: handle 0xFF ambiguity between literal 255 and extended header.
-    //
-    // The writer uses `num_ctus <= 255` for the short (4-byte) header and
-    // `num_ctus > 255` for the extended (6-byte) header with a 0xFF marker
-    // followed by a 2-byte big-endian count.
-    //
-    // When num_ctus == 255, the writer stores byte[3] = 0xFF in short form.
-    // But 0xFF is also the escape marker for extended.  To disambiguate:
-    //   - If byte[3] == 0xFF AND we can read 2 more bytes AND the 2-byte
-    //     value is > 255, it must be extended.
-    //   - Otherwise treat 0xFF as literal 255 (short form).
+    // CTU count: 0xFF byte signals extended header (2-byte big-endian count follows).
+    // This matches the reference reader in isp_emulator exactly.
+    // Note: the writer uses short form for num_ctus <= 255, but 255 CTUs
+    // produces byte[3] = 0xFF which is also the extended escape. The reference
+    // reader always interprets 0xFF as extended, so we do the same for
+    // byte-for-byte compatibility.
     let header_byte = data[offset + 3];
     let (num_ctus, header_size) = if header_byte == 0xFF {
-        // Try extended interpretation
-        if remaining >= EXTENDED_HEADER_SIZE {
-            let ext_count = ((data[offset + 4] as usize) << 8) | (data[offset + 5] as usize);
-            if ext_count > 255 {
-                // Definitely extended header
-                (ext_count, EXTENDED_HEADER_SIZE)
-            } else {
-                // ext_count <= 255 means this was likely the literal 255 short form.
-                // Validate: does the remaining data match short-form (255 CTUs)?
-                let short_frame_total = SHORT_HEADER_SIZE + FRAME_PARAM_SIZE + CTU_PARAM_SIZE * 255;
-                let ext_frame_total =
-                    EXTENDED_HEADER_SIZE + FRAME_PARAM_SIZE + CTU_PARAM_SIZE * ext_count;
-
-                if remaining >= ext_frame_total
-                    && (remaining < short_frame_total || ext_count == 0)
-                {
-                    // Extended is the only viable interpretation
-                    (ext_count, EXTENDED_HEADER_SIZE)
-                } else {
-                    // Default to literal 255
-                    (255_usize, SHORT_HEADER_SIZE)
-                }
-            }
-        } else {
-            // Not enough bytes for extended; must be literal 255
-            (255_usize, SHORT_HEADER_SIZE)
+        if remaining < EXTENDED_HEADER_SIZE {
+            return Err(format!(
+                "truncated extended header at offset {}",
+                offset
+            ));
         }
+        let ext_count = ((data[offset + 4] as usize) << 8) | (data[offset + 5] as usize);
+        (ext_count, EXTENDED_HEADER_SIZE)
     } else {
         (header_byte as usize, SHORT_HEADER_SIZE)
     };

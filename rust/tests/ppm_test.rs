@@ -137,9 +137,9 @@ fn test_convert_i420_to_ppm() {
 
     // Create a 4x4 I420 frame (Y=128, U=128, V=128 → neutral gray)
     let mut frame = Vec::with_capacity(24);
-    frame.extend(std::iter::repeat(128u8).take(16)); // Y
-    frame.extend(std::iter::repeat(128u8).take(4));  // U
-    frame.extend(std::iter::repeat(128u8).take(4));  // V
+    frame.extend(std::iter::repeat_n(128u8, 16)); // Y
+    frame.extend(std::iter::repeat_n(128u8, 4));  // U
+    frame.extend(std::iter::repeat_n(128u8, 4));  // V
 
     let input_path = dir.path().join("input.yuv");
     std::fs::write(&input_path, &frame).unwrap();

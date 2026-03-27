@@ -17,12 +17,12 @@ fn make_p010_frame(w: usize, h: usize, y_val: u16, u_val: u16, v_val: u16) -> Ve
     let mut data = Vec::new();
     // Y plane: MSB-aligned → shift left by 6
     for _ in 0..(w * h) {
-        data.extend_from_slice(&((y_val << 6) as u16).to_le_bytes());
+        data.extend_from_slice(&(y_val << 6).to_le_bytes());
     }
     // UV interleaved: (w/2)*(h/2) pairs
     for _ in 0..((w / 2) * (h / 2)) {
-        data.extend_from_slice(&((u_val << 6) as u16).to_le_bytes());
-        data.extend_from_slice(&((v_val << 6) as u16).to_le_bytes());
+        data.extend_from_slice(&(u_val << 6).to_le_bytes());
+        data.extend_from_slice(&(v_val << 6).to_le_bytes());
     }
     data
 }
@@ -50,10 +50,10 @@ fn make_yuv420p10le_frame(w: usize, h: usize, y_val: u16, u_val: u16, v_val: u16
 fn make_y210_frame(w: usize, h: usize, y_val: u16, u_val: u16, v_val: u16) -> Vec<u8> {
     let mut data = Vec::new();
     for _ in 0..(w / 2 * h) {
-        data.extend_from_slice(&((y_val << 6) as u16).to_le_bytes()); // Y0
-        data.extend_from_slice(&((u_val << 6) as u16).to_le_bytes()); // Cb
-        data.extend_from_slice(&((y_val << 6) as u16).to_le_bytes()); // Y1
-        data.extend_from_slice(&((v_val << 6) as u16).to_le_bytes()); // Cr
+        data.extend_from_slice(&(y_val << 6).to_le_bytes()); // Y0
+        data.extend_from_slice(&(u_val << 6).to_le_bytes()); // Cb
+        data.extend_from_slice(&(y_val << 6).to_le_bytes()); // Y1
+        data.extend_from_slice(&(v_val << 6).to_le_bytes()); // Cr
     }
     data
 }
@@ -553,11 +553,11 @@ fn test_p012_format_and_convert() {
     let h = 4u32;
     let mut data = Vec::new();
     for _ in 0..(w * h) as usize {
-        data.extend_from_slice(&((2048u16 << 4) as u16).to_le_bytes()); // Y=2048 (12-bit mid)
+        data.extend_from_slice(&(2048u16 << 4).to_le_bytes()); // Y=2048 (12-bit mid)
     }
     for _ in 0..((w / 2) * (h / 2)) as usize {
-        data.extend_from_slice(&((2048u16 << 4) as u16).to_le_bytes()); // U
-        data.extend_from_slice(&((2048u16 << 4) as u16).to_le_bytes()); // V
+        data.extend_from_slice(&(2048u16 << 4).to_le_bytes()); // U
+        data.extend_from_slice(&(2048u16 << 4).to_le_bytes()); // V
     }
 
     let mut file = NamedTempFile::new().unwrap();
@@ -599,10 +599,10 @@ fn test_y212_convert() {
     // Build frame: [Y0:u16, Cb:u16, Y1:u16, Cr:u16] per pair, 12-bit MSB → shift left 4
     let mut data = Vec::new();
     for _ in 0..((w / 2) * h) as usize {
-        data.extend_from_slice(&((2048u16 << 4) as u16).to_le_bytes()); // Y0
-        data.extend_from_slice(&((2048u16 << 4) as u16).to_le_bytes()); // Cb
-        data.extend_from_slice(&((2048u16 << 4) as u16).to_le_bytes()); // Y1
-        data.extend_from_slice(&((2048u16 << 4) as u16).to_le_bytes()); // Cr
+        data.extend_from_slice(&(2048u16 << 4).to_le_bytes()); // Y0
+        data.extend_from_slice(&(2048u16 << 4).to_le_bytes()); // Cb
+        data.extend_from_slice(&(2048u16 << 4).to_le_bytes()); // Y1
+        data.extend_from_slice(&(2048u16 << 4).to_le_bytes()); // Cr
     }
 
     let mut file = NamedTempFile::new().unwrap();
@@ -624,7 +624,7 @@ fn test_y212_convert() {
 
 /// Build a packed 10-bit buffer from a slice of 10-bit values (LE bitstream).
 fn pack_10bit_le(values: &[u16]) -> Vec<u8> {
-    assert!(values.len() % 4 == 0, "values must be multiple of 4");
+    assert!(values.len().is_multiple_of(4), "values must be multiple of 4");
     let mut out = Vec::new();
     for chunk in values.chunks(4) {
         let s0 = chunk[0];
@@ -741,7 +741,7 @@ fn test_y10p_format() {
 
 /// Build a BE-packed 10-bit grey buffer (Y10BPACK).
 fn pack_10bit_be(values: &[u16]) -> Vec<u8> {
-    assert!(values.len() % 4 == 0);
+    assert!(values.len().is_multiple_of(4));
     let mut out = Vec::new();
     for chunk in values.chunks(4) {
         let s0 = chunk[0];
@@ -792,7 +792,7 @@ fn test_y10bpack_reader() {
 
 /// Build a MIPI RAW10 packed grey buffer (Y10P).
 fn pack_y10p(values: &[u16]) -> Vec<u8> {
-    assert!(values.len() % 4 == 0);
+    assert!(values.len().is_multiple_of(4));
     let mut out = Vec::new();
     for chunk in values.chunks(4) {
         // 4 MSB bytes
@@ -800,7 +800,7 @@ fn pack_y10p(values: &[u16]) -> Vec<u8> {
             out.push((v >> 2) as u8);
         }
         // 1 LSB byte
-        let lsb = ((chunk[0] & 0x03))
+        let lsb = (chunk[0] & 0x03)
             | ((chunk[1] & 0x03) << 2)
             | ((chunk[2] & 0x03) << 4)
             | ((chunk[3] & 0x03) << 6);

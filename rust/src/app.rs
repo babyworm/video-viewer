@@ -1512,13 +1512,15 @@ impl eframe::App for VideoViewerApp {
                 ui.separator();
                 sb_action = self.sideband_panel.show(
                     ui,
-                    sb_file_ref,
-                    sb_path_ref,
-                    sb_frame_ref,
-                    &mut sb_mode,
-                    &mut sb_opacity,
-                    &mut sb_show_vals,
-                    sb_frame_idx,
+                    &mut crate::analysis::isp_sideband::SidebandPanelContext {
+                        sideband: sb_file_ref,
+                        sideband_path: sb_path_ref,
+                        current_frame: sb_frame_ref,
+                        mode: &mut sb_mode,
+                        opacity: &mut sb_opacity,
+                        show_values: &mut sb_show_vals,
+                        current_frame_idx: sb_frame_idx,
+                    },
                 );
             });
         // Write back sideband UI state changes.
@@ -1600,17 +1602,18 @@ impl eframe::App for VideoViewerApp {
                             (self.canvas.image_rect(), self.canvas.image_size)
                         {
                             crate::ui::sideband_overlay::draw_sideband_overlay(
-                                ui.painter(),
-                                image_rect,
-                                sb_frame,
-                                self.sideband_overlay_mode,
-                                self.sideband_opacity,
-                                self.sideband_show_values,
-                                iw,
-                                ih,
-                                64, // CTU size
-                                self.canvas.zoom,
-                                egui::Pos2::ZERO, // pan offset already baked into image_rect
+                                &crate::ui::sideband_overlay::SidebandOverlayParams {
+                                    painter: ui.painter(),
+                                    image_rect,
+                                    frame: sb_frame,
+                                    mode: self.sideband_overlay_mode,
+                                    opacity: self.sideband_opacity,
+                                    show_values: self.sideband_show_values,
+                                    image_width: iw,
+                                    image_height: ih,
+                                    ctu_size: 64,
+                                    zoom: self.canvas.zoom,
+                                },
                             );
                         }
                     }
