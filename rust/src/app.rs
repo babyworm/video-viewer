@@ -5,6 +5,7 @@ use std::time::Instant;
 use eframe::egui;
 
 use crate::core::reader::VideoReader;
+use crate::core::sideband::SidebandOverlayMode;
 use crate::ui::canvas::ImageCanvas;
 use crate::ui::dialogs::{self, DialogState};
 use crate::ui::navigation::{NavigationBar, NavigationAction};
@@ -88,6 +89,13 @@ pub struct VideoViewerApp {
     test_downloading: bool,
     test_dl_current: Arc<AtomicUsize>,
     test_dl_total: Arc<AtomicUsize>,
+    // ISP Sideband overlay state
+    pub sideband_file: Option<crate::core::sideband::SidebandFile>,
+    pub sideband_path: Option<String>,
+    pub sideband_overlay_mode: SidebandOverlayMode,
+    pub sideband_opacity: f32,
+    pub sideband_show_values: bool,
+    sideband_panel: crate::analysis::isp_sideband::SidebandPanel,
 }
 
 impl VideoViewerApp {
@@ -160,6 +168,12 @@ impl VideoViewerApp {
             test_downloading: false,
             test_dl_current: Arc::new(AtomicUsize::new(0)),
             test_dl_total: Arc::new(AtomicUsize::new(0)),
+            sideband_file: None,
+            sideband_path: None,
+            sideband_overlay_mode: SidebandOverlayMode::None,
+            sideband_opacity: 0.5,
+            sideband_show_values: false,
+            sideband_panel: crate::analysis::isp_sideband::SidebandPanel::new(),
         }
     }
 
@@ -512,6 +526,9 @@ impl VideoViewerApp {
                 }
                 shared.generation += 1;
             }
+            AnalysisTab::IspSideband => {
+                // Sideband analysis is handled in the sidebar panel, not here.
+            }
         }
 
         // Request repaint of the analysis viewport so it picks up new data.
@@ -797,6 +814,24 @@ impl VideoViewerApp {
             }
             ctx2.request_repaint();
         });
+    }
+
+    pub fn load_sideband(&mut self, path: &str) -> Result<(), String> {
+        let file = crate::core::sideband::SidebandFile::open(path)?;
+        self.sideband_file = Some(file);
+        self.sideband_path = Some(path.to_string());
+        self.sideband_overlay_mode = SidebandOverlayMode::QpDelta; // auto-enable
+        Ok(())
+    }
+
+    pub fn unload_sideband(&mut self) {
+        self.sideband_file = None;
+        self.sideband_path = None;
+        self.sideband_overlay_mode = SidebandOverlayMode::None;
+    }
+
+    pub fn current_sideband_frame(&self) -> Option<&crate::core::sideband::SidebandFrame> {
+        self.sideband_file.as_ref()?.frame(self.current_frame_idx)
     }
 }
 
@@ -1461,11 +1496,63 @@ impl eframe::App for VideoViewerApp {
 
         // --- Sidebar (right panel) ---
         let analysis_was_off = !self.sidebar.show_analysis;
+        // Snapshot sideband state for the panel (avoids borrow conflicts).
+        let sb_file_ref = self.sideband_file.as_ref();
+        let sb_path_ref = self.sideband_path.as_deref();
+        let sb_frame_ref = sb_file_ref.and_then(|f| f.frame(self.current_frame_idx));
+        let mut sb_mode = self.sideband_overlay_mode;
+        let mut sb_opacity = self.sideband_opacity;
+        let mut sb_show_vals = self.sideband_show_values;
+        let sb_frame_idx = self.current_frame_idx;
+        let mut sb_action: Option<crate::analysis::isp_sideband::SidebandAction> = None;
         egui::SidePanel::right("sidebar")
             .default_width(250.0)
             .show(ctx, |ui| {
                 self.sidebar.show(ui);
+                ui.separator();
+                sb_action = self.sideband_panel.show(
+                    ui,
+                    sb_file_ref,
+                    sb_path_ref,
+                    sb_frame_ref,
+                    &mut sb_mode,
+                    &mut sb_opacity,
+                    &mut sb_show_vals,
+                    sb_frame_idx,
+                );
             });
+        // Write back sideband UI state changes.
+        self.sideband_overlay_mode = sb_mode;
+        self.sideband_opacity = sb_opacity;
+        self.sideband_show_values = sb_show_vals;
+        // Handle sideband panel actions.
+        if let Some(action) = sb_action {
+            match action {
+                crate::analysis::isp_sideband::SidebandAction::LoadRequested => {
+                    // Use a simple file path input via the native file dialog pattern.
+                    // For now, try loading "sideband.bin" from the same directory as the video.
+                    let candidate = self.current_file.as_ref().and_then(|p| {
+                        std::path::Path::new(p).parent().map(|dir| {
+                            dir.join("sideband.bin").to_string_lossy().to_string()
+                        })
+                    });
+                    if let Some(path) = candidate {
+                        if std::path::Path::new(&path).exists() {
+                            if let Err(e) = self.load_sideband(&path) {
+                                self.status_error = Some(format!("Sideband load error: {}", e));
+                            }
+                        } else {
+                            self.status_error = Some("No sideband.bin found next to video file. Place sideband.bin in the same directory.".to_string());
+                        }
+                    } else {
+                        self.status_error = Some("Open a video file first, then load sideband.".to_string());
+                    }
+                }
+                crate::analysis::isp_sideband::SidebandAction::Unload => {
+                    self.unload_sideband();
+                }
+            }
+        }
         // If user just toggled analysis on, always recompute (data may be stale).
         if analysis_was_off && self.sidebar.show_analysis {
             self.update_analysis(ctx);
@@ -1505,6 +1592,30 @@ impl eframe::App for VideoViewerApp {
 
             if self.reader.is_some() {
                 let response = self.canvas.show(ui);
+
+                // Draw sideband CTU overlay on top of the image.
+                if self.sideband_overlay_mode != SidebandOverlayMode::None {
+                    if let Some(sb_frame) = self.current_sideband_frame() {
+                        if let (Some(image_rect), Some((iw, ih))) =
+                            (self.canvas.image_rect(), self.canvas.image_size)
+                        {
+                            crate::ui::sideband_overlay::draw_sideband_overlay(
+                                ui.painter(),
+                                image_rect,
+                                sb_frame,
+                                self.sideband_overlay_mode,
+                                self.sideband_opacity,
+                                self.sideband_show_values,
+                                iw,
+                                ih,
+                                64, // CTU size
+                                self.canvas.zoom,
+                                egui::Pos2::ZERO, // pan offset already baked into image_rect
+                            );
+                        }
+                    }
+                }
+
                 // Update pixel info on hover — keep layout when mouse leaves
                 let on_image = response.hover_pos()
                     .and_then(|p| self.canvas.image_pos_from_screen(p))

@@ -5,4 +5,5 @@ pub mod hints;
 pub mod pixel;
 pub mod ppm;
 pub mod reader;
+pub mod sideband;
 pub mod y4m;

@@ -12,6 +12,7 @@ pub enum AnalysisTab {
     Waveform,
     Vectorscope,
     Metrics,
+    IspSideband,
 }
 
 /// Shared analysis data passed to the separate viewport via Arc<Mutex<>>.
@@ -337,6 +338,7 @@ impl Sidebar {
                         ui.selectable_value(&mut tab, AnalysisTab::Waveform, "Waveform");
                         ui.selectable_value(&mut tab, AnalysisTab::Vectorscope, "Vectorscope");
                         ui.selectable_value(&mut tab, AnalysisTab::Metrics, "Metrics");
+                        ui.selectable_value(&mut tab, AnalysisTab::IspSideband, "ISP Sideband");
                         ui.separator();
                         if ui.small_button("+").on_hover_text("Zoom in").clicked() {
                             zoom_in = true;
@@ -368,6 +370,10 @@ impl Sidebar {
                         }
                         AnalysisTab::Metrics => {
                             Self::render_metrics(ui, psnr, ssim, frame_diff);
+                        }
+                        AnalysisTab::IspSideband => {
+                            ui.label("ISP Sideband analysis is shown in the right sidebar panel.");
+                            ui.label("Load a sideband.bin file from the sidebar to visualize CTU heatmaps.");
                         }
                     }
                 });
