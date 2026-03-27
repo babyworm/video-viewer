@@ -536,3 +536,366 @@ fn test_hints_y210() {
     let hints = parse_filename_hints("capture_720p_y210.yuv");
     assert_eq!(hints.format.as_deref(), Some("Y210"));
 }
+
+// ============================================================
+// P012 / Y212 / Y216 format tests
+// ============================================================
+
+#[test]
+fn test_p012_format_and_convert() {
+    let fmt = get_format_by_name("P012").expect("P012 not found");
+    assert_eq!(fmt.fourcc, "P012");
+    assert_eq!(fmt.bit_depth, 12);
+    assert_eq!(fmt.frame_size(4, 4), 48); // same as P010
+
+    // P012: MSB-aligned 12-bit → (val << 4) stored in u16 LE
+    let w = 4u32;
+    let h = 4u32;
+    let mut data = Vec::new();
+    for _ in 0..(w * h) as usize {
+        data.extend_from_slice(&((2048u16 << 4) as u16).to_le_bytes()); // Y=2048 (12-bit mid)
+    }
+    for _ in 0..((w / 2) * (h / 2)) as usize {
+        data.extend_from_slice(&((2048u16 << 4) as u16).to_le_bytes()); // U
+        data.extend_from_slice(&((2048u16 << 4) as u16).to_le_bytes()); // V
+    }
+
+    let mut file = NamedTempFile::new().unwrap();
+    file.write_all(&data).unwrap();
+    file.flush().unwrap();
+
+    let path = file.path().to_str().unwrap();
+    let mut reader = VideoReader::open(path, w, h, "P012", "BT.601").expect("open P012");
+    let raw = reader.seek_frame(0).unwrap();
+    let rgb = reader.convert_to_rgb(&raw).expect("P012 convert");
+    assert_eq!(rgb.len(), (w * h * 3) as usize);
+    // 2048 << 4 = 32768, >> 8 = 128
+    for i in 0..(w * h) as usize {
+        assert_eq!(rgb[i * 3], 128, "R at pixel {i}");
+    }
+}
+
+#[test]
+fn test_y212_format() {
+    let fmt = get_format_by_name("Y212").expect("Y212 not found");
+    assert_eq!(fmt.fourcc, "Y212");
+    assert_eq!(fmt.bit_depth, 12);
+    assert_eq!(fmt.frame_size(4, 2), 32); // w*h*4
+}
+
+#[test]
+fn test_y216_format() {
+    let fmt = get_format_by_name("Y216").expect("Y216 not found");
+    assert_eq!(fmt.fourcc, "Y216");
+    assert_eq!(fmt.bit_depth, 16);
+    assert_eq!(fmt.frame_size(4, 2), 32);
+}
+
+#[test]
+fn test_y212_convert() {
+    // Y212: same layout as Y210, 12-bit MSB-aligned
+    let w = 4u32;
+    let h = 2u32;
+    // Build frame: [Y0:u16, Cb:u16, Y1:u16, Cr:u16] per pair, 12-bit MSB → shift left 4
+    let mut data = Vec::new();
+    for _ in 0..((w / 2) * h) as usize {
+        data.extend_from_slice(&((2048u16 << 4) as u16).to_le_bytes()); // Y0
+        data.extend_from_slice(&((2048u16 << 4) as u16).to_le_bytes()); // Cb
+        data.extend_from_slice(&((2048u16 << 4) as u16).to_le_bytes()); // Y1
+        data.extend_from_slice(&((2048u16 << 4) as u16).to_le_bytes()); // Cr
+    }
+
+    let mut file = NamedTempFile::new().unwrap();
+    file.write_all(&data).unwrap();
+    file.flush().unwrap();
+
+    let path = file.path().to_str().unwrap();
+    let mut reader = VideoReader::open(path, w, h, "Y212", "BT.601").expect("open Y212");
+    let raw = reader.seek_frame(0).unwrap();
+    let rgb = reader.convert_to_rgb(&raw).expect("Y212 convert");
+    for i in 0..(w * h) as usize {
+        assert_eq!(rgb[i * 3], 128, "R at pixel {i}");
+    }
+}
+
+// ============================================================
+// NV15 / NV20 packed 10-bit tests
+// ============================================================
+
+/// Build a packed 10-bit buffer from a slice of 10-bit values (LE bitstream).
+fn pack_10bit_le(values: &[u16]) -> Vec<u8> {
+    assert!(values.len() % 4 == 0, "values must be multiple of 4");
+    let mut out = Vec::new();
+    for chunk in values.chunks(4) {
+        let s0 = chunk[0];
+        let s1 = chunk[1];
+        let s2 = chunk[2];
+        let s3 = chunk[3];
+        out.push((s0 & 0xFF) as u8);
+        out.push((((s0 >> 8) & 0x03) | ((s1 & 0x3F) << 2)) as u8);
+        out.push((((s1 >> 6) & 0x0F) | ((s2 & 0x0F) << 4)) as u8);
+        out.push((((s2 >> 4) & 0x3F) | ((s3 & 0x03) << 6)) as u8);
+        out.push(((s3 >> 2) & 0xFF) as u8);
+    }
+    out
+}
+
+#[test]
+fn test_nv15_format() {
+    let fmt = get_format_by_name("NV15").expect("NV15 not found");
+    assert_eq!(fmt.fourcc, "NV15");
+    assert_eq!(fmt.bit_depth, 10);
+    assert_eq!(fmt.subsampling, (2, 2));
+    // 4x4: y_size=16, frame = 16*15/8 = 30
+    assert_eq!(fmt.frame_size(4, 4), 30);
+}
+
+#[test]
+fn test_nv20_format() {
+    let fmt = get_format_by_name("NV20").expect("NV20 not found");
+    assert_eq!(fmt.fourcc, "NV20");
+    assert_eq!(fmt.bit_depth, 10);
+    assert_eq!(fmt.subsampling, (2, 1));
+    // 4x4: y_size=16, frame = 16*5/2 = 40
+    assert_eq!(fmt.frame_size(4, 4), 40);
+}
+
+#[test]
+fn test_nv15_neutral_gray() {
+    let w = 4usize;
+    let h = 4usize;
+    // Y plane: 16 samples of 512 (10-bit mid-range)
+    let y_vals: Vec<u16> = vec![512; w * h];
+    let y_packed = pack_10bit_le(&y_vals);
+    // UV plane: (w/2)*(h/2)*2 = 8 samples of 512 (neutral)
+    let uv_vals: Vec<u16> = vec![512; (w / 2) * (h / 2) * 2];
+    let uv_packed = pack_10bit_le(&uv_vals);
+
+    let mut raw = y_packed;
+    raw.extend_from_slice(&uv_packed);
+
+    let rgb = yuv_to_rgb_nv15_nv20(&raw, w, h, (2, 2), false);
+    assert_eq!(rgb.len(), w * h * 3);
+    for i in 0..w * h {
+        assert_eq!(rgb[i * 3], 128, "R at pixel {i}");
+        assert_eq!(rgb[i * 3 + 1], 128, "G at pixel {i}");
+        assert_eq!(rgb[i * 3 + 2], 128, "B at pixel {i}");
+    }
+}
+
+#[test]
+fn test_nv15_reader() {
+    let w = 4u32;
+    let h = 4u32;
+    let y_packed = pack_10bit_le(&vec![512u16; (w * h) as usize]);
+    let uv_packed = pack_10bit_le(&vec![512u16; ((w / 2) * (h / 2) * 2) as usize]);
+    let mut frame = y_packed;
+    frame.extend_from_slice(&uv_packed);
+
+    let mut file = NamedTempFile::new().unwrap();
+    file.write_all(&frame).unwrap();
+    file.flush().unwrap();
+
+    let path = file.path().to_str().unwrap();
+    let mut reader = VideoReader::open(path, w, h, "NV15", "BT.601").expect("open NV15");
+    let raw = reader.seek_frame(0).unwrap();
+    let rgb = reader.convert_to_rgb(&raw).expect("NV15 convert");
+    for i in 0..(w * h) as usize {
+        assert_eq!(rgb[i * 3], 128, "pixel {i}");
+    }
+}
+
+#[test]
+fn test_nv20_neutral_gray() {
+    let w = 4usize;
+    let h = 4usize;
+    let y_packed = pack_10bit_le(&vec![512u16; w * h]);
+    // NV20: 4:2:2 → UV samples = (w/2)*h*2
+    let uv_packed = pack_10bit_le(&vec![512u16; (w / 2) * h * 2]);
+    let mut raw = y_packed;
+    raw.extend_from_slice(&uv_packed);
+
+    let rgb = yuv_to_rgb_nv15_nv20(&raw, w, h, (2, 1), false);
+    for i in 0..w * h {
+        assert_eq!(rgb[i * 3], 128, "R at pixel {i}");
+    }
+}
+
+// ============================================================
+// Y10BPACK / Y10P grey packed tests
+// ============================================================
+
+#[test]
+fn test_y10bpack_format() {
+    let fmt = get_format_by_name("Y10B").expect("Y10B not found");
+    assert_eq!(fmt.fourcc, "Y10B");
+    assert_eq!(fmt.frame_size(4, 4), 20); // 16*5/4
+}
+
+#[test]
+fn test_y10p_format() {
+    let fmt = get_format_by_name("Y10P").expect("Y10P not found");
+    assert_eq!(fmt.fourcc, "Y10P");
+    assert_eq!(fmt.frame_size(4, 4), 20);
+}
+
+/// Build a BE-packed 10-bit grey buffer (Y10BPACK).
+fn pack_10bit_be(values: &[u16]) -> Vec<u8> {
+    assert!(values.len() % 4 == 0);
+    let mut out = Vec::new();
+    for chunk in values.chunks(4) {
+        let s0 = chunk[0];
+        let s1 = chunk[1];
+        let s2 = chunk[2];
+        let s3 = chunk[3];
+        out.push((s0 >> 2) as u8);
+        out.push((((s0 & 0x03) << 6) | ((s1 >> 4) & 0x3F)) as u8);
+        out.push((((s1 & 0x0F) << 4) | ((s2 >> 6) & 0x0F)) as u8);
+        out.push((((s2 & 0x3F) << 2) | ((s3 >> 8) & 0x03)) as u8);
+        out.push((s3 & 0xFF) as u8);
+    }
+    out
+}
+
+#[test]
+fn test_y10bpack_neutral_gray() {
+    let w = 4;
+    let h = 4;
+    let packed = pack_10bit_be(&vec![512u16; w * h]);
+
+    let rgb = grey_10bpack_to_rgb(&packed, w, h);
+    assert_eq!(rgb.len(), w * h * 3);
+    for i in 0..w * h {
+        assert_eq!(rgb[i * 3], 128, "pixel {i}");
+    }
+}
+
+#[test]
+fn test_y10bpack_reader() {
+    let w = 4u32;
+    let h = 4u32;
+    let packed = pack_10bit_be(&vec![512u16; (w * h) as usize]);
+
+    let mut file = NamedTempFile::new().unwrap();
+    file.write_all(&packed).unwrap();
+    file.flush().unwrap();
+
+    let path = file.path().to_str().unwrap();
+    let mut reader = VideoReader::open(path, w, h, "Greyscale (10-bit BE packed)", "BT.601")
+        .expect("open Y10BPACK");
+    let raw = reader.seek_frame(0).unwrap();
+    let rgb = reader.convert_to_rgb(&raw).expect("Y10BPACK convert");
+    for i in 0..(w * h) as usize {
+        assert_eq!(rgb[i * 3], 128, "pixel {i}");
+    }
+}
+
+/// Build a MIPI RAW10 packed grey buffer (Y10P).
+fn pack_y10p(values: &[u16]) -> Vec<u8> {
+    assert!(values.len() % 4 == 0);
+    let mut out = Vec::new();
+    for chunk in values.chunks(4) {
+        // 4 MSB bytes
+        for &v in chunk {
+            out.push((v >> 2) as u8);
+        }
+        // 1 LSB byte
+        let lsb = ((chunk[0] & 0x03))
+            | ((chunk[1] & 0x03) << 2)
+            | ((chunk[2] & 0x03) << 4)
+            | ((chunk[3] & 0x03) << 6);
+        out.push(lsb as u8);
+    }
+    out
+}
+
+#[test]
+fn test_y10p_neutral_gray() {
+    let w = 4;
+    let h = 4;
+    let packed = pack_y10p(&vec![512u16; w * h]);
+
+    let rgb = grey_y10p_to_rgb(&packed, w, h);
+    assert_eq!(rgb.len(), w * h * 3);
+    for i in 0..w * h {
+        assert_eq!(rgb[i * 3], 128, "pixel {i}");
+    }
+}
+
+#[test]
+fn test_y10p_reader() {
+    let w = 4u32;
+    let h = 4u32;
+    let packed = pack_y10p(&vec![512u16; (w * h) as usize]);
+
+    let mut file = NamedTempFile::new().unwrap();
+    file.write_all(&packed).unwrap();
+    file.flush().unwrap();
+
+    let path = file.path().to_str().unwrap();
+    let mut reader = VideoReader::open(path, w, h, "Greyscale (10-bit MIPI)", "BT.601")
+        .expect("open Y10P");
+    let raw = reader.seek_frame(0).unwrap();
+    let rgb = reader.convert_to_rgb(&raw).expect("Y10P convert");
+    for i in 0..(w * h) as usize {
+        assert_eq!(rgb[i * 3], 128, "pixel {i}");
+    }
+}
+
+// ============================================================
+// T010 (tiled P010) tests
+// ============================================================
+
+#[test]
+fn test_t010_format() {
+    let fmt = get_format_by_name("T010").expect("T010 not found");
+    assert_eq!(fmt.fourcc, "T010");
+    assert_eq!(fmt.bit_depth, 10);
+    assert_eq!(fmt.frame_size(4, 4), 48); // same as P010
+}
+
+#[test]
+fn test_t010_convert() {
+    // 8x8 frame: Y = 2x2 tiles of 4x4, UV plane (8x4) = 2x1 tiles of 4x4.
+    // With uniform data, tiled == linear, so we can reuse make_p010_frame.
+    let w = 8u32;
+    let h = 8u32;
+    let frame = make_p010_frame(w as usize, h as usize, 512, 512, 512);
+
+    let mut file = NamedTempFile::new().unwrap();
+    file.write_all(&frame).unwrap();
+    file.flush().unwrap();
+
+    let path = file.path().to_str().unwrap();
+    let mut reader = VideoReader::open(path, w, h, "T010", "BT.601").expect("open T010");
+    let raw = reader.seek_frame(0).unwrap();
+    let rgb = reader.convert_to_rgb(&raw).expect("T010 convert");
+    for i in 0..(w * h) as usize {
+        assert_eq!(rgb[i * 3], 128, "pixel {i}");
+    }
+}
+
+// ============================================================
+// Additional hints tests
+// ============================================================
+
+#[test]
+fn test_hints_p012() {
+    use video_viewer::core::hints::parse_filename_hints;
+    let hints = parse_filename_hints("video_1080p_p012.raw");
+    assert_eq!(hints.format.as_deref(), Some("P012"));
+}
+
+#[test]
+fn test_hints_nv15() {
+    use video_viewer::core::hints::parse_filename_hints;
+    let hints = parse_filename_hints("capture_720p_nv15.raw");
+    assert_eq!(hints.format.as_deref(), Some("NV15"));
+}
+
+#[test]
+fn test_hints_y10bpack() {
+    use video_viewer::core::hints::parse_filename_hints;
+    let hints = parse_filename_hints("sensor_vga_y10bpack.raw");
+    assert_eq!(hints.format.as_deref(), Some("Greyscale (10-bit BE packed)"));
+}

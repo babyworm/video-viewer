@@ -135,7 +135,7 @@ fn test_formats_by_type() {
     assert_eq!(bayer.len(), 20);
 
     let grey = get_formats_by_type(FormatType::Grey);
-    assert_eq!(grey.len(), 4);
+    assert_eq!(grey.len(), 6); // +2 for Y10BPACK, Y10P
 }
 
 #[test]

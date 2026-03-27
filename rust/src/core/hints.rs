@@ -72,6 +72,15 @@ fn format_aliases() -> &'static HashMap<&'static str, &'static str> {
         m.insert("p016",        "P016");
         m.insert("p210",        "P210");
         m.insert("y210",        "Y210");
+        m.insert("y212",        "Y212");
+        m.insert("y216",        "Y216");
+        m.insert("p012",        "P012");
+        m.insert("nv15",        "NV15");
+        m.insert("nv20",        "NV20");
+        m.insert("t010",        "T010");
+        m.insert("y10b",        "Greyscale (10-bit BE packed)");
+        m.insert("y10bpack",    "Greyscale (10-bit BE packed)");
+        m.insert("y10p",        "Greyscale (10-bit MIPI)");
         m
     })
 }

@@ -351,6 +351,218 @@ pub fn grey_highbit_to_rgb(raw: &[u8], w: usize, h: usize, bit_depth: u32) -> Ve
     rgb
 }
 
+/// Unpack 4 tightly-packed 10-bit samples from 5 bytes (LE bitstream, Rockchip NV15/NV20).
+///
+/// Layout:
+///   byte0 = s0[7:0]
+///   byte1 = s1[5:0]<<2 | s0[9:8]
+///   byte2 = s2[3:0]<<4 | s1[9:6]
+///   byte3 = s3[1:0]<<6 | s2[9:4]
+///   byte4 = s3[9:2]
+#[inline]
+fn unpack_10bit_le_4samples(data: &[u8], offset: usize) -> [u16; 4] {
+    let b0 = data[offset] as u16;
+    let b1 = data[offset + 1] as u16;
+    let b2 = data[offset + 2] as u16;
+    let b3 = data[offset + 3] as u16;
+    let b4 = data[offset + 4] as u16;
+    [
+        b0 | ((b1 & 0x03) << 8),
+        (b1 >> 2) | ((b2 & 0x0F) << 6),
+        (b2 >> 4) | ((b3 & 0x3F) << 4),
+        (b3 >> 6) | (b4 << 2),
+    ]
+}
+
+/// Convert NV15/NV20 (tightly packed 10-bit semi-planar) to RGB24.
+///
+/// Both Y and UV planes use LE bitstream packing (4 samples → 5 bytes).
+/// NV15 = 4:2:0, NV20 = 4:2:2.
+pub fn yuv_to_rgb_nv15_nv20(
+    raw: &[u8],
+    w: usize,
+    h: usize,
+    subsampling: (usize, usize),
+    bt709: bool,
+) -> Vec<u8> {
+    let (h_sub, v_sub) = subsampling;
+    let y_plane_bytes = (w * h * 10 + 7) / 8; // = w*h*5/4
+    let uv_w = w / h_sub;
+    let uv_h = h / v_sub;
+    // UV plane: interleaved U,V → total uv_w*2 samples per row (treated as linear)
+    let uv_samples_per_row = uv_w * 2;
+
+    // Decode Y plane into a flat array of 8-bit values
+    let y_count = w * h;
+    let mut y_buf = vec![0u8; y_count];
+    let groups = y_count / 4;
+    for g in 0..groups {
+        let samples = unpack_10bit_le_4samples(raw, g * 5);
+        for k in 0..4 {
+            y_buf[g * 4 + k] = (samples[k] >> 2) as u8;
+        }
+    }
+
+    // Decode UV plane into flat arrays
+    let uv_total_samples = uv_samples_per_row * uv_h;
+    let uv_groups = uv_total_samples / 4;
+    let mut uv_buf = vec![0u8; uv_total_samples];
+    for g in 0..uv_groups {
+        let samples = unpack_10bit_le_4samples(raw, y_plane_bytes + g * 5);
+        for k in 0..4 {
+            uv_buf[g * 4 + k] = (samples[k] >> 2) as u8;
+        }
+    }
+
+    // Convert to RGB
+    let mut rgb = vec![0u8; w * h * 3];
+    for py in 0..h {
+        for px in 0..w {
+            let y_val = y_buf[py * w + px];
+            let cx = px / h_sub;
+            let cy = py / v_sub;
+            let uv_base = cy * uv_samples_per_row + cx * 2;
+            let u_val = uv_buf[uv_base];
+            let v_val = uv_buf[uv_base + 1];
+            let (r, g, b) = yuv_to_rgb_pixel(y_val, u_val, v_val, bt709);
+            let out = (py * w + px) * 3;
+            rgb[out] = r;
+            rgb[out + 1] = g;
+            rgb[out + 2] = b;
+        }
+    }
+    rgb
+}
+
+/// Unpack 4 tightly-packed 10-bit samples from 5 bytes (BE bitstream, Y10BPACK).
+///
+/// Layout (MSB first):
+///   s0 = byte0[7:0]<<2 | byte1[7:6]
+///   s1 = byte1[5:0]<<4 | byte2[7:4]
+///   s2 = byte2[3:0]<<6 | byte3[7:2]
+///   s3 = byte3[1:0]<<8 | byte4[7:0]
+#[inline]
+fn unpack_10bit_be_4samples(data: &[u8], offset: usize) -> [u16; 4] {
+    let b0 = data[offset] as u16;
+    let b1 = data[offset + 1] as u16;
+    let b2 = data[offset + 2] as u16;
+    let b3 = data[offset + 3] as u16;
+    let b4 = data[offset + 4] as u16;
+    [
+        (b0 << 2) | (b1 >> 6),
+        ((b1 & 0x3F) << 4) | (b2 >> 4),
+        ((b2 & 0x0F) << 6) | (b3 >> 2),
+        ((b3 & 0x03) << 8) | b4,
+    ]
+}
+
+/// Convert Y10BPACK (10-bit BE packed greyscale) to RGB24.
+/// 4 pixels in 5 bytes, MSB-first.
+pub fn grey_10bpack_to_rgb(raw: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let count = w * h;
+    let groups = count / 4;
+    let mut rgb = vec![0u8; count * 3];
+    for g in 0..groups {
+        let samples = unpack_10bit_be_4samples(raw, g * 5);
+        for k in 0..4 {
+            let v = (samples[k] >> 2) as u8;
+            let o = (g * 4 + k) * 3;
+            rgb[o] = v;
+            rgb[o + 1] = v;
+            rgb[o + 2] = v;
+        }
+    }
+    rgb
+}
+
+/// Convert Y10P (MIPI RAW10 packed greyscale) to RGB24.
+/// Layout: [MSB0, MSB1, MSB2, MSB3, LSBs] per 4 pixels.
+/// LSBs byte: s0[1:0] | s1[1:0]<<2 | s2[1:0]<<4 | s3[1:0]<<6
+pub fn grey_y10p_to_rgb(raw: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let count = w * h;
+    let groups = count / 4;
+    let mut rgb = vec![0u8; count * 3];
+    for g in 0..groups {
+        let base = g * 5;
+        let lsbs = raw[base + 4];
+        for k in 0..4usize {
+            let msb = raw[base + k] as u16;
+            let lsb = ((lsbs >> (k * 2)) & 0x03) as u16;
+            let val10 = (msb << 2) | lsb;
+            let v = (val10 >> 2) as u8;
+            let o = (g * 4 + k) * 3;
+            rgb[o] = v;
+            rgb[o + 1] = v;
+            rgb[o + 2] = v;
+        }
+    }
+    rgb
+}
+
+/// Detile P010_4L4 (T010) tiled data into linear P010 layout.
+///
+/// Tiles are 4x4 pixels. Each sample is u16 LE (same as P010).
+/// Y plane: tiles in raster order, UV plane: tiles in raster order.
+pub fn detile_p010_4l4(raw: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let y_plane_bytes = w * h * 2;
+    let uv_h = h / 2;
+    let uv_plane_bytes = w * uv_h * 2; // interleaved U,V at half height
+    let mut out = vec![0u8; y_plane_bytes + uv_plane_bytes];
+
+    let tile_w = 4;
+    let tile_h = 4;
+    let bytes_per_sample = 2;
+
+    // Detile Y plane
+    let tiles_x = w / tile_w;
+    let tiles_y = h / tile_h;
+    let tile_bytes = tile_w * tile_h * bytes_per_sample; // 32 bytes per tile
+    for ty in 0..tiles_y {
+        for tx in 0..tiles_x {
+            let tile_idx = ty * tiles_x + tx;
+            let src_base = tile_idx * tile_bytes;
+            for row in 0..tile_h {
+                let dst_y = ty * tile_h + row;
+                let dst_x = tx * tile_w;
+                let dst_off = (dst_y * w + dst_x) * bytes_per_sample;
+                let src_off = src_base + row * tile_w * bytes_per_sample;
+                let len = tile_w * bytes_per_sample;
+                out[dst_off..dst_off + len].copy_from_slice(&raw[src_off..src_off + len]);
+            }
+        }
+    }
+
+    // Detile UV plane (4x4 tiles of interleaved UV, effectively 4x4 sample pairs at half height)
+    // UV plane: each tile covers 4x4 UV samples. UV dimensions: w x (h/2).
+    let uv_tiles_y = uv_h / tile_h;
+    let uv_tile_bytes = tile_w * tile_h * bytes_per_sample;
+    for ty in 0..uv_tiles_y {
+        for tx in 0..tiles_x {
+            let tile_idx = ty * tiles_x + tx;
+            let src_base = y_plane_bytes + tile_idx * uv_tile_bytes;
+            // Handle case where there might not be enough UV tiles
+            if src_base + uv_tile_bytes > raw.len() {
+                break;
+            }
+            for row in 0..tile_h {
+                let dst_y = ty * tile_h + row;
+                if dst_y >= uv_h {
+                    break;
+                }
+                let dst_x = tx * tile_w;
+                let dst_off = y_plane_bytes + (dst_y * w + dst_x) * bytes_per_sample;
+                let src_off = src_base + row * tile_w * bytes_per_sample;
+                let len = tile_w * bytes_per_sample;
+                if dst_off + len <= out.len() && src_off + len <= raw.len() {
+                    out[dst_off..dst_off + len].copy_from_slice(&raw[src_off..src_off + len]);
+                }
+            }
+        }
+    }
+
+    out
+}
+
 /// Convert RGB24 to greyscale 8-bit using BT.601 luma weights.
 pub fn rgb_to_grey(raw: &[u8], w: usize, h: usize) -> Vec<u8> {
     let mut grey = vec![0u8; w * h];

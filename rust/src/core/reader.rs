@@ -274,7 +274,7 @@ impl VideoReader {
             // P010 / P016 / P210  (high-bit semi-planar, MSB-aligned)
             // ----------------------------------------------------------
             FormatType::YuvSemiPlanar
-                if matches!(self.format.fourcc.as_str(), "P010" | "P016" | "P210") =>
+                if matches!(self.format.fourcc.as_str(), "P010" | "P012" | "P016" | "P210") =>
             {
                 let (h_sub, v_sub) = (
                     self.format.subsampling.0 as usize,
@@ -287,9 +287,34 @@ impl VideoReader {
             }
 
             // ----------------------------------------------------------
+            // T010  (tiled P010 — detile then convert as P010)
+            // ----------------------------------------------------------
+            FormatType::YuvSemiPlanar if self.format.fourcc == "T010" => {
+                let linear = colorspace::detile_p010_4l4(raw, w, h);
+                Ok(colorspace::yuv_to_rgb_semi_planar_highbit(
+                    &linear, w, h, (2, 2), 10, false, bt709,
+                ))
+            }
+
+            // ----------------------------------------------------------
+            // NV15 / NV20  (tightly packed 10-bit semi-planar)
+            // ----------------------------------------------------------
+            FormatType::YuvSemiPlanar
+                if matches!(self.format.fourcc.as_str(), "NV15" | "NV20") =>
+            {
+                let (h_sub, v_sub) = (
+                    self.format.subsampling.0 as usize,
+                    self.format.subsampling.1 as usize,
+                );
+                Ok(colorspace::yuv_to_rgb_nv15_nv20(raw, w, h, (h_sub, v_sub), bt709))
+            }
+
+            // ----------------------------------------------------------
             // Y210  (10-bit packed 4:2:2, MSB-aligned)
             // ----------------------------------------------------------
-            FormatType::YuvPacked if self.format.fourcc == "Y210" => {
+            FormatType::YuvPacked
+                if matches!(self.format.fourcc.as_str(), "Y210" | "Y212" | "Y216") =>
+            {
                 Ok(colorspace::yuv_to_rgb_y210(raw, w, h, bt709))
             }
 
@@ -329,6 +354,16 @@ impl VideoReader {
             // ----------------------------------------------------------
             FormatType::Grey if self.format.bit_depth == 8 => {
                 Ok(colorspace::grey_to_rgb(raw, w, h))
+            }
+
+            // ----------------------------------------------------------
+            // Greyscale 10-bit packed (Y10BPACK / Y10P)
+            // ----------------------------------------------------------
+            FormatType::Grey if self.format.fourcc == "Y10B" => {
+                Ok(colorspace::grey_10bpack_to_rgb(raw, w, h))
+            }
+            FormatType::Grey if self.format.fourcc == "Y10P" => {
+                Ok(colorspace::grey_y10p_to_rgb(raw, w, h))
             }
 
             // ----------------------------------------------------------
@@ -490,7 +525,7 @@ impl VideoReader {
 
             FormatType::YuvSemiPlanar => {
                 let fc = self.format.fourcc.as_str();
-                let highbit = matches!(fc, "P010" | "P016" | "P210");
+                let highbit = matches!(fc, "P010" | "P012" | "P016" | "P210");
 
                 if highbit {
                     // High-bit semi-planar: Y plane is w*h u16 LE samples
