@@ -68,9 +68,22 @@ const EXTENDED_HEADER_SIZE: usize = 6;
 // SidebandFile
 // ---------------------------------------------------------------------------
 
+/// Maximum sideband file size (256 MB). Prevents accidental OOM on huge files.
+/// 8K@60fps, 300 frames ≈ 40 MB; this cap leaves generous headroom.
+const MAX_SIDEBAND_FILE_SIZE: u64 = 256 * 1024 * 1024;
+
 impl SidebandFile {
     /// Read a sideband binary file from disk.
     pub fn open(path: &str) -> Result<Self, String> {
+        let meta = std::fs::metadata(path)
+            .map_err(|e| format!("failed to read sideband file '{}': {}", path, e))?;
+        if meta.len() > MAX_SIDEBAND_FILE_SIZE {
+            return Err(format!(
+                "sideband file too large ({:.1} MB, max {} MB)",
+                meta.len() as f64 / (1024.0 * 1024.0),
+                MAX_SIDEBAND_FILE_SIZE / (1024 * 1024),
+            ));
+        }
         let data = std::fs::read(path)
             .map_err(|e| format!("failed to read sideband file '{}': {}", path, e))?;
         Self::from_bytes(&data)
