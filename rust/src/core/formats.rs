@@ -38,10 +38,10 @@ impl VideoFormat {
                     "YU12" | "YV12" | "YM12" | "YM21" => y_size * 3 / 2,
                     "422P" | "YM16" | "YM61" => y_size * 2,
                     "Y444" | "444P" => y_size * 3,
-                    // 10-bit planar: each sample in 16-bit LE word
-                    "0T20" => y_size * 3,       // Y*2 + U*0.5 + V*0.5
-                    "2T22" => y_size * 4,       // Y*2 + U*1 + V*1
-                    "4T44" => y_size * 6,       // Y*2 + U*2 + V*2
+                    // 10/12-bit planar: each sample in 16-bit LE word
+                    "0T20" | "0C20" => y_size * 3,  // Y*2 + U*0.5 + V*0.5
+                    "2T22" | "2C22" => y_size * 4,  // Y*2 + U*1 + V*1
+                    "4T44" | "4C44" => y_size * 6,  // Y*2 + U*2 + V*2
                     "YUV9" | "YVU9" => {
                         y_size + (w / 4) * (h / 4) * 2
                     }
@@ -139,6 +139,9 @@ const FORMAT_DEFS: &[FormatEntry] = &[
     FormatEntry { name: "YUV420P10LE (10-bit 4:2:0)", format_type: FormatType::YuvPlanar, fourcc: "0T20", bit_depth: 10, subsampling: (2, 2), bpp: 0, planes: 1, v4l2_name: "" },
     FormatEntry { name: "YUV422P10LE (10-bit 4:2:2)", format_type: FormatType::YuvPlanar, fourcc: "2T22", bit_depth: 10, subsampling: (2, 1), bpp: 0, planes: 1, v4l2_name: "" },
     FormatEntry { name: "YUV444P10LE (10-bit 4:4:4)", format_type: FormatType::YuvPlanar, fourcc: "4T44", bit_depth: 10, subsampling: (1, 1), bpp: 0, planes: 1, v4l2_name: "" },
+    FormatEntry { name: "YUV420P12LE (12-bit 4:2:0)", format_type: FormatType::YuvPlanar, fourcc: "0C20", bit_depth: 12, subsampling: (2, 2), bpp: 0, planes: 1, v4l2_name: "" },
+    FormatEntry { name: "YUV422P12LE (12-bit 4:2:2)", format_type: FormatType::YuvPlanar, fourcc: "2C22", bit_depth: 12, subsampling: (2, 1), bpp: 0, planes: 1, v4l2_name: "" },
+    FormatEntry { name: "YUV444P12LE (12-bit 4:4:4)", format_type: FormatType::YuvPlanar, fourcc: "4C44", bit_depth: 12, subsampling: (1, 1), bpp: 0, planes: 1, v4l2_name: "" },
 
     // --- Planar YUV ---
     FormatEntry { name: "I420 (4:2:0)", format_type: FormatType::YuvPlanar, fourcc: "YU12", bit_depth: 8, subsampling: (2, 2), bpp: 0, planes: 1, v4l2_name: "V4L2_PIX_FMT_YUV420" },

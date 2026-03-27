@@ -81,6 +81,12 @@ fn format_aliases() -> &'static HashMap<&'static str, &'static str> {
         m.insert("y10b",        "Greyscale (10-bit BE packed)");
         m.insert("y10bpack",    "Greyscale (10-bit BE packed)");
         m.insert("y10p",        "Greyscale (10-bit MIPI)");
+        m.insert("yuv420p12le", "YUV420P12LE");
+        m.insert("yuv420p12",   "YUV420P12LE");
+        m.insert("yuv422p12le", "YUV422P12LE");
+        m.insert("yuv422p12",   "YUV422P12LE");
+        m.insert("yuv444p12le", "YUV444P12LE");
+        m.insert("yuv444p12",   "YUV444P12LE");
         m
     })
 }

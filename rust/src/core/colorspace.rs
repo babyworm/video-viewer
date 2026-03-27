@@ -301,10 +301,12 @@ pub fn yuv_to_rgb_semi_planar_highbit(
     rgb
 }
 
-/// Convert Y210 (10-bit packed 4:2:2, MSB-aligned) to RGB24.
+/// Convert Y210/Y212/Y216 (MSB-aligned packed 4:2:2) to RGB24.
 ///
 /// Layout per pixel pair: [Y0:u16, Cb:u16, Y1:u16, Cr:u16] — 8 bytes per 2 pixels.
-pub fn yuv_to_rgb_y210(raw: &[u8], w: usize, h: usize, bt709: bool) -> Vec<u8> {
+/// All three formats use MSB-alignment in 16-bit words; the combined shift to 8-bit
+/// is always `>> 8` regardless of bit_depth, so a single code path handles all.
+pub fn yuv_to_rgb_y21x(raw: &[u8], w: usize, h: usize, bt709: bool) -> Vec<u8> {
     let mut rgb = vec![0u8; w * h * 3];
 
     for py in 0..h {

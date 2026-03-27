@@ -315,7 +315,7 @@ impl VideoReader {
             FormatType::YuvPacked
                 if matches!(self.format.fourcc.as_str(), "Y210" | "Y212" | "Y216") =>
             {
-                Ok(colorspace::yuv_to_rgb_y210(raw, w, h, bt709))
+                Ok(colorspace::yuv_to_rgb_y21x(raw, w, h, bt709))
             }
 
             // ----------------------------------------------------------
@@ -377,7 +377,7 @@ impl VideoReader {
             // YUV planar 10-bit (LSB-aligned in u16 LE)
             // ----------------------------------------------------------
             FormatType::YuvPlanar
-                if matches!(self.format.fourcc.as_str(), "0T20" | "2T22" | "4T44") =>
+                if matches!(self.format.fourcc.as_str(), "0T20" | "2T22" | "4T44" | "0C20" | "2C22" | "4C44") =>
             {
                 let (h_sub, v_sub) = (
                     self.format.subsampling.0 as usize,
@@ -432,7 +432,7 @@ impl VideoReader {
         match self.format.format_type {
             FormatType::YuvPlanar => {
                 let fc = self.format.fourcc.as_str();
-                let highbit = matches!(fc, "0T20" | "2T22" | "4T44");
+                let highbit = matches!(fc, "0T20" | "2T22" | "4T44" | "0C20" | "2C22" | "4C44");
 
                 if highbit {
                     // 10-bit planar: each sample is u16 LE, LSB-aligned
@@ -525,14 +525,23 @@ impl VideoReader {
 
             FormatType::YuvSemiPlanar => {
                 let fc = self.format.fourcc.as_str();
-                let highbit = matches!(fc, "P010" | "P012" | "P016" | "P210");
+                let highbit = matches!(fc, "P010" | "P012" | "P016" | "P210" | "T010");
 
                 if highbit {
+                    // T010: detile first, then process as P010
+                    let linear;
+                    let src: &[u8] = if fc == "T010" {
+                        linear = crate::core::colorspace::detile_p010_4l4(raw, w, h);
+                        &linear
+                    } else {
+                        raw
+                    };
+
                     // High-bit semi-planar: Y plane is w*h u16 LE samples
                     let y_plane_bytes = w * h * 2;
                     let mut y = vec![0u8; w * h];
                     for i in 0..(w * h) {
-                        let val = u16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]);
+                        let val = u16::from_le_bytes([src[i * 2], src[i * 2 + 1]]);
                         y[i] = (val >> 8) as u8;
                     }
                     channels.insert("Y".to_string(), y);
@@ -547,8 +556,8 @@ impl VideoReader {
                     let mut v_small = vec![0u8; uv_w * uv_h];
                     for i in 0..(uv_w * uv_h) {
                         let base = y_plane_bytes + i * 4;
-                        let uv0 = u16::from_le_bytes([raw[base], raw[base + 1]]);
-                        let uv1 = u16::from_le_bytes([raw[base + 2], raw[base + 3]]);
+                        let uv0 = u16::from_le_bytes([src[base], src[base + 1]]);
+                        let uv1 = u16::from_le_bytes([src[base + 2], src[base + 3]]);
                         u_small[i] = (uv0 >> 8) as u8;
                         v_small[i] = (uv1 >> 8) as u8;
                     }

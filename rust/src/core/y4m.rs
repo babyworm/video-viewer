@@ -23,6 +23,10 @@ impl Y4mHeader {
     pub fn to_format_name(&self) -> &str {
         let cs = self.colorspace.as_str();
         match cs {
+            // 12-bit variants (e.g. "420p12", "422p12", "444p12")
+            _ if cs.contains("420") && cs.contains("p12") => "YUV420P12LE",
+            _ if cs.contains("422") && cs.contains("p12") => "YUV422P12LE",
+            _ if cs.contains("444") && cs.contains("p12") => "YUV444P12LE",
             // 10-bit variants (e.g. "420p10", "420mpeg2p10")
             _ if cs.contains("420") && cs.contains("p10") => "YUV420P10LE",
             _ if cs.contains("422") && cs.contains("p10") => "YUV422P10LE",

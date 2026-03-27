@@ -126,7 +126,7 @@ fn test_format_lookup_not_found() {
 #[test]
 fn test_formats_by_type() {
     let yuv_planar = get_formats_by_type(FormatType::YuvPlanar);
-    assert_eq!(yuv_planar.len(), 12); // +3 for 10-bit planar (420/422/444)
+    assert_eq!(yuv_planar.len(), 15); // +3 10-bit, +3 12-bit planar
 
     let rgb = get_formats_by_type(FormatType::Rgb);
     assert_eq!(rgb.len(), 24);

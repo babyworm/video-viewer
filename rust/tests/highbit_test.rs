@@ -188,7 +188,7 @@ fn test_y210_neutral_gray() {
     let h = 2;
     let raw = make_y210_frame(w, h, 512, 512, 512);
 
-    let rgb = yuv_to_rgb_y210(&raw, w, h, false);
+    let rgb = yuv_to_rgb_y21x(&raw, w, h, false);
     assert_eq!(rgb.len(), w * h * 3);
     for i in 0..w * h {
         assert_eq!(rgb[i * 3], 128, "R at pixel {i}");

@@ -2,6 +2,68 @@ use std::collections::HashMap;
 
 use super::formats::{FormatType, VideoFormat};
 
+/// Unpack one 10-bit sample from LE bitstream (NV15/NV20: 4 samples in 5 bytes).
+fn unpack_10bit_le_sample(data: &[u8], group_off: usize, idx: usize) -> u16 {
+    let b0 = data[group_off] as u16;
+    let b1 = data[group_off + 1] as u16;
+    let b2 = data[group_off + 2] as u16;
+    let b3 = data[group_off + 3] as u16;
+    let b4 = data[group_off + 4] as u16;
+    match idx {
+        0 => b0 | ((b1 & 0x03) << 8),
+        1 => (b1 >> 2) | ((b2 & 0x0F) << 6),
+        2 => (b2 >> 4) | ((b3 & 0x3F) << 4),
+        _ => (b3 >> 6) | (b4 << 2),
+    }
+}
+
+/// Unpack one 10-bit sample from BE bitstream (Y10BPACK: 4 samples in 5 bytes, MSB-first).
+fn unpack_10bit_be_sample(data: &[u8], group_off: usize, idx: usize) -> u16 {
+    let b0 = data[group_off] as u16;
+    let b1 = data[group_off + 1] as u16;
+    let b2 = data[group_off + 2] as u16;
+    let b3 = data[group_off + 3] as u16;
+    let b4 = data[group_off + 4] as u16;
+    match idx {
+        0 => (b0 << 2) | (b1 >> 6),
+        1 => ((b1 & 0x3F) << 4) | (b2 >> 4),
+        2 => ((b2 & 0x0F) << 6) | (b3 >> 2),
+        _ => ((b3 & 0x03) << 8) | b4,
+    }
+}
+
+/// Unpack one 10-bit sample from MIPI RAW10 (Y10P: 4 MSB bytes + 1 LSB byte).
+fn unpack_y10p_sample(data: &[u8], group_off: usize, idx: usize) -> u16 {
+    let msb = data[group_off + idx] as u16;
+    let lsb = ((data[group_off + 4] >> (idx * 2)) & 0x03) as u16;
+    (msb << 2) | lsb
+}
+
+/// Read a packed 10-bit sample at pixel index from a Grey packed format.
+fn grey_packed_sample(data: &[u8], fourcc: &str, pixel_idx: usize) -> Option<u16> {
+    let group = pixel_idx / 4;
+    let si = pixel_idx % 4;
+    let off = group * 5;
+    if off + 4 >= data.len() {
+        return None;
+    }
+    Some(match fourcc {
+        "Y10B" => unpack_10bit_be_sample(data, off, si),
+        "Y10P" => unpack_y10p_sample(data, off, si),
+        _ => 0,
+    })
+}
+
+/// Compute Y sample byte offset for T010 (tiled P010, 4x4 tiles).
+fn t010_y_offset(px: usize, py: usize, w: usize) -> usize {
+    let tiles_x = w / 4;
+    let tile_x = px / 4;
+    let tile_y = py / 4;
+    let in_x = px % 4;
+    let in_y = py % 4;
+    (tile_y * tiles_x + tile_x) * 32 + (in_y * 4 + in_x) * 2
+}
+
 /// Pixel information at a specific coordinate.
 #[derive(Debug, Clone)]
 pub struct PixelInfo {
@@ -36,11 +98,11 @@ fn pixel_first_byte_hex(
     match format.format_type {
         FormatType::YuvPlanar => {
             if format.bit_depth > 8 {
-                // 10-bit planar: Y samples are u16 LE
                 let offset = idx * 2;
                 if offset + 1 < data.len() {
                     let val = u16::from_le_bytes([data[offset], data[offset + 1]]);
-                    let shifted = ((val & 0x3FF) >> 2) as u8;
+                    let mask = (1u16 << format.bit_depth) - 1;
+                    let shifted = ((val & mask) >> (format.bit_depth - 8)) as u8;
                     format!("{:02X}", shifted)
                 } else {
                     "--".to_string()
@@ -52,8 +114,25 @@ fn pixel_first_byte_hex(
             }
         }
         FormatType::YuvSemiPlanar => {
-            if format.bit_depth > 8 {
-                // P010/P210: Y samples are u16 LE, MSB-aligned
+            let fc = format.fourcc.as_str();
+            if matches!(fc, "NV15" | "NV20") {
+                let group = idx / 4;
+                let si = idx % 4;
+                let off = group * 5;
+                if off + 4 < data.len() {
+                    format!("{:02X}", (unpack_10bit_le_sample(data, off, si) >> 2) as u8)
+                } else {
+                    "--".to_string()
+                }
+            } else if fc == "T010" {
+                let off = t010_y_offset(px as usize, py as usize, width as usize);
+                if off + 1 < data.len() {
+                    let val = u16::from_le_bytes([data[off], data[off + 1]]);
+                    format!("{:02X}", (val >> 8) as u8)
+                } else {
+                    "--".to_string()
+                }
+            } else if format.bit_depth > 8 {
                 let offset = idx * 2;
                 if offset + 1 < data.len() {
                     let val = u16::from_le_bytes([data[offset], data[offset + 1]]);
@@ -68,7 +147,14 @@ fn pixel_first_byte_hex(
             }
         }
         FormatType::Grey => {
-            if format.bit_depth > 8 {
+            let fc = format.fourcc.as_str();
+            if matches!(fc, "Y10B" | "Y10P") {
+                if let Some(val) = grey_packed_sample(data, fc, idx) {
+                    format!("{:02X}", (val >> 2) as u8)
+                } else {
+                    "--".to_string()
+                }
+            } else if format.bit_depth > 8 {
                 let offset = idx * 2;
                 if offset + 1 < data.len() {
                     let val = u16::from_le_bytes([data[offset], data[offset + 1]]);
@@ -159,7 +245,16 @@ fn raw_hex_at(data: &[u8], width: u32, height: u32, format: &VideoFormat, x: u32
             }
         }
         FormatType::YuvSemiPlanar => {
-            if format.bit_depth > 8 {
+            let fc = format.fourcc.as_str();
+            if matches!(fc, "NV15" | "NV20") {
+                // Show the 5-byte group containing this pixel's Y sample
+                let group = idx / 4;
+                let off = group * 5;
+                (0..5).filter_map(|i| data.get(off + i).copied()).collect()
+            } else if fc == "T010" {
+                let off = t010_y_offset(x as usize, y as usize, width as usize);
+                if off + 1 < data.len() { vec![data[off], data[off + 1]] } else { vec![] }
+            } else if format.bit_depth > 8 {
                 let offset = idx * 2;
                 if offset + 1 < data.len() {
                     vec![data[offset], data[offset + 1]]
@@ -202,6 +297,11 @@ fn raw_hex_at(data: &[u8], width: u32, height: u32, format: &VideoFormat, x: u32
             (0..bpp_bytes)
                 .filter_map(|i| data.get(offset + i).copied())
                 .collect()
+        }
+        FormatType::Grey if matches!(format.fourcc.as_str(), "Y10B" | "Y10P") => {
+            let group = idx / 4;
+            let off = group * 5;
+            (0..5).filter_map(|i| data.get(off + i).copied()).collect()
         }
         FormatType::Bayer | FormatType::Grey => {
             if format.bit_depth <= 8 {
@@ -246,7 +346,8 @@ fn extract_components(
     match format.format_type {
         FormatType::YuvPlanar => {
             if format.bit_depth > 8 {
-                // 10-bit planar: each sample is u16 LE, LSB-aligned
+                // High-bit planar: each sample is u16 LE, LSB-aligned
+                let mask = (1u16 << format.bit_depth) - 1;
                 let (sx, sy) = (format.subsampling.0 as usize, format.subsampling.1 as usize);
                 let y_samples = w * h;
                 let uv_w = w / sx;
@@ -255,7 +356,7 @@ fn extract_components(
                 let y_byte = (py * w + px) * 2;
                 if y_byte + 1 < data.len() {
                     let val = u16::from_le_bytes([data[y_byte], data[y_byte + 1]]);
-                    components.insert("Y".to_string(), val & 0x3FF);
+                    components.insert("Y".to_string(), val & mask);
                 }
 
                 let c_x = px / sx;
@@ -265,11 +366,11 @@ fn extract_components(
                 let v_byte = y_samples * 2 + uv_samples * 2 + c_idx * 2;
                 if u_byte + 1 < data.len() {
                     let val = u16::from_le_bytes([data[u_byte], data[u_byte + 1]]);
-                    components.insert("U".to_string(), val & 0x3FF);
+                    components.insert("U".to_string(), val & mask);
                 }
                 if v_byte + 1 < data.len() {
                     let val = u16::from_le_bytes([data[v_byte], data[v_byte + 1]]);
-                    components.insert("V".to_string(), val & 0x3FF);
+                    components.insert("V".to_string(), val & mask);
                 }
             } else {
                 let y_idx = py * w + px;
@@ -333,8 +434,66 @@ fn extract_components(
 
         FormatType::YuvSemiPlanar => {
             let fc = format.fourcc.as_str();
-            if format.bit_depth > 8 {
-                // P010/P016/P210: Y is u16 LE MSB-aligned, UV interleaved u16 LE pairs
+
+            if matches!(fc, "NV15" | "NV20") {
+                // Packed 10-bit semi-planar: unpack Y and UV from LE bitstream
+                let (sx, sy) = (format.subsampling.0 as usize, format.subsampling.1 as usize);
+                let y_idx = py * w + px;
+                let y_group = y_idx / 4;
+                let y_si = y_idx % 4;
+                let y_off = y_group * 5;
+                if y_off + 4 < data.len() {
+                    components.insert("Y".to_string(), unpack_10bit_le_sample(data, y_off, y_si));
+                }
+                let y_plane_bytes = (w * h * 5) / 4;
+                let uv_w = w / sx;
+                let c_x = px / sx;
+                let c_y = py / sy;
+                let uv_linear = c_y * uv_w * 2 + c_x * 2; // interleaved U,V
+                let uv_group = uv_linear / 4;
+                let uv_si = uv_linear % 4;
+                let uv_off = y_plane_bytes + uv_group * 5;
+                if uv_off + 4 < data.len() {
+                    let u_val = unpack_10bit_le_sample(data, uv_off, uv_si);
+                    components.insert("U".to_string(), u_val);
+                    // V is the next sample
+                    let v_linear = uv_linear + 1;
+                    let v_group = v_linear / 4;
+                    let v_si = v_linear % 4;
+                    let v_off = y_plane_bytes + v_group * 5;
+                    if v_off + 4 < data.len() {
+                        components.insert("V".to_string(), unpack_10bit_le_sample(data, v_off, v_si));
+                    }
+                }
+            } else if fc == "T010" {
+                // Tiled P010: compute tiled addresses, then read as MSB-aligned u16
+                let shift = 16u32 - format.bit_depth;
+                let off = t010_y_offset(px, py, w);
+                if off + 1 < data.len() {
+                    let val = u16::from_le_bytes([data[off], data[off + 1]]);
+                    components.insert("Y".to_string(), val >> shift);
+                }
+                // UV plane: tiles at offset y_plane_tiled_bytes, half height
+                let y_plane_bytes = w * h * 2;
+                let (sx, sy) = (format.subsampling.0 as usize, format.subsampling.1 as usize);
+                let uv_w = w;
+                let c_x = px / sx;
+                let c_y = py / sy;
+                // UV tile addressing: tile contains 4x4 u16 samples (interleaved U,V pairs)
+                let uv_tiles_x = uv_w / 4;
+                let tile_x = (c_x * 2) / 4; // c_x*2 because interleaved U,V
+                let tile_y = c_y / 4;
+                let in_x = (c_x * 2) % 4;
+                let in_y = c_y % 4;
+                let uv_tile_off = y_plane_bytes + (tile_y * uv_tiles_x + tile_x) * 32 + (in_y * 4 + in_x) * 2;
+                if uv_tile_off + 3 < data.len() {
+                    let u_val = u16::from_le_bytes([data[uv_tile_off], data[uv_tile_off + 1]]);
+                    let v_val = u16::from_le_bytes([data[uv_tile_off + 2], data[uv_tile_off + 3]]);
+                    components.insert("U".to_string(), u_val >> shift);
+                    components.insert("V".to_string(), v_val >> shift);
+                }
+            } else if format.bit_depth > 8 {
+                // P010/P012/P016/P210: Y is u16 LE MSB-aligned, UV interleaved u16 LE pairs
                 let y_byte = (py * w + px) * 2;
                 if y_byte + 1 < data.len() {
                     let val = u16::from_le_bytes([data[y_byte], data[y_byte + 1]]);
@@ -396,23 +555,26 @@ fn extract_components(
         }
 
         FormatType::YuvPacked => {
-            if format.bit_depth > 8 && format.fourcc == "Y210" {
-                // Y210: [Y0:u16, Cb:u16, Y1:u16, Cr:u16] per pixel pair, MSB-aligned
+            if format.bit_depth > 8
+                && matches!(format.fourcc.as_str(), "Y210" | "Y212" | "Y216")
+            {
+                // Y210/Y212/Y216: [Y0:u16, Cb:u16, Y1:u16, Cr:u16] per pixel pair, MSB-aligned
+                let shift = 16 - format.bit_depth;
                 let pair_idx = px / 2;
                 let base = (py * w / 2 + pair_idx) * 8;
                 let is_odd = (px % 2) == 1;
                 let y_off = if is_odd { base + 4 } else { base };
                 if y_off + 1 < data.len() {
                     let val = u16::from_le_bytes([data[y_off], data[y_off + 1]]);
-                    components.insert("Y".to_string(), val >> 6);
+                    components.insert("Y".to_string(), val >> shift);
                 }
                 if base + 3 < data.len() {
                     let val = u16::from_le_bytes([data[base + 2], data[base + 3]]);
-                    components.insert("U".to_string(), val >> 6);
+                    components.insert("U".to_string(), val >> shift);
                 }
                 if base + 7 < data.len() {
                     let val = u16::from_le_bytes([data[base + 6], data[base + 7]]);
-                    components.insert("V".to_string(), val >> 6);
+                    components.insert("V".to_string(), val >> shift);
                 }
                 return components;
             }
@@ -519,7 +681,12 @@ fn extract_components(
 
         FormatType::Grey => {
             let idx = py * w + px;
-            if format.bit_depth <= 8 {
+            let fc = format.fourcc.as_str();
+            if matches!(fc, "Y10B" | "Y10P") {
+                if let Some(val) = grey_packed_sample(data, fc, idx) {
+                    components.insert("Y".to_string(), val);
+                }
+            } else if format.bit_depth <= 8 {
                 if idx < data.len() {
                     components.insert("Y".to_string(), data[idx] as u16);
                 }
