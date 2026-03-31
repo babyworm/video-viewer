@@ -232,6 +232,11 @@ impl ImageCanvas {
         self.zoom
     }
 
+    /// Return the on-screen rect of the rendered image (if any).
+    pub fn image_rect(&self) -> Option<egui::Rect> {
+        self.image_rect
+    }
+
     /// Convert a screen position to image pixel coordinates.
     /// `screen_pos` is in absolute screen coordinates (e.g., from hover_pos()).
     pub fn image_pos_from_screen(&self, screen_pos: egui::Pos2) -> Option<(u32, u32)> {

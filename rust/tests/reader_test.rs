@@ -128,8 +128,7 @@ fn test_convert_i420_to_rgb() {
         .suffix(".yuv")
         .tempfile()
         .unwrap();
-    let frame: Vec<u8> = std::iter::repeat(128u8)
-        .take(16 + 4 + 4) // Y(16) + U(4) + V(4)
+    let frame: Vec<u8> = std::iter::repeat_n(128u8, 16 + 4 + 4) // Y(16) + U(4) + V(4)
         .collect();
     gray_file.write_all(&frame).unwrap();
     gray_file.flush().unwrap();
@@ -148,7 +147,7 @@ fn test_convert_i420_to_rgb() {
     // Each channel should be in the range [100, 156] (near 128).
     for (i, &v) in rgb.iter().enumerate() {
         assert!(
-            v >= 100 && v <= 156,
+            (100..=156).contains(&v),
             "channel[{i}] = {v} out of expected near-gray range [100,156]"
         );
     }

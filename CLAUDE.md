@@ -79,6 +79,7 @@
 | `tests/vectorscope_test.rs` | Vectorscope neutral/red/blue, subsampling (5 tests) |
 | `tests/metrics_test.rs` | PSNR, SSIM, frame difference (4 tests) |
 | `tests/scene_test.rs` | Scene detection, threshold, save/load (4 tests) |
+| `tests/sideband_test.rs` | Sideband binary parsing, extended header, signed fields, display (13 tests) |
 | `tests/integration_test.rs` | Real Y4M file (conditional) (1 test) |
 
 ## Filename Hint Reference
@@ -130,6 +131,43 @@ When adding new aliases, update `rust/src/core/hints.rs` tables AND this section
 | `10bit` | 10 | Bayer 10-bit, Grey 10-bit |
 | `12bit` | 12 | Bayer 12-bit, Grey 12-bit |
 | `16bit` | 16 | Bayer 16-bit, Grey 16-bit |
+
+## ISP Sideband Overlay (추가 기능, 계획)
+
+**중요: 이 기능은 코어 뷰어와 분리된 추가 기능이다. 기존 코어 기능에 영향을 주지 않도록 메뉴/모듈을 분리할 것.**
+
+### 개요
+
+isp_emulator가 생성한 sideband.bin 파일을 로딩하여 CTU 단위 오버레이를 영상 위에 표시.
+현재 64px 그리드 오버레이가 이미 존재하므로 이를 확장하는 형태.
+
+### 연관 프로젝트
+
+- **isp_emulator** (`/home/babyworm/work/isp_emulator/`)
+  - sideband.bin 생성 (Y4M → CTU 분석 → 바이너리 출력)
+  - `src/output/sideband_reader.rs`에 바이너리 파서 존재 — 이것을 복사하거나 공유 crate로 추출
+  - dump 명령어로 text/hjson/csv 출력 가능
+
+### Sideband 바이너리 형식 (v0)
+
+```
+프레임마다:
+  Header:  "IP" + version(1B) + numCtus(1B 또는 0xFF + 2B extended)
+  Frame:   20 bytes (scene_class, noise_class, motion_class, QP bias 등)
+  CTUs:    16 bytes × numCtus (activity, flatness, edge, qp_delta, sao_prior 등)
+```
+
+- Big-endian, Q8.8 고정소수점 (256 = 1.0)
+- CTU 순서: 래스터 스캔 (좌→우, 상→하)
+- 1080p 64x64 CTU: 510개 (30 cols × 17 rows)
+
+### 구현 방향
+
+1. **모듈 분리**: `src/analysis/isp_sideband.rs` 또는 `src/core/sideband.rs` — 코어 뷰어 코드와 분리
+2. **UI 분리**: Analysis 탭에 "ISP Sideband" 탭 추가 (기존 Histogram/Waveform/Vectorscope 옆)
+3. **오버레이 종류**: QP delta 히트맵, activity/flatness 컬러맵, saliency 맵, confidence 맵
+4. **프레임 동기화**: 영상 프레임 이동 시 sideband 프레임도 자동 연동
+5. **로딩**: File 메뉴 또는 Analysis 패널에서 sideband.bin 파일 선택
 
 ## Copyright
 

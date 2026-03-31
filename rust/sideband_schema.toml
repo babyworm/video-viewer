@@ -1,0 +1,201 @@
+# Sideband Binary Format Schema v0
+# Shared across: video-viewer, isp_emulator, isp_hevc
+# Single source of truth for binary layout.
+#
+# Encoding rules:
+#   - All multi-byte fields are big-endian
+#   - Packed fields: writer stores (value << shift), reader extracts (byte >> shift)
+#   - type: u8, i8, u16, i32 (always big-endian for multi-byte)
+#   - shift: right-shift to extract from packed byte (0 = raw)
+#   - scale: fixed-point denominator (256 = Q8.8, 0 = none)
+
+[format]
+magic = "IP"
+version = 0
+endian = "big"
+
+[header]
+short_size = 4
+extended_size = 6
+extended_marker = 255
+# CTU count encoding:
+#   byte[3] < 0xFF  → short form (4-byte header), count = byte[3]
+#   byte[3] == 0xFF → extended form (6-byte header), count = u16 at bytes[4..6]
+
+[frame_params]
+size = 20
+
+[[frame_params.fields]]
+name = "frame_id"
+offset = 0
+type = "i32"
+shift = 0
+
+[[frame_params.fields]]
+name = "valid_fields_mask"
+offset = 4
+type = "u16"
+shift = 0
+
+[[frame_params.fields]]
+name = "scene_class"
+offset = 6
+type = "u8"
+shift = 4
+
+[[frame_params.fields]]
+name = "noise_class"
+offset = 7
+type = "u8"
+shift = 5
+
+[[frame_params.fields]]
+name = "motion_class"
+offset = 8
+type = "u8"
+shift = 5
+
+[[frame_params.fields]]
+name = "denoise_strength"
+offset = 9
+type = "u8"
+shift = 3
+
+[[frame_params.fields]]
+name = "sharpen_strength"
+offset = 10
+type = "u8"
+shift = 3
+
+[[frame_params.fields]]
+name = "scene_flags"
+offset = 11
+type = "u8"
+shift = 0
+
+[[frame_params.fields]]
+name = "frame_qp_bias"
+offset = 12
+type = "i8"
+shift = 0
+
+[[frame_params.fields]]
+name = "frame_chroma_cb_bias"
+offset = 13
+type = "i8"
+shift = 0
+
+[[frame_params.fields]]
+name = "frame_chroma_cr_bias"
+offset = 14
+type = "i8"
+shift = 0
+
+[[frame_params.fields]]
+name = "frame_lambda_scale_q8"
+offset = 15
+type = "u16"
+shift = 0
+scale = 256
+
+[[frame_params.fields]]
+name = "global_confidence"
+offset = 17
+type = "u8"
+shift = 0
+
+# bytes 18-19: reserved (zero)
+
+[ctu_params]
+size = 16
+
+[[ctu_params.fields]]
+name = "activity"
+offset = 0
+type = "u8"
+shift = 2
+
+[[ctu_params.fields]]
+name = "flatness"
+offset = 1
+type = "u8"
+shift = 2
+
+[[ctu_params.fields]]
+name = "edge_density"
+offset = 2
+type = "u8"
+shift = 2
+
+[[ctu_params.fields]]
+name = "noise"
+offset = 3
+type = "u8"
+shift = 4
+
+[[ctu_params.fields]]
+name = "saliency"
+offset = 4
+type = "u8"
+shift = 2
+
+[[ctu_params.fields]]
+name = "chroma_importance"
+offset = 5
+type = "u8"
+shift = 3
+
+[[ctu_params.fields]]
+name = "confidence"
+offset = 6
+type = "u8"
+shift = 4
+
+[[ctu_params.fields]]
+name = "ctu_flags"
+offset = 7
+type = "u8"
+shift = 5
+
+[[ctu_params.fields]]
+name = "qp_delta"
+offset = 8
+type = "i8"
+shift = 0
+
+[[ctu_params.fields]]
+name = "chroma_cb_delta"
+offset = 9
+type = "i8"
+shift = 0
+
+[[ctu_params.fields]]
+name = "chroma_cr_delta"
+offset = 10
+type = "i8"
+shift = 0
+
+[[ctu_params.fields]]
+name = "lambda_scale_q8"
+offset = 11
+type = "u16"
+shift = 0
+scale = 256
+
+[[ctu_params.fields]]
+name = "rc_importance_weight"
+offset = 13
+type = "u8"
+shift = 0
+
+[[ctu_params.fields]]
+name = "sao_prior"
+offset = 14
+type = "i8"
+shift = 0
+
+[[ctu_params.fields]]
+name = "temporal_stability"
+offset = 15
+type = "u8"
+shift = 0
