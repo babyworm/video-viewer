@@ -309,10 +309,28 @@ fn parse_one_frame(
 // SidebandFile
 // ---------------------------------------------------------------------------
 
+/// Schema file name to look for next to the sideband binary.
+const SCHEMA_FILENAME: &str = "sideband_schema.toml";
+
+/// Resolve schema: try loading from same directory as the sideband file,
+/// fall back to the embedded default.
+fn resolve_schema(sideband_path: &str) -> Result<SchemaRoot, String> {
+    if let Some(parent) = std::path::Path::new(sideband_path).parent() {
+        let candidate = parent.join(SCHEMA_FILENAME);
+        if candidate.is_file() {
+            let toml_str = std::fs::read_to_string(&candidate)
+                .map_err(|e| format!("failed to read schema '{}': {}", candidate.display(), e))?;
+            return load_schema_from_str(&toml_str);
+        }
+    }
+    load_default_schema()
+}
+
 impl SidebandFile {
-    /// Read a sideband binary file using the embedded default schema.
+    /// Read a sideband binary file. Looks for `sideband_schema.toml` next to
+    /// the file; falls back to the embedded default schema.
     pub fn open(path: &str) -> Result<Self, String> {
-        let schema = load_default_schema()?;
+        let schema = resolve_schema(path)?;
         Self::open_with_schema(path, &schema)
     }
 
