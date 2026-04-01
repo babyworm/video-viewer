@@ -27,6 +27,7 @@
     - `hints.rs` - parse_filename_hints (resolution, format, fps, bit depth from filename)
     - `y4m.rs` - Y4M header parser and frame offset builder
     - `pixel.rs` - get_pixel_info (pixel inspector values, hex, neighborhood)
+    - `sideband.rs` - Schema-driven sideband binary parser (ISP parameter overlay)
   - `src/ui/` - UI components
     - `canvas.rs` - ImageCanvas (rendering, zoom, grid overlay)
     - `toolbar.rs` - Toolbar (component selection, grid controls, colorize_channel)
@@ -35,12 +36,14 @@
     - `dialogs.rs` - Open, Save, Parameters, Export, Convert, Settings dialogs
     - `comparison.rs` - ComparisonView (split, overlay, diff modes)
     - `settings.rs` - Settings persistence (toml)
+    - `sideband_overlay.rs` - Sideband CTU heatmap overlay rendering
   - `src/analysis/` - Analysis tools
     - `histogram.rs` - RGB and luma histograms
     - `waveform.rs` - Waveform display
     - `vectorscope.rs` - BT.709 YCbCr vectorscope
     - `metrics.rs` - PSNR, SSIM, frame difference
     - `scene.rs` - Scene change detection
+    - `isp_sideband.rs` - SidebandPanel UI (load/unload, overlay mode, opacity)
   - `src/conversion/` - Format conversion
     - `converter.rs` - VideoConverter, extract/pack YUV planes, chroma resampling
   - `tests/` - Integration tests

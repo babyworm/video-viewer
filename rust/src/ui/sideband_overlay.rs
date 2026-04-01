@@ -28,7 +28,7 @@ pub fn draw_sideband_overlay(params: &SidebandOverlayParams) {
     let ctu_cols = params.image_width.div_ceil(params.ctu_size);
     let ctu_rows = params.image_height.div_ceil(params.ctu_size);
     let max_ctus = (ctu_cols * ctu_rows) as usize;
-    let alpha = (params.opacity * 180.0) as u8; // max ~70% alpha
+    let alpha = (params.opacity * 255.0) as u8;
 
     for (idx, ctu) in params.frame.ctus.iter().take(max_ctus).enumerate() {
         let col = idx as u32 % ctu_cols;

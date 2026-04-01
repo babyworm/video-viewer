@@ -74,7 +74,7 @@ pub enum SidebandOverlayMode {
 // Schema types (deserialized from TOML)
 // ---------------------------------------------------------------------------
 
-/// Embedded default schema. Override at runtime via `SidebandFile::open_with_schema`.
+/// Embedded default schema. Override at runtime via `SidebandFile::from_bytes_with_schema_str`.
 const DEFAULT_SCHEMA: &str = include_str!("../../sideband_schema.toml");
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +89,8 @@ struct SchemaRoot {
 struct SchemaFormat {
     magic: String,
     version: u8,
+    #[serde(default)]
+    endian: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,14 +120,27 @@ struct SchemaField {
 // Schema loading
 // ---------------------------------------------------------------------------
 
+fn validate_schema(schema: &SchemaRoot) -> Result<(), String> {
+    if let Some(ref endian) = schema.format.endian {
+        if endian != "big" {
+            return Err(format!("unsupported endian '{}': only \"big\" is supported", endian));
+        }
+    }
+    Ok(())
+}
+
 fn load_default_schema() -> Result<SchemaRoot, String> {
-    toml::from_str(DEFAULT_SCHEMA)
-        .map_err(|e| format!("failed to parse embedded sideband schema: {}", e))
+    let schema: SchemaRoot = toml::from_str(DEFAULT_SCHEMA)
+        .map_err(|e| format!("failed to parse embedded sideband schema: {}", e))?;
+    validate_schema(&schema)?;
+    Ok(schema)
 }
 
 fn load_schema_from_str(toml_str: &str) -> Result<SchemaRoot, String> {
-    toml::from_str(toml_str)
-        .map_err(|e| format!("failed to parse sideband schema: {}", e))
+    let schema: SchemaRoot = toml::from_str(toml_str)
+        .map_err(|e| format!("failed to parse sideband schema: {}", e))?;
+    validate_schema(&schema)?;
+    Ok(schema)
 }
 
 // ---------------------------------------------------------------------------
@@ -136,7 +151,7 @@ fn load_schema_from_str(toml_str: &str) -> Result<SchemaRoot, String> {
 fn extract_field(buf: &[u8], field: &SchemaField) -> i64 {
     match field.field_type.as_str() {
         "u8" => (buf[field.offset] >> field.shift) as i64,
-        "i8" => (buf[field.offset] as i8) as i64,
+        "i8" => ((buf[field.offset] >> field.shift) as i8) as i64,
         "u16" => {
             let v = ((buf[field.offset] as u16) << 8) | (buf[field.offset + 1] as u16);
             (v >> field.shift) as i64
