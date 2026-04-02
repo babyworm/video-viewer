@@ -65,6 +65,12 @@ Download the latest release for your platform from the [Releases](https://github
 
 Extract and run — no installation required.
 
+### Windows (winget)
+
+```powershell
+winget install babyworm.VideoViewer
+```
+
 ### Build from source
 
 #### Prerequisites
