@@ -375,8 +375,8 @@ fn test_multi_frame_different_ctu_counts() {
 
 #[test]
 fn test_unsupported_version() {
-    // Version > 0 should be rejected
-    let data = [b'I', b'P', 0x01, 0x00]; // version=1
+    // Version > 1 should be rejected (v0 and v1 are supported)
+    let data = [b'I', b'P', 0x02, 0x00]; // version=2
     let err = SidebandFile::from_bytes(&data).unwrap_err();
     assert!(
         err.contains("unsupported sideband version"),

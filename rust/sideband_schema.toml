@@ -1,95 +1,113 @@
-# Sideband Binary Format Schema v0
+# Sideband Binary Format Schema v1
+# Extends v0 with ISP research platform fields.
 # Shared across: video-viewer, isp_emulator, isp_hevc
-# Single source of truth for binary layout.
 #
-# Encoding rules:
+# v1 additions:
+#   Frame: 20B -> 28B (+8 bytes for exposure/lens metadata)
+#   CTU:   16B -> 24B (+8 bytes for noise/lens per-CTU detail)
+#
+# v0 consumers ignore version byte and read only the first 20/16 bytes,
+# so v1 is wire-compatible as long as the consumer checks version.
+#
+# Encoding rules (same as v0):
 #   - All multi-byte fields are big-endian
 #   - Packed fields: writer stores (value << shift), reader extracts (byte >> shift)
 #   - type: u8, i8, u16, i32 (always big-endian for multi-byte)
 #   - shift: right-shift to extract from packed byte (0 = raw)
 #   - scale: fixed-point denominator (256 = Q8.8, 0 = none)
+#   - min_version: minimum schema version that includes this field
 
 [format]
 magic = "IP"
-version = 0
+version = 1
 endian = "big"
 
 [header]
 short_size = 4
 extended_size = 6
 extended_marker = 255
-# CTU count encoding:
-#   byte[3] < 0xFF  → short form (4-byte header), count = byte[3]
-#   byte[3] == 0xFF → extended form (6-byte header), count = u16 at bytes[4..6]
 
 [frame_params]
-size = 20
+size = 28
+
+# --- v0 fields (offsets 0-19) ---
 
 [[frame_params.fields]]
 name = "frame_id"
 offset = 0
 type = "i32"
 shift = 0
+min_version = 0
 
 [[frame_params.fields]]
 name = "valid_fields_mask"
 offset = 4
 type = "u16"
 shift = 0
+min_version = 0
 
 [[frame_params.fields]]
 name = "scene_class"
 offset = 6
 type = "u8"
 shift = 4
+min_version = 0
 
 [[frame_params.fields]]
 name = "noise_class"
 offset = 7
 type = "u8"
 shift = 5
+min_version = 0
 
 [[frame_params.fields]]
 name = "motion_class"
 offset = 8
 type = "u8"
 shift = 5
+min_version = 0
 
 [[frame_params.fields]]
 name = "denoise_strength"
 offset = 9
 type = "u8"
 shift = 3
+min_version = 0
 
 [[frame_params.fields]]
 name = "sharpen_strength"
 offset = 10
 type = "u8"
 shift = 3
+min_version = 0
 
 [[frame_params.fields]]
 name = "scene_flags"
 offset = 11
 type = "u8"
 shift = 0
+min_version = 0
 
 [[frame_params.fields]]
 name = "frame_qp_bias"
 offset = 12
 type = "i8"
 shift = 0
+min_version = 0
 
 [[frame_params.fields]]
 name = "frame_chroma_cb_bias"
 offset = 13
 type = "i8"
 shift = 0
+min_version = 0
 
 [[frame_params.fields]]
 name = "frame_chroma_cr_bias"
 offset = 14
 type = "i8"
 shift = 0
+min_version = 0
 
 [[frame_params.fields]]
 name = "frame_lambda_scale_q8"
@@ -97,83 +115,168 @@ offset = 15
 type = "u16"
 shift = 0
 scale = 256
+min_version = 0
 
 [[frame_params.fields]]
 name = "global_confidence"
 offset = 17
 type = "u8"
 shift = 0
+min_version = 0
 
-# bytes 18-19: reserved (zero)
+# bytes 18-19: reserved (zero) in v0
+
+# --- v1 extensions (offsets 20-27) ---
+
+[[frame_params.fields]]
+name = "iso_class"
+offset = 20
+type = "u8"
+shift = 0
+min_version = 1
+# 0=Low, 1=Med, 2=High
+
+[[frame_params.fields]]
+name = "ae_state"
+offset = 21
+type = "u8"
+shift = 0
+min_version = 1
+# 0=Stable, 1=Converging, 2=Hunting
+
+[[frame_params.fields]]
+name = "histogram_shape"
+offset = 22
+type = "u8"
+shift = 0
+min_version = 1
+# 0=Normal, 1=LowKey, 2=HighKey, 3=Bimodal
+
+[[frame_params.fields]]
+name = "dynamic_range_q8"
+offset = 23
+type = "u8"
+shift = 0
+scale = 16
+min_version = 1
+# Dynamic range in stops, Q4.4 (16 = 1.0 stop)
+
+[[frame_params.fields]]
+name = "ca_severity_q8"
+offset = 24
+type = "u8"
+shift = 0
+scale = 255
+min_version = 1
+# 0-255, 255 = max severity
+
+[[frame_params.fields]]
+name = "distortion_k1_q8"
+offset = 25
+type = "i8"
+shift = 0
+scale = 100
+min_version = 1
+# k1 * 100, signed
+
+[[frame_params.fields]]
+name = "scene_change_score"
+offset = 26
+type = "u8"
+shift = 0
+min_version = 1
+# 0-255
+
+[[frame_params.fields]]
+name = "v1_frame_reserved"
+offset = 27
+type = "u8"
+shift = 0
+min_version = 1
+
+# ===========================================================================
 
 [ctu_params]
-size = 16
+size = 24
+
+# --- v0 fields (offsets 0-15) ---
 
 [[ctu_params.fields]]
 name = "activity"
 offset = 0
 type = "u8"
 shift = 2
+min_version = 0
 
 [[ctu_params.fields]]
 name = "flatness"
 offset = 1
 type = "u8"
 shift = 2
+min_version = 0
 
 [[ctu_params.fields]]
 name = "edge_density"
 offset = 2
 type = "u8"
 shift = 2
+min_version = 0
 
 [[ctu_params.fields]]
 name = "noise"
 offset = 3
 type = "u8"
 shift = 4
+min_version = 0
 
 [[ctu_params.fields]]
 name = "saliency"
 offset = 4
 type = "u8"
 shift = 2
+min_version = 0
 
 [[ctu_params.fields]]
 name = "chroma_importance"
 offset = 5
 type = "u8"
 shift = 3
+min_version = 0
 
 [[ctu_params.fields]]
 name = "confidence"
 offset = 6
 type = "u8"
 shift = 4
+min_version = 0
 
 [[ctu_params.fields]]
 name = "ctu_flags"
 offset = 7
 type = "u8"
 shift = 5
+min_version = 0
 
 [[ctu_params.fields]]
 name = "qp_delta"
 offset = 8
 type = "i8"
 shift = 0
+min_version = 0
 
 [[ctu_params.fields]]
 name = "chroma_cb_delta"
 offset = 9
 type = "i8"
 shift = 0
+min_version = 0
 
 [[ctu_params.fields]]
 name = "chroma_cr_delta"
 offset = 10
 type = "i8"
 shift = 0
+min_version = 0
 
 [[ctu_params.fields]]
 name = "lambda_scale_q8"
@@ -181,21 +284,92 @@ offset = 11
 type = "u16"
 shift = 0
 scale = 256
+min_version = 0
 
 [[ctu_params.fields]]
 name = "rc_importance_weight"
 offset = 13
 type = "u8"
 shift = 0
+min_version = 0
 
 [[ctu_params.fields]]
 name = "sao_prior"
 offset = 14
 type = "i8"
 shift = 0
+min_version = 0
 
 [[ctu_params.fields]]
 name = "temporal_stability"
 offset = 15
 type = "u8"
 shift = 0
+min_version = 0
+
+# --- v1 extensions (offsets 16-23) ---
+
+[[ctu_params.fields]]
+name = "noise_sigma_q8"
+offset = 16
+type = "u8"
+shift = 0
+scale = 16
+min_version = 1
+# sigma * 16, Q4.4
+
+[[ctu_params.fields]]
+name = "noise_confidence"
+offset = 17
+type = "u8"
+shift = 0
+min_version = 1
+# 0-255
+
+[[ctu_params.fields]]
+name = "clip_risk"
+offset = 18
+type = "u8"
+shift = 0
+min_version = 1
+# 0-255
+
+[[ctu_params.fields]]
+name = "structure_class"
+offset = 19
+type = "u8"
+shift = 0
+min_version = 1
+# 0=Smooth, 1=Edge, 2=Texture (matches RegionClass)
+
+[[ctu_params.fields]]
+name = "dof_sharpness"
+offset = 20
+type = "u8"
+shift = 0
+min_version = 1
+# 0-255, 255 = fully in focus
+
+[[ctu_params.fields]]
+name = "vignetting_gain_q8"
+offset = 21
+type = "u8"
+shift = 0
+scale = 255
+min_version = 1
+# 0-255, 255 = no vignetting
+
+[[ctu_params.fields]]
+name = "denoise_confidence"
+offset = 22
+type = "u8"
+shift = 0
+min_version = 1
+# 0-255
+
+[[ctu_params.fields]]
+name = "v1_ctu_reserved"
+offset = 23
+type = "u8"
+shift = 0
+min_version = 1

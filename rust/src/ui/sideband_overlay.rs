@@ -105,6 +105,41 @@ fn get_ctu_color(ctu: &SidebandCtu, mode: SidebandOverlayMode) -> (f64, Color32)
             let v = ctu.temporal_stability as f64;
             (v, sequential_colormap(v / 255.0, [255, 60, 60], [60, 60, 255]))
         }
+        // v1 modes
+        SidebandOverlayMode::NoiseSigma => {
+            let v = ctu.noise_sigma_q8 as f64;
+            (v, sequential_colormap(v / 255.0, [20, 20, 20], [255, 100, 0])) // dark -> orange
+        }
+        SidebandOverlayMode::NoiseConfidence => {
+            let v = ctu.noise_confidence as f64;
+            (v, sequential_colormap(v / 255.0, [255, 60, 60], [60, 200, 60])) // red -> green
+        }
+        SidebandOverlayMode::ClipRisk => {
+            let v = ctu.clip_risk as f64;
+            (v, sequential_colormap(v / 255.0, [20, 80, 20], [255, 0, 0])) // green -> red
+        }
+        SidebandOverlayMode::StructureClass => {
+            let v = ctu.structure_class as f64;
+            // 0=Smooth(blue), 1=Edge(yellow), 2=Texture(magenta)
+            let color = match ctu.structure_class {
+                0 => Color32::from_rgb(60, 120, 255),
+                1 => Color32::from_rgb(255, 220, 40),
+                _ => Color32::from_rgb(220, 60, 220),
+            };
+            (v, color)
+        }
+        SidebandOverlayMode::DofSharpness => {
+            let v = ctu.dof_sharpness as f64;
+            (v, sequential_colormap(v / 255.0, [180, 40, 40], [40, 255, 40])) // blurry(red) -> sharp(green)
+        }
+        SidebandOverlayMode::VignettingGain => {
+            let v = ctu.vignetting_gain_q8 as f64;
+            (v, sequential_colormap(v / 255.0, [40, 0, 80], [255, 255, 200])) // dark purple -> bright
+        }
+        SidebandOverlayMode::DenoiseConfidence => {
+            let v = ctu.denoise_confidence as f64;
+            (v, sequential_colormap(v / 255.0, [255, 60, 60], [60, 200, 60])) // red -> green
+        }
         SidebandOverlayMode::None => (0.0, Color32::TRANSPARENT),
     }
 }

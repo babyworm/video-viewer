@@ -33,6 +33,14 @@ pub struct SidebandFrame {
     pub frame_chroma_cr_bias: i8,
     pub frame_lambda_scale_q8: u16,
     pub global_confidence: u8,
+    // v1 fields
+    pub iso_class: u8,
+    pub ae_state: u8,
+    pub histogram_shape: u8,
+    pub dynamic_range_q8: u8,
+    pub ca_severity_q8: u8,
+    pub distortion_k1_q8: i8,
+    pub scene_change_score: u8,
     pub ctus: Vec<SidebandCtu>,
 }
 
@@ -54,6 +62,14 @@ pub struct SidebandCtu {
     pub rc_importance_weight: u8,
     pub sao_prior: i8,
     pub temporal_stability: u8,
+    // v1 fields
+    pub noise_sigma_q8: u8,
+    pub noise_confidence: u8,
+    pub clip_risk: u8,
+    pub structure_class: u8,
+    pub dof_sharpness: u8,
+    pub vignetting_gain_q8: u8,
+    pub denoise_confidence: u8,
 }
 
 /// Which CTU field to visualize as a heatmap overlay.
@@ -68,6 +84,14 @@ pub enum SidebandOverlayMode {
     Noise,
     Confidence,
     TemporalStability,
+    // v1 modes
+    NoiseSigma,
+    NoiseConfidence,
+    ClipRisk,
+    StructureClass,
+    DofSharpness,
+    VignettingGain,
+    DenoiseConfidence,
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +138,11 @@ struct SchemaField {
     field_type: String,
     #[serde(default)]
     shift: u8,
+    #[serde(default)]
+    #[allow(dead_code)]
+    scale: u16,
+    #[serde(default)]
+    min_version: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +176,29 @@ fn load_schema_from_str(toml_str: &str) -> Result<SchemaRoot, String> {
 // Generic field extraction from binary buffer
 // ---------------------------------------------------------------------------
 
+/// Compute the effective byte size of a section for a given binary version.
+///
+/// For the highest schema version, returns the declared `section.size`.
+/// For older versions, returns the start offset of the first field belonging
+/// to a newer version (which is where the older version's data ends, including
+/// any reserved/padding bytes between the last real field and the extension area).
+fn effective_section_size(section: &SchemaSection, version: u8) -> usize {
+    // Check if any field exceeds this version
+    let has_newer = section.fields.iter().any(|f| f.min_version > version);
+    if !has_newer {
+        // This is the newest (or only) version — use declared size
+        return section.size;
+    }
+    // Effective size = start offset of first field from a newer version
+    section
+        .fields
+        .iter()
+        .filter(|f| f.min_version > version)
+        .map(|f| f.offset)
+        .min()
+        .unwrap_or(section.size)
+}
+
 /// Extract a single field value as i64 from a binary buffer according to schema.
 fn extract_field(buf: &[u8], field: &SchemaField) -> i64 {
     match field.field_type.as_str() {
@@ -168,8 +220,17 @@ fn extract_field(buf: &[u8], field: &SchemaField) -> i64 {
 }
 
 /// Extract all fields from a section into a name→value map.
-fn extract_section<'a>(buf: &[u8], section: &'a SchemaSection) -> Vec<(&'a str, i64)> {
-    section.fields.iter().map(|f| (f.name.as_str(), extract_field(buf, f))).collect()
+/// Only extracts fields whose `min_version` <= the binary version
+/// and whose offset fits within the actual buffer.
+fn extract_section<'a>(buf: &[u8], section: &'a SchemaSection, version: u8) -> Vec<(&'a str, i64)> {
+    section
+        .fields
+        .iter()
+        .filter(|f| {
+            f.min_version <= version && f.offset < buf.len()
+        })
+        .map(|f| (f.name.as_str(), extract_field(buf, f)))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +252,14 @@ fn map_frame_fields(values: &[(&str, i64)]) -> SidebandFrame {
         frame_chroma_cr_bias: 0,
         frame_lambda_scale_q8: 0,
         global_confidence: 0,
+        // v1 fields default to 0/neutral
+        iso_class: 0,
+        ae_state: 0,
+        histogram_shape: 0,
+        dynamic_range_q8: 0,
+        ca_severity_q8: 0,
+        distortion_k1_q8: 0,
+        scene_change_score: 0,
         ctus: Vec::new(),
     };
     for &(name, val) in values {
@@ -208,7 +277,15 @@ fn map_frame_fields(values: &[(&str, i64)]) -> SidebandFrame {
             "frame_chroma_cr_bias" => frame.frame_chroma_cr_bias = val as i8,
             "frame_lambda_scale_q8" => frame.frame_lambda_scale_q8 = val as u16,
             "global_confidence" => frame.global_confidence = val as u8,
-            _ => {} // ignore unknown fields (forward compatibility)
+            // v1 fields
+            "iso_class" => frame.iso_class = val as u8,
+            "ae_state" => frame.ae_state = val as u8,
+            "histogram_shape" => frame.histogram_shape = val as u8,
+            "dynamic_range_q8" => frame.dynamic_range_q8 = val as u8,
+            "ca_severity_q8" => frame.ca_severity_q8 = val as u8,
+            "distortion_k1_q8" => frame.distortion_k1_q8 = val as i8,
+            "scene_change_score" => frame.scene_change_score = val as u8,
+            _ => {} // ignore unknown/reserved fields (forward compatibility)
         }
     }
     frame
@@ -233,6 +310,14 @@ fn map_ctu_fields(values: &[(&str, i64)]) -> SidebandCtu {
             "rc_importance_weight" => ctu.rc_importance_weight = val as u8,
             "sao_prior" => ctu.sao_prior = val as i8,
             "temporal_stability" => ctu.temporal_stability = val as u8,
+            // v1 fields
+            "noise_sigma_q8" => ctu.noise_sigma_q8 = val as u8,
+            "noise_confidence" => ctu.noise_confidence = val as u8,
+            "clip_risk" => ctu.clip_risk = val as u8,
+            "structure_class" => ctu.structure_class = val as u8,
+            "dof_sharpness" => ctu.dof_sharpness = val as u8,
+            "vignetting_gain_q8" => ctu.vignetting_gain_q8 = val as u8,
+            "denoise_confidence" => ctu.denoise_confidence = val as u8,
             _ => {}
         }
     }
@@ -291,20 +376,21 @@ fn parse_one_frame(
         (count_byte as usize, hdr.short_size)
     };
 
-    let fp_size = schema.frame_params.size;
-    let ctu_size = schema.ctu_params.size;
+    // Use version-aware sizes: a v0 binary uses smaller frame/CTU buffers
+    let fp_size = effective_section_size(&schema.frame_params, version);
+    let ctu_size = effective_section_size(&schema.ctu_params, version);
     let needed = header_size + fp_size + ctu_size * num_ctus;
     if remaining < needed {
         return Err(format!(
-            "truncated frame at offset {}: need {} bytes ({} CTUs), have {}",
-            offset, needed, num_ctus, remaining
+            "truncated frame at offset {}: need {} bytes ({} CTUs, v{}), have {}",
+            offset, needed, num_ctus, version, remaining
         ));
     }
 
     // Extract frame params
     let fp_start = offset + header_size;
     let fp_buf = &data[fp_start..fp_start + fp_size];
-    let fp_values = extract_section(fp_buf, &schema.frame_params);
+    let fp_values = extract_section(fp_buf, &schema.frame_params, version);
     let mut frame = map_frame_fields(&fp_values);
 
     // Extract CTU params
@@ -313,7 +399,7 @@ fn parse_one_frame(
     for i in 0..num_ctus {
         let co = ctu_base + i * ctu_size;
         let ctu_buf = &data[co..co + ctu_size];
-        let ctu_values = extract_section(ctu_buf, &schema.ctu_params);
+        let ctu_values = extract_section(ctu_buf, &schema.ctu_params, version);
         frame.ctus.push(map_ctu_fields(&ctu_values));
     }
 
@@ -420,9 +506,10 @@ impl fmt::Display for SidebandFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Frame(id={}, scene={}, noise={}, motion={}, qp_bias={}, ctus={})",
+            "Frame(id={}, scene={}, noise={}, motion={}, qp_bias={}, iso={}, ae={}, ctus={})",
             self.frame_id, self.scene_class, self.noise_class,
-            self.motion_class, self.frame_qp_bias, self.ctus.len(),
+            self.motion_class, self.frame_qp_bias,
+            self.iso_class, self.ae_state, self.ctus.len(),
         )
     }
 }
@@ -456,11 +543,24 @@ mod tests {
     fn schema_loads_successfully() {
         let schema = load_default_schema().unwrap();
         assert_eq!(schema.format.magic, "IP");
-        assert_eq!(schema.format.version, 0);
-        assert_eq!(schema.frame_params.size, 20);
-        assert_eq!(schema.ctu_params.size, 16);
-        assert_eq!(schema.frame_params.fields.len(), 13);
-        assert_eq!(schema.ctu_params.fields.len(), 15);
+        assert_eq!(schema.format.version, 1);
+        assert_eq!(schema.frame_params.size, 28);
+        assert_eq!(schema.ctu_params.size, 24);
+        // v0: 13 frame + v1: 8 (7 real + 1 reserved) = 21 total
+        assert_eq!(schema.frame_params.fields.len(), 21);
+        // v0: 15 ctu + v1: 8 (7 real + 1 reserved) = 23 total
+        assert_eq!(schema.ctu_params.fields.len(), 23);
+    }
+
+    #[test]
+    fn effective_sizes_match_versions() {
+        let schema = load_default_schema().unwrap();
+        // v0 effective sizes
+        assert_eq!(effective_section_size(&schema.frame_params, 0), 20);
+        assert_eq!(effective_section_size(&schema.ctu_params, 0), 16);
+        // v1 effective sizes
+        assert_eq!(effective_section_size(&schema.frame_params, 1), 28);
+        assert_eq!(effective_section_size(&schema.ctu_params, 1), 24);
     }
 
     #[test]

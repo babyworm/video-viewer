@@ -67,6 +67,15 @@ impl SidebandPanel {
                 ui.selectable_value(ctx.mode, SidebandOverlayMode::Noise, "Noise");
                 ui.selectable_value(ctx.mode, SidebandOverlayMode::Confidence, "Confidence");
                 ui.selectable_value(ctx.mode, SidebandOverlayMode::TemporalStability, "Temporal Stability");
+                ui.separator();
+                ui.label("── v1 fields ──");
+                ui.selectable_value(ctx.mode, SidebandOverlayMode::NoiseSigma, "Noise Sigma");
+                ui.selectable_value(ctx.mode, SidebandOverlayMode::NoiseConfidence, "Noise Confidence");
+                ui.selectable_value(ctx.mode, SidebandOverlayMode::ClipRisk, "Clip Risk");
+                ui.selectable_value(ctx.mode, SidebandOverlayMode::StructureClass, "Structure Class");
+                ui.selectable_value(ctx.mode, SidebandOverlayMode::DofSharpness, "DoF Sharpness");
+                ui.selectable_value(ctx.mode, SidebandOverlayMode::VignettingGain, "Vignetting Gain");
+                ui.selectable_value(ctx.mode, SidebandOverlayMode::DenoiseConfidence, "Denoise Confidence");
             });
 
         // Opacity slider
@@ -106,6 +115,52 @@ impl SidebandPanel {
                 ui.label("Lambda:");
                 ui.label(format!("{:.3}", frame.lambda_scale()));
                 ui.end_row();
+
+                // v1 frame fields (show if non-zero to indicate v1 data present)
+                if frame.iso_class > 0 || frame.ae_state > 0 || frame.scene_change_score > 0
+                    || frame.dynamic_range_q8 > 0
+                {
+                    ui.label("──");
+                    ui.label("v1 ──");
+                    ui.end_row();
+                    ui.label("ISO class:");
+                    ui.label(match frame.iso_class {
+                        0 => "Low".to_string(),
+                        1 => "Med".to_string(),
+                        2 => "High".to_string(),
+                        v => format!("{}", v),
+                    });
+                    ui.end_row();
+                    ui.label("AE state:");
+                    ui.label(match frame.ae_state {
+                        0 => "Stable".to_string(),
+                        1 => "Converging".to_string(),
+                        2 => "Hunting".to_string(),
+                        v => format!("{}", v),
+                    });
+                    ui.end_row();
+                    ui.label("Histogram:");
+                    ui.label(match frame.histogram_shape {
+                        0 => "Normal".to_string(),
+                        1 => "LowKey".to_string(),
+                        2 => "HighKey".to_string(),
+                        3 => "Bimodal".to_string(),
+                        v => format!("{}", v),
+                    });
+                    ui.end_row();
+                    ui.label("Dyn range:");
+                    ui.label(format!("{:.1} stops", frame.dynamic_range_q8 as f64 / 16.0));
+                    ui.end_row();
+                    ui.label("CA severity:");
+                    ui.label(format!("{}", frame.ca_severity_q8));
+                    ui.end_row();
+                    ui.label("Distortion k1:");
+                    ui.label(format!("{:.2}", frame.distortion_k1_q8 as f64 / 100.0));
+                    ui.end_row();
+                    ui.label("Scene change:");
+                    ui.label(format!("{}", frame.scene_change_score));
+                    ui.end_row();
+                }
             });
 
             ui.separator();
