@@ -116,9 +116,10 @@ impl SidebandPanel {
                 ui.label(format!("{:.3}", frame.lambda_scale()));
                 ui.end_row();
 
-                // v1 frame fields (show if non-zero to indicate v1 data present)
+                // v1 frame fields (show if any v1 field is non-zero)
                 if frame.iso_class > 0 || frame.ae_state > 0 || frame.scene_change_score > 0
-                    || frame.dynamic_range_q8 > 0
+                    || frame.dynamic_range_q8 > 0 || frame.histogram_shape > 0
+                    || frame.ca_severity_q8 > 0 || frame.distortion_k1_q8 != 0
                 {
                     ui.label("──");
                     ui.label("v1 ──");

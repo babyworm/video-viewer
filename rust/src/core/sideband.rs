@@ -219,15 +219,26 @@ fn extract_field(buf: &[u8], field: &SchemaField) -> i64 {
     }
 }
 
+/// Byte width of a schema field type.
+fn field_byte_width(field_type: &str) -> usize {
+    match field_type {
+        "u8" | "i8" => 1,
+        "u16" => 2,
+        "i32" => 4,
+        _ => 1,
+    }
+}
+
 /// Extract all fields from a section into a name→value map.
 /// Only extracts fields whose `min_version` <= the binary version
-/// and whose offset fits within the actual buffer.
+/// and whose offset + width fits within the actual buffer.
 fn extract_section<'a>(buf: &[u8], section: &'a SchemaSection, version: u8) -> Vec<(&'a str, i64)> {
     section
         .fields
         .iter()
         .filter(|f| {
-            f.min_version <= version && f.offset < buf.len()
+            f.min_version <= version
+                && f.offset + field_byte_width(&f.field_type) <= buf.len()
         })
         .map(|f| (f.name.as_str(), extract_field(buf, f)))
         .collect()

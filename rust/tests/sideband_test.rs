@@ -384,3 +384,159 @@ fn test_unsupported_version() {
         err
     );
 }
+
+// ---------------------------------------------------------------------------
+// v1 test helpers
+// ---------------------------------------------------------------------------
+
+/// Build a sideband header with a specified version byte.
+fn write_header_v(buf: &mut Vec<u8>, version: u8, num_ctus: usize) {
+    buf.push(b'I');
+    buf.push(b'P');
+    buf.push(version);
+    if num_ctus < 255 {
+        buf.push(num_ctus as u8);
+    } else {
+        buf.push(0xFF);
+        buf.push((num_ctus >> 8) as u8);
+        buf.push((num_ctus & 0xFF) as u8);
+    }
+}
+
+/// Build a 28-byte v1 frame param block (20B v0 + 8B v1 extension).
+fn write_frame_params_v1(
+    buf: &mut Vec<u8>,
+    frame_id: i32,
+    iso_class: u8,
+    ae_state: u8,
+    histogram_shape: u8,
+    dynamic_range_q8: u8,
+    ca_severity_q8: u8,
+    distortion_k1_q8: i8,
+    scene_change_score: u8,
+) {
+    // v0 portion (20 bytes): neutral values
+    buf.push((frame_id >> 24) as u8);
+    buf.push((frame_id >> 16) as u8);
+    buf.push((frame_id >> 8) as u8);
+    buf.push(frame_id as u8);
+    buf.push(0xFF); // valid_fields_mask hi
+    buf.push(0xFF); // valid_fields_mask lo
+    buf.push(0);    // scene_class
+    buf.push(0);    // noise_class
+    buf.push(0);    // motion_class
+    buf.push(0);    // denoise_strength
+    buf.push(0);    // sharpen_strength
+    buf.push(0);    // scene_flags
+    buf.push(0);    // frame_qp_bias
+    buf.push(0);    // frame_chroma_cb_bias
+    buf.push(0);    // frame_chroma_cr_bias
+    buf.push(0);    // frame_lambda_scale_q8 hi
+    buf.push(0);    // frame_lambda_scale_q8 lo
+    buf.push(0);    // global_confidence
+    buf.push(0);    // reserved
+    buf.push(0);    // reserved
+    // v1 extension (8 bytes)
+    buf.push(iso_class);
+    buf.push(ae_state);
+    buf.push(histogram_shape);
+    buf.push(dynamic_range_q8);
+    buf.push(ca_severity_q8);
+    buf.push(distortion_k1_q8 as u8);
+    buf.push(scene_change_score);
+    buf.push(0);    // v1_frame_reserved
+}
+
+/// Build a 24-byte v1 CTU param block (16B v0 + 8B v1 extension).
+fn write_ctu_params_v1(
+    buf: &mut Vec<u8>,
+    noise_sigma_q8: u8,
+    noise_confidence: u8,
+    clip_risk: u8,
+    structure_class: u8,
+    dof_sharpness: u8,
+    vignetting_gain_q8: u8,
+    denoise_confidence: u8,
+) {
+    // v0 portion (16 bytes): neutral values
+    for _ in 0..16 {
+        buf.push(0);
+    }
+    // v1 extension (8 bytes)
+    buf.push(noise_sigma_q8);
+    buf.push(noise_confidence);
+    buf.push(clip_risk);
+    buf.push(structure_class);
+    buf.push(dof_sharpness);
+    buf.push(vignetting_gain_q8);
+    buf.push(denoise_confidence);
+    buf.push(0); // v1_ctu_reserved
+}
+
+// ---------------------------------------------------------------------------
+// v1 parsing tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_v1_frame_fields_parsed() {
+    let mut buf = Vec::new();
+    write_header_v(&mut buf, 1, 1);
+    write_frame_params_v1(&mut buf, 42, 2, 1, 3, 160, 200, -5, 180);
+    write_ctu_params_v1(&mut buf, 0, 0, 0, 0, 0, 0, 0);
+
+    let sb = SidebandFile::from_bytes(&buf).unwrap();
+    let f = sb.frame(0).unwrap();
+    assert_eq!(f.frame_id, 42);
+    assert_eq!(f.iso_class, 2);
+    assert_eq!(f.ae_state, 1);
+    assert_eq!(f.histogram_shape, 3);
+    assert_eq!(f.dynamic_range_q8, 160);
+    assert_eq!(f.ca_severity_q8, 200);
+    assert_eq!(f.distortion_k1_q8, -5);
+    assert_eq!(f.scene_change_score, 180);
+}
+
+#[test]
+fn test_v1_ctu_fields_parsed() {
+    let mut buf = Vec::new();
+    write_header_v(&mut buf, 1, 1);
+    write_frame_params_v1(&mut buf, 0, 0, 0, 0, 0, 0, 0, 0);
+    write_ctu_params_v1(&mut buf, 128, 200, 50, 2, 255, 180, 90);
+
+    let sb = SidebandFile::from_bytes(&buf).unwrap();
+    let ctu = &sb.frame(0).unwrap().ctus[0];
+    assert_eq!(ctu.noise_sigma_q8, 128);
+    assert_eq!(ctu.noise_confidence, 200);
+    assert_eq!(ctu.clip_risk, 50);
+    assert_eq!(ctu.structure_class, 2);
+    assert_eq!(ctu.dof_sharpness, 255);
+    assert_eq!(ctu.vignetting_gain_q8, 180);
+    assert_eq!(ctu.denoise_confidence, 90);
+}
+
+#[test]
+fn test_v0_binary_with_v1_schema_ignores_extensions() {
+    // v0 binary: 20B frame + 16B CTU — v1 fields should default to 0
+    let mut buf = Vec::new();
+    write_header_v(&mut buf, 0, 1);
+    write_frame_params(
+        &mut buf, 1, 5, 3, 2, 10, 8, 0x01, -3, 1, -1, 512, 200,
+    );
+    write_ctu_params(
+        &mut buf, 10, 20, 30, 5, 40, 8, 12, 1, -2, 1, -1, 300, 50, 3, 100,
+    );
+
+    let sb = SidebandFile::from_bytes(&buf).unwrap();
+    let f = sb.frame(0).unwrap();
+    // v0 fields parsed correctly
+    assert_eq!(f.frame_id, 1);
+    assert_eq!(f.scene_class, 5);
+    // v1 fields default to 0
+    assert_eq!(f.iso_class, 0);
+    assert_eq!(f.ae_state, 0);
+    assert_eq!(f.distortion_k1_q8, 0);
+    // v1 CTU fields default to 0
+    let ctu = &f.ctus[0];
+    assert_eq!(ctu.noise_sigma_q8, 0);
+    assert_eq!(ctu.dof_sharpness, 0);
+}
