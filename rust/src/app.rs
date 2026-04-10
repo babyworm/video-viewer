@@ -1883,12 +1883,11 @@ impl VideoViewerApp {
         // Windows file association dialog
         #[cfg(target_os = "windows")]
         if self.show_register_assoc {
-            let mut open = true;
             let mut do_register = false;
             let mut do_unregister = false;
+            let mut do_close = false;
 
             egui::Window::new("Register File Associations")
-                .open(&mut open)
                 .resizable(false)
                 .collapsible(false)
                 .show(ctx, |ui| {
@@ -1921,7 +1920,7 @@ impl VideoViewerApp {
                             do_unregister = true;
                         }
                         if ui.button("Close").clicked() {
-                            open = false;
+                            do_close = true;
                         }
                     });
                 });
@@ -1932,7 +1931,7 @@ impl VideoViewerApp {
             if do_unregister {
                 self.register_assoc_result = Some(win_file_assoc::unregister());
             }
-            if !open {
+            if do_close {
                 self.show_register_assoc = false;
                 self.register_assoc_result = None;
             }
