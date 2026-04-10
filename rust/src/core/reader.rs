@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 use std::fs::File;
 
@@ -8,6 +8,20 @@ use crate::core::formats::{VideoFormat, FormatType, get_format_by_name};
 use crate::core::hints::parse_filename_hints;
 use crate::core::ppm::parse_ppm_header;
 use crate::core::y4m::{parse_y4m_header, build_frame_offsets};
+
+/// Image file extensions decodable by the `image` crate.
+const IMAGE_EXTENSIONS: &[&str] = &["png", "bmp", "jpg", "jpeg", "tif", "tiff", "gif", "webp"];
+
+/// Check if a file extension is a decodable image format.
+pub fn is_image_ext(ext: &str) -> bool {
+    IMAGE_EXTENSIONS.contains(&ext)
+}
+
+/// Check if a file extension auto-detects parameters from the file header
+/// (Y4M, PPM, PNG, BMP, etc.) — no manual width/height/format needed.
+pub fn is_auto_detect_ext(ext: &str) -> bool {
+    ext == "y4m" || ext == "ppm" || is_image_ext(ext)
+}
 
 /// Default cache budget: 512 MiB.
 const DEFAULT_CACHE_BYTES: usize = 512 * 1024 * 1024;
@@ -41,6 +55,12 @@ pub struct VideoReader {
     y4m_fps: Option<f64>,
     pub color_matrix: String,
     is_y4m: bool,
+    /// File paths for image sequences (PNG, etc.). Empty for non-sequence files.
+    image_paths: Vec<PathBuf>,
+    /// Interlace mode from Y4M header ("progressive", "tff", "bff", or "").
+    interlace: String,
+    /// For image sequences: the frame index of the originally opened file.
+    initial_frame: usize,
 }
 
 impl VideoReader {
@@ -55,16 +75,68 @@ impl VideoReader {
         path: &str,
         mut width: u32,
         mut height: u32,
-        mut format_name: &str,
+        format_name: &str,
         color_matrix: &str,
     ) -> Result<Self, String> {
         // ------------------------------------------------------------------
-        // 1. Read file into memory (mmap preferred, Vec<u8> as fallback).
+        // 1. Detect format by extension (before reading file data).
+        // ------------------------------------------------------------------
+        let ext = Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let is_image = is_image_ext(&ext);
+
+        let mut frame_offsets: Vec<usize> = Vec::new();
+        let mut y4m_fps: Option<f64> = None;
+        let mut image_paths: Vec<PathBuf> = Vec::new();
+        let mut interlace = String::new();
+        let mut is_y4m = false;
+        let mut initial_frame: usize = 0;
+
+        let format: &'static VideoFormat;
+        let frame_size: usize;
+        let total_frames: usize;
+        let data: FileData;
+
+        if is_image {
+            // --------------------------------------------------------------
+            // 2i. Image path (PNG, BMP, JPG, etc.) — decode via image crate,
+            //     detect numbered sequences. Skip mmap — image crate reads
+            //     the file directly.
+            // --------------------------------------------------------------
+            let p = Path::new(path);
+            let (seq, selected_idx) = detect_image_sequence(p);
+
+            // Decode the selected image for dimensions (not always seq[0],
+            // since the user may have opened a middle frame).
+            let (rgb_data, img_w, img_h) = decode_image_to_rgb(&seq[selected_idx])?;
+            width = img_w;
+            height = img_h;
+            format = get_format_by_name("RGB24")
+                .ok_or_else(|| "RGB24 format not found".to_string())?;
+            frame_size = format.frame_size(width, height);
+
+            if seq.len() > 1 {
+                initial_frame = selected_idx;
+                image_paths = seq;
+                total_frames = image_paths.len();
+            } else {
+                total_frames = 1;
+            }
+            // Store decoded RGB pixels as the backing data
+            data = FileData::Heap(rgb_data);
+            frame_offsets.push(0);
+        } else {
+
+        // ------------------------------------------------------------------
+        // 2. Non-image: read file into memory (mmap preferred, fallback).
         // ------------------------------------------------------------------
         let file = File::open(path)
             .map_err(|e| format!("Cannot open '{}': {e}", path))?;
 
-        let data = match unsafe { Mmap::map(&file) } {
+        let raw_data = match unsafe { Mmap::map(&file) } {
             Ok(m) => FileData::Mmap(m),
             Err(_) => {
                 use std::io::Read;
@@ -77,25 +149,9 @@ impl VideoReader {
             }
         };
 
-        let raw = data.as_slice();
-
-        // ------------------------------------------------------------------
-        // 2. Detect Y4M vs raw.
-        // ------------------------------------------------------------------
-        let ext = Path::new(path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        let is_y4m = ext == "y4m" || raw.starts_with(b"YUV4MPEG2");
+        let raw = raw_data.as_slice();
+        is_y4m = ext == "y4m" || raw.starts_with(b"YUV4MPEG2");
         let is_ppm = ext == "ppm" || raw.starts_with(b"P6");
-
-        let mut frame_offsets: Vec<usize> = Vec::new();
-        let mut y4m_fps: Option<f64> = None;
-
-        let format: &'static VideoFormat;
-        let frame_size: usize;
-        let total_frames: usize;
 
         if is_ppm {
             // --------------------------------------------------------------
@@ -119,6 +175,7 @@ impl VideoReader {
             if header.fps_den != 0 {
                 y4m_fps = Some(header.fps());
             }
+            interlace = header.interlace.clone();
             let fmt_name = header.to_format_name();
             format = get_format_by_name(fmt_name)
                 .ok_or_else(|| format!("Unknown Y4M format name '{fmt_name}'"))?;
@@ -130,6 +187,7 @@ impl VideoReader {
             // --------------------------------------------------------------
             // 3b. Raw path — apply filename hints if width not provided.
             // --------------------------------------------------------------
+            let mut hinted_format = String::new();
             if width == 0 {
                 let hints = parse_filename_hints(path);
                 if let (Some(w), Some(h)) = (hints.width, hints.height) {
@@ -138,7 +196,7 @@ impl VideoReader {
                 }
                 if let Some(ref fmt) = hints.format {
                     if format_name.is_empty() {
-                        format_name = Box::leak(fmt.clone().into_boxed_str());
+                        hinted_format = fmt.clone();
                     }
                 }
             }
@@ -147,7 +205,13 @@ impl VideoReader {
                 return Err("Width and height must be provided for raw files".to_string());
             }
 
-            let fmt_key = if format_name.is_empty() { "I420" } else { format_name };
+            let fmt_key = if !hinted_format.is_empty() {
+                hinted_format.as_str()
+            } else if format_name.is_empty() {
+                "I420"
+            } else {
+                format_name
+            };
             format = get_format_by_name(fmt_key)
                 .ok_or_else(|| format!("Unknown format '{fmt_key}'"))?;
 
@@ -158,7 +222,10 @@ impl VideoReader {
             total_frames = raw.len() / frame_size;
         }
 
-        Ok(VideoReader {
+        data = raw_data;
+        } // end of else (non-image)
+
+        let mut reader = VideoReader {
             data,
             width,
             height,
@@ -170,7 +237,20 @@ impl VideoReader {
             y4m_fps,
             color_matrix: color_matrix.to_string(),
             is_y4m,
-        })
+            image_paths,
+            interlace,
+            initial_frame,
+        };
+
+        // Pre-cache the initially decoded frame for image sequences.
+        if !reader.image_paths.is_empty() {
+            let decoded = reader.data.as_slice();
+            if decoded.len() >= reader.frame_size {
+                reader.cache.put(reader.initial_frame, decoded[..reader.frame_size].to_vec());
+            }
+        }
+
+        Ok(reader)
     }
 
     // ------------------------------------------------------------------
@@ -183,6 +263,8 @@ impl VideoReader {
     pub fn format_name(&self) -> &str { &self.format.name }
     pub fn format(&self) -> &crate::core::formats::VideoFormat { self.format }
     pub fn y4m_fps(&self) -> Option<f64> { self.y4m_fps }
+    pub fn interlace(&self) -> &str { &self.interlace }
+    pub fn initial_frame(&self) -> usize { self.initial_frame }
 
     // ------------------------------------------------------------------
     // Frame access
@@ -200,6 +282,20 @@ impl VideoReader {
         // Cache hit?
         if let Some(cached) = self.cache.get(idx) {
             return Ok(cached.clone());
+        }
+
+        // Image sequence: decode from individual file.
+        if !self.image_paths.is_empty() {
+            let path = &self.image_paths[idx];
+            let (rgb_data, dec_w, dec_h) = decode_image_to_rgb(path)?;
+            if dec_w != self.width || dec_h != self.height {
+                return Err(format!(
+                    "Frame {idx} has dimensions {dec_w}x{dec_h}, expected {}x{}",
+                    self.width, self.height
+                ));
+            }
+            self.cache.put(idx, rgb_data.clone());
+            return Ok(rgb_data);
         }
 
         // Determine byte offset.
@@ -622,6 +718,105 @@ impl VideoReader {
         }
 
         channels
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Image helpers
+// ---------------------------------------------------------------------------
+
+/// Decode an image file to RGB24 using the `image` crate.
+fn decode_image_to_rgb(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
+    let img = image::open(path)
+        .map_err(|e| format!("Cannot decode '{}': {}", path.display(), e))?;
+    let rgb = img.to_rgb8();
+    let (w, h) = rgb.dimensions();
+    Ok((rgb.into_raw(), w, h))
+}
+
+/// Detect numbered image sequence from a single file path.
+///
+/// Given `frame_0042.png`, finds all `frame_NNNN.png` in the same directory
+/// and returns `(sorted_paths, selected_index)` where `selected_index` is
+/// the position of `path` in the sorted list. Returns a single-element vec
+/// with index 0 if no sequence pattern is found.
+fn detect_image_sequence(path: &Path) -> (Vec<PathBuf>, usize) {
+    let single = || (vec![path.to_path_buf()], 0usize);
+
+    let dir = match path.parent() {
+        Some(d) => d,
+        None => return single(),
+    };
+    let ext = match path.extension().and_then(|e| e.to_str()) {
+        Some(e) => e.to_lowercase(),
+        None => return single(),
+    };
+    let stem = match path.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s,
+        None => return single(),
+    };
+
+    // Find trailing digits in the stem (e.g. "frame_0042" → prefix="frame_", digits=4)
+    let digit_count = stem.chars().rev().take_while(|c| c.is_ascii_digit()).count();
+    if digit_count == 0 || digit_count == stem.len() {
+        // No digits, or stem is entirely digits (e.g. "0042.png") — skip sequence detection
+        // to avoid matching unrelated numbered files in the same directory.
+        return single();
+    }
+
+    let prefix = &stem[..stem.len() - digit_count];
+
+    // Collect matching files in the directory
+    let mut numbered: Vec<(u64, PathBuf)> = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            log::warn!("Cannot scan directory for image sequence: {}", e);
+            return single();
+        }
+    };
+    for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if !entry_path.is_file() {
+                continue;
+            }
+
+            let entry_ext = entry_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase());
+            if entry_ext.as_deref() != Some(ext.as_str()) {
+                continue;
+            }
+
+            let entry_stem = match entry_path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+
+            if !entry_stem.starts_with(prefix) {
+                continue;
+            }
+            let suffix = &entry_stem[prefix.len()..];
+            if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+
+            if let Ok(num) = suffix.parse::<u64>() {
+                numbered.push((num, entry_path));
+            }
+        }
+
+    numbered.sort_by_key(|(num, _)| *num);
+    if numbered.is_empty() {
+        single()
+    } else {
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let paths: Vec<PathBuf> = numbered.into_iter().map(|(_, p)| p).collect();
+        let selected = paths.iter().position(|p| {
+            p.canonicalize().unwrap_or_else(|_| p.clone()) == canon
+        }).unwrap_or(0);
+        (paths, selected)
     }
 }
 

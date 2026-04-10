@@ -97,6 +97,12 @@ pub struct VideoViewerApp {
     pub sideband_show_values: bool,
     sideband_panel: crate::analysis::isp_sideband::SidebandPanel,
     sideband_dialog: Option<dialogs::SidebandFileDialog>,
+    /// Show Windows file association registration dialog.
+    #[cfg(target_os = "windows")]
+    show_register_assoc: bool,
+    /// Result message from file association registration.
+    #[cfg(target_os = "windows")]
+    register_assoc_result: Option<(bool, String)>,
 }
 
 impl VideoViewerApp {
@@ -176,6 +182,10 @@ impl VideoViewerApp {
             sideband_show_values: false,
             sideband_panel: crate::analysis::isp_sideband::SidebandPanel::new(),
             sideband_dialog: None,
+            #[cfg(target_os = "windows")]
+            show_register_assoc: false,
+            #[cfg(target_os = "windows")]
+            register_assoc_result: None,
         }
     }
 
@@ -191,6 +201,7 @@ impl VideoViewerApp {
         let color_matrix = &self.settings.defaults.color_matrix;
         match VideoReader::open(&path, width, height, format, color_matrix) {
             Ok(reader) => {
+                let start_frame = reader.initial_frame();
                 self.current_frame_idx = 0;
                 self.bookmarks.clear();
                 if let Some(fps) = reader.y4m_fps() {
@@ -206,6 +217,8 @@ impl VideoViewerApp {
                 self.reader = Some(reader);
                 self.is_playing = false;
                 self.last_frame_time = None;
+                self.playback_frame_times.clear();
+                self.playback_fps = 0.0;
                 // Clear sideband overlay from previous file.
                 self.unload_sideband();
                 // Clear stale frame data to prevent cross-file metrics.
@@ -217,8 +230,9 @@ impl VideoViewerApp {
                 self.scene_changes.clear();
                 self.scene_detect_active_job.store(0, Ordering::Relaxed);
                 self.scene_detect_running = false;
-                // Use goto_frame so component view is applied correctly.
-                self.goto_frame(ctx, 0);
+                // Seek to the initial frame (image sequences start at the
+                // file the user selected, others start at frame 0).
+                self.goto_frame(ctx, start_frame);
                 // Apply auto-fit immediately so the image fills the canvas.
                 if self.auto_fit {
                     let avail = ctx.available_rect().size();
@@ -892,7 +906,8 @@ impl eframe::App for VideoViewerApp {
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
                 .to_lowercase();
-            let (w, h, fmt) = if ext == "y4m" {
+            let is_auto = crate::core::reader::is_auto_detect_ext(&ext);
+            let (w, h, fmt) = if is_auto {
                 (0, 0, String::new())
             } else {
                 // Try filename hints
@@ -1139,7 +1154,7 @@ impl eframe::App for VideoViewerApp {
                         self.export_dialog = Some(dialogs::ExportDialog::new(self.total_frames()));
                         self.dialog_state = DialogState::Export;
                     }
-                    if ui.button("Export PNG Sequence...").clicked() {
+                    if ui.button("Export Image Sequence...").clicked() {
                         ui.close_menu();
                         self.png_export_dialog = Some(dialogs::PngExportDialog::new(self.total_frames()));
                         self.dialog_state = DialogState::PngExport;
@@ -1156,7 +1171,8 @@ impl eframe::App for VideoViewerApp {
                                         .and_then(|e| e.to_str())
                                         .unwrap_or("")
                                         .to_lowercase();
-                                    let (w, h, fmt) = if ext == "y4m" {
+                                    let is_auto = crate::core::reader::is_auto_detect_ext(&ext);
+                                    let (w, h, fmt) = if is_auto {
                                         (0, 0, String::new())
                                     } else {
                                         let hints = crate::core::hints::parse_filename_hints(path);
@@ -1235,7 +1251,14 @@ impl eframe::App for VideoViewerApp {
                         }
                         self.dialog_state = DialogState::Parameters;
                     }
-                    if ui.button("Convert...").clicked() {
+                    let is_image_file = self.current_file.as_ref().is_some_and(|p| {
+                        let ext = std::path::Path::new(p.as_str())
+                            .extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                        crate::core::reader::is_image_ext(&ext)
+                    });
+                    if ui.add_enabled(!is_image_file, egui::Button::new("Convert..."))
+                        .on_disabled_hover_text("Convert is not available for image files")
+                        .clicked() {
                         ui.close_menu();
                         let info = if let (Some(ref path), Some(ref r)) = (&self.current_file, &self.reader) {
                             format!("{} ({}x{} {})", path, r.width(), r.height(), r.format_name())
@@ -1317,6 +1340,15 @@ impl eframe::App for VideoViewerApp {
                             ctx.open_url(egui::OpenUrl::new_tab("https://media.xiph.org/video/derf/"));
                         }
                     });
+                    // Windows-only: file association registration
+                    #[cfg(target_os = "windows")]
+                    {
+                        ui.separator();
+                        if ui.button("Register File Associations...").clicked() {
+                            ui.close_menu();
+                            self.show_register_assoc = true;
+                        }
+                    }
                     ui.separator();
                     if ui.button("About").clicked() {
                         ui.close_menu();
@@ -1414,6 +1446,7 @@ impl eframe::App for VideoViewerApp {
         });
 
         // --- Status bar (declared first → stacks above navigation) ---
+        let mut status_params_clicked = false;
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 // Download progress (shown inline in status bar)
@@ -1437,12 +1470,26 @@ impl eframe::App for VideoViewerApp {
                     ui.colored_label(egui::Color32::RED, err);
                 } else if let Some(ref path) = self.current_file {
                     if let Some(ref r) = self.reader {
+                        ui.label(format!("{}  |", path));
+                        // Clickable resolution + format (opens Parameters dialog)
+                        let interlace_str = match r.interlace() {
+                            "tff" => " [TFF]",
+                            "bff" => " [BFF]",
+                            "mixed" => " [Mixed]",
+                            _ => "",
+                        };
+                        let res_text = format!(
+                            "  {}x{} {}{}  ",
+                            r.width(), r.height(), r.format_name(), interlace_str,
+                        );
+                        if ui.add(
+                            egui::Button::new(egui::RichText::new(&res_text).strong())
+                                .frame(false)
+                        ).on_hover_text("Click to change video parameters").clicked() {
+                            status_params_clicked = true;
+                        }
                         ui.label(format!(
-                            "{}  |  {}x{}  {}  |  {:.0}%  |  Frame {}/{}  |  {:.1} fps",
-                            path,
-                            r.width(),
-                            r.height(),
-                            r.format_name(),
+                            "|  {:.0}%  |  Frame {}/{}  |  {:.1} fps",
                             self.canvas.zoom_level() * 100.0,
                             self.current_frame_idx,
                             r.total_frames().saturating_sub(1),
@@ -1454,6 +1501,16 @@ impl eframe::App for VideoViewerApp {
                 }
             });
         });
+
+        // Handle status bar resolution click → open Parameters dialog
+        if status_params_clicked {
+            if let Some(ref r) = self.reader {
+                self.params_dialog = Some(dialogs::ParametersDialog::new(
+                    r.width(), r.height(), r.format_name(),
+                ));
+                self.dialog_state = DialogState::Parameters;
+            }
+        }
 
         // --- Navigation bar (declared second → sits at bottom edge) ---
         let total = self.total_frames();
@@ -1716,12 +1773,12 @@ impl VideoViewerApp {
             }
         }
 
-        // PNG export dialog
+        // Image sequence export dialog
         if self.dialog_state == DialogState::PngExport {
             if let Some(ref mut dlg) = self.png_export_dialog {
                 if let Some(result) = dlg.show(ctx) {
-                    if let Some((start, end, dir, prefix)) = result {
-                        self.export_png_sequence(ctx, start, end, &dir, &prefix);
+                    if let Some((start, end, dir, prefix, ext)) = result {
+                        self.export_image_sequence(ctx, start, end, &dir, &prefix, &ext);
                     }
                     self.dialog_state = DialogState::None;
                     self.png_export_dialog = None;
@@ -1821,6 +1878,64 @@ impl VideoViewerApp {
         // About dialog
         if self.show_about {
             self.show_about = dialogs::show_about_dialog(ctx);
+        }
+
+        // Windows file association dialog
+        #[cfg(target_os = "windows")]
+        if self.show_register_assoc {
+            let mut open = true;
+            let mut do_register = false;
+            let mut do_unregister = false;
+
+            egui::Window::new("Register File Associations")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    ui.label("Register this application as the default viewer for\nvideo file formats in Windows.");
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(
+                        "Extensions: .yuv .y4m .raw .rgb .bgr .nv12 .nv21\n\
+                         .yuyv .uyvy .grey .gray .i420 .yv12"
+                    ).monospace().small());
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Writes to HKCU (current user only, no admin required).")
+                            .weak()
+                            .small(),
+                    );
+
+                    if let Some((ok, ref msg)) = self.register_assoc_result {
+                        ui.add_space(4.0);
+                        let color = if ok { egui::Color32::LIGHT_GREEN } else { egui::Color32::RED };
+                        ui.colored_label(color, msg);
+                    }
+
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Register").clicked() {
+                            do_register = true;
+                        }
+                        if ui.button("Unregister").clicked() {
+                            do_unregister = true;
+                        }
+                        if ui.button("Close").clicked() {
+                            open = false;
+                        }
+                    });
+                });
+
+            if do_register {
+                self.register_assoc_result = Some(win_file_assoc::register());
+            }
+            if do_unregister {
+                self.register_assoc_result = Some(win_file_assoc::unregister());
+            }
+            if !open {
+                self.show_register_assoc = false;
+                self.register_assoc_result = None;
+            }
         }
 
         // Scene detection dialog
@@ -1945,9 +2060,21 @@ impl VideoViewerApp {
         self.status_error = None;
     }
 
-    fn export_png_sequence(&mut self, _ctx: &egui::Context, start: usize, end: usize, dir: &str, prefix: &str) {
+    fn export_image_sequence(&mut self, _ctx: &egui::Context, start: usize, end: usize, dir: &str, prefix: &str, ext: &str) {
         if start > end {
-            self.status_error = Some(format!("PNG export error: start frame ({start}) > end frame ({end})"));
+            self.status_error = Some(format!("Export error: start frame ({start}) > end frame ({end})"));
+            return;
+        }
+        if let Some(ref r) = self.reader {
+            let total = r.total_frames();
+            if end >= total {
+                self.status_error = Some(format!("Export error: end frame ({end}) >= total frames ({total})"));
+                return;
+            }
+        }
+        // Create output directory if needed.
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            self.status_error = Some(format!("Cannot create directory '{dir}': {e}"));
             return;
         }
         let reader = match self.reader.as_mut() {
@@ -1956,14 +2083,39 @@ impl VideoViewerApp {
         };
         let w = reader.width();
         let h = reader.height();
+        let use_ppm_writer = ext == "ppm";
         for idx in start..=end {
             match reader.seek_frame(idx) {
                 Ok(raw) => match reader.convert_to_rgb(&raw) {
                     Ok(rgb) => {
-                        let path = format!("{}/{}_{:06}.png", dir, prefix, idx);
-                        if let Some(img) = image::RgbImage::from_raw(w, h, rgb) {
+                        let path = format!("{}/{}_{:06}.{}", dir, prefix, idx, ext);
+                        if use_ppm_writer {
+                            // Use custom PPM writer for P6 binary output.
+                            let mut file = match std::fs::File::create(&path) {
+                                Ok(f) => f,
+                                Err(e) => {
+                                    self.status_error = Some(format!("File create error: {e}"));
+                                    return;
+                                }
+                            };
+                            if let Err(e) = crate::core::ppm::write_ppm(&mut file, w, h, &rgb) {
+                                self.status_error = Some(format!("PPM write error: {e}"));
+                                return;
+                            }
+                        } else {
+                            // Use image crate (PNG, BMP, JPEG, TIFF, etc.)
+                            let img = match image::RgbImage::from_raw(w, h, rgb) {
+                                Some(img) => img,
+                                None => {
+                                    self.status_error = Some(format!(
+                                        "RGB buffer size mismatch at frame {idx} ({}x{})",
+                                        w, h
+                                    ));
+                                    return;
+                                }
+                            };
                             if let Err(e) = img.save(&path) {
-                                self.status_error = Some(format!("PNG save error: {e}"));
+                                self.status_error = Some(format!("Image save error: {e}"));
                                 return;
                             }
                         }
@@ -1980,5 +2132,137 @@ impl VideoViewerApp {
             }
         }
         self.status_error = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows file association helpers
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "windows")]
+mod win_file_assoc {
+    use std::process::Command;
+
+    /// Video file extensions to register (without dot prefix in ProgID).
+    const EXTENSIONS: &[(&str, &str)] = &[
+        (".yuv",  "YUV Raw Video"),
+        (".y4m",  "Y4M Video"),
+        (".raw",  "Raw Video"),
+        (".rgb",  "RGB Raw Video"),
+        (".bgr",  "BGR Raw Video"),
+        (".nv12", "NV12 Video"),
+        (".nv21", "NV21 Video"),
+        (".yuyv", "YUYV Video"),
+        (".uyvy", "UYVY Video"),
+        (".grey", "Greyscale Video"),
+        (".gray", "Greyscale Video"),
+        (".i420", "I420 Video"),
+        (".yv12", "YV12 Video"),
+    ];
+
+    fn prog_id(ext: &str) -> String {
+        format!("VideoViewer{}", ext.replace('.', "_"))
+    }
+
+    fn reg_add(key: &str, data: &str) -> Result<(), String> {
+        let output = Command::new("reg")
+            .args(["add", key, "/ve", "/d", data, "/f"])
+            .output()
+            .map_err(|e| format!("reg.exe: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("reg add failed for {key}: {stderr}"));
+        }
+        Ok(())
+    }
+
+    fn reg_delete(key: &str) -> Result<(), String> {
+        let output = Command::new("reg")
+            .args(["delete", key, "/f"])
+            .output()
+            .map_err(|e| format!("reg.exe: {e}"))?;
+        // Ignore "not found" errors during unregister
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("unable to find") && !stderr.contains("could not find") {
+                return Err(format!("reg delete failed for {key}: {stderr}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn notify_shell() {
+        #[link(name = "shell32")]
+        extern "system" {
+            fn SHChangeNotify(
+                wEventId: i32,
+                uFlags: u32,
+                dwItem1: *const std::ffi::c_void,
+                dwItem2: *const std::ffi::c_void,
+            );
+        }
+        const SHCNE_ASSOCCHANGED: i32 = 0x0800_0000;
+        const SHCNF_IDLIST: u32 = 0;
+        unsafe {
+            SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, std::ptr::null(), std::ptr::null());
+        }
+    }
+
+    /// Register file associations for the current user. Returns (success, message).
+    pub fn register() -> (bool, String) {
+        let exe = match std::env::current_exe() {
+            Ok(p) => p.to_string_lossy().to_string(),
+            Err(e) => return (false, format!("Cannot determine exe path: {e}")),
+        };
+
+        let base = r"HKCU\Software\Classes";
+        let mut count = 0;
+        for (ext, desc) in EXTENSIONS {
+            let pid = prog_id(ext);
+
+            if let Err(e) = reg_add(&format!(r"{base}\{ext}"), &pid) {
+                return (false, format!("Failed at {ext}: {e}"));
+            }
+            if let Err(e) = reg_add(&format!(r"{base}\{pid}"), desc) {
+                return (false, format!("Failed at {ext}: {e}"));
+            }
+            let open_cmd = format!(r#""{exe}" "%1""#);
+            if let Err(e) = reg_add(&format!(r"{base}\{pid}\shell\open\command"), &open_cmd) {
+                return (false, format!("Failed at {ext}: {e}"));
+            }
+            let icon = format!(r#""{exe}",0"#);
+            if let Err(e) = reg_add(&format!(r"{base}\{pid}\DefaultIcon"), &icon) {
+                return (false, format!("Failed at {ext}: {e}"));
+            }
+            count += 1;
+        }
+
+        notify_shell();
+        (true, format!("Registered {} file types successfully.", count))
+    }
+
+    /// Remove file associations for the current user. Returns (success, message).
+    pub fn unregister() -> (bool, String) {
+        let base = r"HKCU\Software\Classes";
+        let mut ok_count = 0;
+        let mut fail_count = 0;
+
+        for (ext, _) in EXTENSIONS {
+            let pid = prog_id(ext);
+            let r1 = reg_delete(&format!(r"{base}\{ext}"));
+            let r2 = reg_delete(&format!(r"{base}\{pid}"));
+            if r1.is_ok() && r2.is_ok() {
+                ok_count += 1;
+            } else {
+                fail_count += 1;
+            }
+        }
+
+        notify_shell();
+        if fail_count == 0 {
+            (true, format!("Unregistered {} file types.", ok_count))
+        } else {
+            (false, format!("Unregistered {}, failed {}.", ok_count, fail_count))
+        }
     }
 }

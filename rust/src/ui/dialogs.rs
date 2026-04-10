@@ -501,12 +501,25 @@ impl ConvertDialog {
 // PNG Export Dialog
 // ---------------------------------------------------------------------------
 
+/// Result of the image export dialog: (start, end, dir, prefix, ext).
+pub type ImageExportResult = Option<Option<(usize, usize, String, String, String)>>;
+
+/// Image export format options: (display name, file extension).
+const IMAGE_EXPORT_FORMATS: &[(&str, &str)] = &[
+    ("PNG", "png"),
+    ("PPM", "ppm"),
+    ("BMP", "bmp"),
+    ("JPEG", "jpg"),
+    ("TIFF", "tiff"),
+];
+
 pub struct PngExportDialog {
     pub start_frame: usize,
     pub end_frame: usize,
     pub total_frames: usize,
     pub output_dir: String,
     pub prefix: String,
+    pub format_idx: usize,
 }
 
 impl PngExportDialog {
@@ -517,14 +530,16 @@ impl PngExportDialog {
             total_frames,
             output_dir: String::new(),
             prefix: "frame".to_string(),
+            format_idx: 0, // PNG default
         }
     }
 
-    pub fn show(&mut self, ctx: &egui::Context) -> Option<Option<(usize, usize, String, String)>> {
+    /// Returns Some((start, end, dir, prefix, ext)) on OK, None if cancelled.
+    pub fn show(&mut self, ctx: &egui::Context) -> ImageExportResult {
         let mut result = None;
         let mut open = true;
 
-        egui::Window::new("Export PNG Sequence")
+        egui::Window::new("Export Image Sequence")
             .open(&mut open)
             .resizable(false)
             .show(ctx, |ui| {
@@ -545,16 +560,35 @@ impl PngExportDialog {
                     ui.label("Prefix:");
                     ui.text_edit_singleline(&mut self.prefix);
                     ui.end_row();
+
+                    ui.label("Format:");
+                    let (display, _) = IMAGE_EXPORT_FORMATS[self.format_idx];
+                    egui::ComboBox::from_id_salt("img_export_fmt")
+                        .selected_text(display)
+                        .show_ui(ui, |ui| {
+                            for (idx, (name, _ext)) in IMAGE_EXPORT_FORMATS.iter().enumerate() {
+                                ui.selectable_value(&mut self.format_idx, idx, *name);
+                            }
+                        });
+                    ui.end_row();
                 });
+
+                // Preview output filename
+                let (_, ext) = IMAGE_EXPORT_FORMATS[self.format_idx];
+                let preview = format!("{}/{}_{:06}.{}", self.output_dir, self.prefix, self.start_frame, ext);
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(format!("Preview: {}", preview)).weak());
 
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Export").clicked() && !self.output_dir.is_empty() {
+                        let (_, ext) = IMAGE_EXPORT_FORMATS[self.format_idx];
                         result = Some(Some((
                             self.start_frame,
                             self.end_frame,
                             self.output_dir.clone(),
                             self.prefix.clone(),
+                            ext.to_string(),
                         )));
                     }
                     if ui.button("Cancel").clicked() {
@@ -830,10 +864,11 @@ impl SettingsDialog {
 // Inline File Browser (egui-based, no OS dialog dependency)
 // ---------------------------------------------------------------------------
 
-/// Video file extensions recognized by the browser filter.
+/// Video/image file extensions recognized by the browser filter.
 const VIDEO_EXTENSIONS: &[&str] = &[
     "yuv", "y4m", "raw", "rgb", "bgr", "nv12", "nv21", "yuyv", "uyvy",
     "yvyu", "i420", "yv12", "422p", "444p", "grey", "gray", "bayer",
+    "png", "ppm", "bmp", "jpg", "jpeg", "tif", "tiff", "gif", "webp",
 ];
 
 struct FileBrowser {
@@ -1035,7 +1070,8 @@ pub struct OpenFileDialog {
     pub height: u32,
     pub format_idx: usize,
     pub format_names: Vec<String>,
-    pub is_y4m: bool,
+    /// True when the file format auto-detects parameters (Y4M, PNG, PPM, etc.)
+    pub is_auto_detect: bool,
     /// Track last path for which hints were applied, to avoid re-overriding user edits.
     last_hinted_path: String,
     /// Inline file browser (created on demand when Browse is clicked).
@@ -1070,7 +1106,7 @@ impl OpenFileDialog {
             height: default_height,
             format_idx,
             format_names,
-            is_y4m: false,
+            is_auto_detect: false,
             last_hinted_path: String::new(),
             file_browser: None,
             initial_dir,
@@ -1121,10 +1157,10 @@ impl OpenFileDialog {
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
                     .to_lowercase();
-                self.is_y4m = ext == "y4m";
+                self.is_auto_detect = crate::core::reader::is_auto_detect_ext(&ext);
 
                 // Auto-fill from filename hints when path changes
-                if !self.is_y4m && self.path != self.last_hinted_path && !self.path.is_empty() {
+                if !self.is_auto_detect && self.path != self.last_hinted_path && !self.path.is_empty() {
                     let hints = crate::core::hints::parse_filename_hints(&self.path);
                     if let Some(w) = hints.width {
                         self.width = w;
@@ -1145,7 +1181,7 @@ impl OpenFileDialog {
                     .num_columns(2)
                     .spacing(egui::vec2(8.0, 4.0))
                     .show(ui, |ui| {
-                        if !self.is_y4m {
+                        if !self.is_auto_detect {
                             ui.label("Width:");
                             ui.add(egui::DragValue::new(&mut self.width).range(1..=8192));
                             ui.end_row();
@@ -1170,7 +1206,7 @@ impl OpenFileDialog {
                             ui.end_row();
                         } else {
                             ui.label("Info:");
-                            ui.label("Y4M: parameters auto-detected from header");
+                            ui.label("Parameters auto-detected from file header");
                             ui.end_row();
                         }
                     });
@@ -1216,7 +1252,7 @@ impl OpenFileDialog {
                         .add_enabled(can_open, egui::Button::new("Open"))
                         .clicked()
                     {
-                        let (w, h, fmt) = if self.is_y4m {
+                        let (w, h, fmt) = if self.is_auto_detect {
                             (0, 0, String::new())
                         } else {
                             (
