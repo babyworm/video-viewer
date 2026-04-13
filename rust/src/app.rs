@@ -25,29 +25,9 @@ pub enum InterlaceViewMode {
     OddField,
 }
 
-/// Common video sizes for the View → Video Size menu.
-const VIDEO_SIZE_PRESETS: &[(&str, u32, u32)] = &[
-    // CIF family
-    ("SQCIF (128×96)",     128,   96),
-    ("QCIF (176×144)",     176,  144),
-    ("SIF (352×240)",      352,  240),
-    ("CIF (352×288)",      352,  288),
-    ("2CIF (704×288)",     704,  288),
-    ("4CIF (704×576)",     704,  576),
-    // SD
-    ("D1 NTSC (720×480)",  720,  480),
-    ("D1 PAL (720×576)",   720,  576),
-    // PC
-    ("QVGA (320×240)",     320,  240),
-    ("VGA (640×480)",      640,  480),
-    ("SVGA (800×600)",     800,  600),
-    ("XGA (1024×768)",    1024,  768),
-    // HD / UHD
-    ("720p (1280×720)",   1280,  720),
-    ("1080p (1920×1080)", 1920, 1080),
-    ("QHD (2560×1440)",   2560, 1440),
-    ("4K UHD (3840×2160)",3840, 2160),
-];
+// Video Size menu entries come from crate::core::hints::NAMED_RESOLUTIONS
+// (filter: show_in_menu == true). Same table feeds filename-alias lookup and
+// file-size-based resolution guessing so they can never drift apart.
 
 pub struct VideoViewerApp {
     pub current_file: Option<String>,
@@ -76,6 +56,8 @@ pub struct VideoViewerApp {
     startup_format: Option<String>,
     /// Error message to show in the status bar.
     status_error: Option<String>,
+    /// Informational message (e.g. "File-size guess: …"); cleared on each open_file.
+    status_info: Option<String>,
     /// Active dialog state.
     dialog_state: DialogState,
     /// Dialog instances (created on demand).
@@ -177,6 +159,7 @@ impl VideoViewerApp {
             startup_height: height,
             startup_format: format,
             status_error: None,
+            status_info: None,
             dialog_state: DialogState::None,
             open_file_dialog: None,
             save_file_dialog: None,
@@ -225,6 +208,32 @@ impl VideoViewerApp {
         }
     }
 
+    /// Resolve (width, height, format) for a raw file path by combining filename
+    /// hints (WxH or named aliases) with a file-size-based guess, falling back to
+    /// configured defaults. Returns an optional info string to surface in the
+    /// status bar when a guess was applied. For auto-detect formats (Y4M, image
+    /// sequences) returns `(0, 0, "", None)` so the reader picks up the stream
+    /// parameters itself.
+    fn resolve_raw_open_params(&self, path: &str) -> (u32, u32, String, Option<String>) {
+        let ext = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if crate::core::reader::is_auto_detect_ext(&ext) {
+            return (0, 0, String::new(), None);
+        }
+        let file_size = std::fs::metadata(path).ok().map(|m| m.len());
+        let r = crate::core::hints::resolve_raw_params(
+            path,
+            file_size,
+            self.settings.defaults.width,
+            self.settings.defaults.height,
+            &self.settings.defaults.format,
+        );
+        (r.width, r.height, r.format, r.info)
+    }
+
     /// Open a file by path.
     fn open_file(
         &mut self,
@@ -234,6 +243,9 @@ impl VideoViewerApp {
         height: u32,
         format: &str,
     ) {
+        // Clear per-file status so stale messages don't persist across opens.
+        self.status_error = None;
+        self.status_info = None;
         let color_matrix = &self.settings.defaults.color_matrix;
         match VideoReader::open(&path, width, height, format, color_matrix) {
             Ok(reader) => {
@@ -958,24 +970,9 @@ impl eframe::App for VideoViewerApp {
                 .collect()
         });
         if let Some(path) = dropped.into_iter().next() {
-            let ext = std::path::Path::new(&path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            let is_auto = crate::core::reader::is_auto_detect_ext(&ext);
-            let (w, h, fmt) = if is_auto {
-                (0, 0, String::new())
-            } else {
-                // Try filename hints
-                let hints = crate::core::hints::parse_filename_hints(&path);
-                (
-                    hints.width.unwrap_or(self.settings.defaults.width),
-                    hints.height.unwrap_or(self.settings.defaults.height),
-                    hints.format.unwrap_or_else(|| self.settings.defaults.format.clone()),
-                )
-            };
+            let (w, h, fmt, info) = self.resolve_raw_open_params(&path);
             self.open_file(ctx, path, w, h, &fmt);
+            self.status_info = info;
         }
 
         // --- Playback tick ---
@@ -1223,23 +1220,9 @@ impl eframe::App for VideoViewerApp {
                             let recent = self.settings.recent_files.clone();
                             for path in &recent {
                                 if ui.button(path).clicked() {
-                                    let ext = std::path::Path::new(path.as_str())
-                                        .extension()
-                                        .and_then(|e| e.to_str())
-                                        .unwrap_or("")
-                                        .to_lowercase();
-                                    let is_auto = crate::core::reader::is_auto_detect_ext(&ext);
-                                    let (w, h, fmt) = if is_auto {
-                                        (0, 0, String::new())
-                                    } else {
-                                        let hints = crate::core::hints::parse_filename_hints(path);
-                                        (
-                                            hints.width.unwrap_or(self.settings.defaults.width),
-                                            hints.height.unwrap_or(self.settings.defaults.height),
-                                            hints.format.unwrap_or_else(|| self.settings.defaults.format.clone()),
-                                        )
-                                    };
+                                    let (w, h, fmt, info) = self.resolve_raw_open_params(path);
                                     self.open_file(ctx, path.clone(), w, h, &fmt);
+                                    self.status_info = info;
                                     ui.close_menu();
                                 }
                             }
@@ -1290,16 +1273,21 @@ impl eframe::App for VideoViewerApp {
                         });
                     ui.add_enabled_ui(has_raw_file, |ui| {
                         ui.menu_button("Video Size", |ui| {
-                            for &(label, w, h) in VIDEO_SIZE_PRESETS {
-                                let is_current = self.reader.as_ref()
-                                    .is_some_and(|r| r.width() == w && r.height() == h);
+                            for entry in crate::core::hints::NAMED_RESOLUTIONS
+                                .iter()
+                                .filter(|e| e.show_in_menu)
+                            {
+                                let label = format!("{} ({}×{})", entry.label, entry.width, entry.height);
+                                let is_current = self.reader.as_ref().is_some_and(|r| {
+                                    r.width() == entry.width && r.height() == entry.height
+                                });
                                 if ui.add(egui::Button::new(label).selected(is_current)).clicked() {
                                     ui.close_menu();
                                     if let Some(ref path) = self.current_file.clone() {
                                         let fmt = self.reader.as_ref()
                                             .map(|r| r.format_name().to_string())
                                             .unwrap_or_else(|| "I420".to_string());
-                                        self.open_file(ctx, path.clone(), w, h, &fmt);
+                                        self.open_file(ctx, path.clone(), entry.width, entry.height, &fmt);
                                     }
                                 }
                             }
@@ -1572,6 +1560,8 @@ impl eframe::App for VideoViewerApp {
                 }
                 if let Some(ref err) = self.status_error {
                     ui.colored_label(egui::Color32::RED, err);
+                } else if let Some(ref info) = self.status_info {
+                    ui.colored_label(egui::Color32::LIGHT_BLUE, info);
                 } else if let Some(ref path) = self.current_file {
                     if let Some(ref r) = self.reader {
                         ui.label(format!("{}  |", path));

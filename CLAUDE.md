@@ -24,7 +24,7 @@
     - `formats.rs` - FormatType, VideoFormat, FORMAT_DEFS (75+ pixel format definitions)
     - `reader.rs` - VideoReader (file I/O, frame seeking, RGB conversion, channel extraction)
     - `cache.rs` - FrameCache (LRU memory-bounded cache)
-    - `hints.rs` - parse_filename_hints (resolution, format, fps, bit depth from filename)
+    - `hints.rs` - Single source of truth for named resolutions (`NAMED_RESOLUTIONS`), filename hint parsing (`parse_filename_hints`), file-size-based resolution guess (`guess_resolution_from_size`), unified open-time resolver (`resolve_raw_params`)
     - `y4m.rs` - Y4M header parser and frame offset builder
     - `pixel.rs` - get_pixel_info (pixel inspector values, hex, neighborhood)
     - `sideband.rs` - Schema-driven sideband binary parser (ISP parameter overlay)
@@ -93,19 +93,56 @@ When adding new aliases, update `rust/src/core/hints.rs` tables AND this section
 
 | Alias | Width | Height | Notes |
 |-------|-------|--------|-------|
+| `sqcif` | 128 | 96 | Sub-QCIF |
 | `qcif` | 176 | 144 | Quarter CIF |
 | `cif` | 352 | 288 | Common Intermediate Format |
+| `sif` | 352 | 240 | Source Input Format (NTSC-rate CIF) |
+| `2cif` | 704 | 288 | Double CIF |
+| `4cif` | 704 | 576 | 4× CIF (D1 PAL) |
+| `16cif` | 1408 | 1152 | 16× CIF |
+| `d1` | 720 | 480 | ITU-R BT.601 D1 (NTSC) |
+| `sd` / `pal` | 720 | 576 | PAL SD |
+| `ntsc` | 720 | 480 | NTSC SD |
+| `qqvga` | 160 | 120 | Quarter QVGA |
 | `qvga` | 320 | 240 | Quarter VGA |
+| `hvga` | 480 | 320 | Half VGA |
 | `vga` | 640 | 480 | |
 | `wvga` | 800 | 480 | Wide VGA |
 | `svga` | 800 | 600 | |
 | `xga` | 1024 | 768 | |
-| `hd` / `720p` | 1280 | 720 | |
-| `1080p` | 1920 | 1080 | |
-| `2k` | 2560 | 1440 | QHD |
-| `4k` | 3840 | 2160 | UHD |
-| `sd` / `pal` | 720 | 576 | PAL SD |
-| `ntsc` | 720 | 480 | NTSC SD |
+| `wxga` | 1280 | 800 | Wide XGA |
+| `sxga` | 1280 | 1024 | Super XGA |
+| `wsxga` | 1680 | 1050 | Wide SXGA+ |
+| `uxga` | 1600 | 1200 | Ultra XGA |
+| `wuxga` | 1920 | 1200 | Wide UXGA |
+| `qxga` | 2048 | 1536 | Quad XGA |
+| `wqxga` | 2560 | 1600 | Wide QXGA |
+| `qhd` | 960 | 540 | Quarter HD |
+| `hd` / `720p` | 1280 | 720 | HD |
+| `fhd` / `fullhd` / `1080p` | 1920 | 1080 | Full HD |
+| `wqhd` / `1440p` / `2k` | 2560 | 1440 | WQHD |
+| `uhd` / `4kuhd` / `4k` / `2160p` | 3840 | 2160 | UHD-1 |
+| `8k` / `4320p` | 7680 | 4320 | UHD-2 |
+| `240p` | 320 | 240 | NNNp shorthand |
+| `360p` | 640 | 360 | NNNp shorthand |
+| `480p` | 640 | 480 | NNNp shorthand |
+| `576p` | 720 | 576 | NNNp shorthand |
+
+### Resolution Resolver (single source of truth)
+
+`rust/src/core/hints.rs::NAMED_RESOLUTIONS` is the canonical table. It simultaneously feeds:
+
+1. **Filename alias lookup** — `parse_filename_hints()`
+2. **View → Video Size menu** — entries with `show_in_menu: true`
+3. **File-size-based resolution guess** — same menu set, sorted largest-first, crossed with `I420, NV12, YUYV, RGB24` (recovered from Python's `_guess_resolution`)
+
+`resolve_raw_params(path, file_size, default_w, default_h, default_fmt)` applies this priority order:
+
+1. Filename carries **both width and height** → use them (format from hint or default)
+2. Else file-size guess succeeds → use it, emit info string for the status bar
+3. Else fall back to configured defaults
+
+When adding a new entry: edit `NAMED_RESOLUTIONS` only; the menu, HashMap lookup, and guess candidate set all update automatically.
 
 ### Format Aliases
 

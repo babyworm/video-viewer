@@ -12,62 +12,200 @@ pub struct FilenameHints {
     pub bit_depth: Option<u32>,
 }
 
+/// One named resolution entry. Single source of truth used by:
+///   - filename alias lookup (parse_filename_hints)
+///   - Video Size menu (show_in_menu=true)
+///   - file-size-based resolution guess (show_in_menu=true used as candidate set)
+pub struct NamedResolution {
+    /// Display label for the Video Size menu (e.g. "1080p", "4K UHD").
+    pub label: &'static str,
+    /// Lowercase tokens recognised in filenames.
+    pub aliases: &'static [&'static str],
+    pub width: u32,
+    pub height: u32,
+    /// If true: shown in View → Video Size menu AND used as file-size guess candidate.
+    pub show_in_menu: bool,
+}
+
+/// Canonical resolution table. Order = menu display order (small → large within group).
+pub const NAMED_RESOLUTIONS: &[NamedResolution] = &[
+    // CIF family
+    NamedResolution { label: "SQCIF",  aliases: &["sqcif"],                    width: 128,  height: 96,   show_in_menu: true  },
+    NamedResolution { label: "QCIF",   aliases: &["qcif"],                     width: 176,  height: 144,  show_in_menu: true  },
+    NamedResolution { label: "SIF",    aliases: &["sif"],                      width: 352,  height: 240,  show_in_menu: true  },
+    NamedResolution { label: "CIF",    aliases: &["cif"],                      width: 352,  height: 288,  show_in_menu: true  },
+    NamedResolution { label: "2CIF",   aliases: &["2cif"],                     width: 704,  height: 288,  show_in_menu: true  },
+    NamedResolution { label: "4CIF",   aliases: &["4cif"],                     width: 704,  height: 576,  show_in_menu: true  },
+    NamedResolution { label: "16CIF",  aliases: &["16cif"],                    width: 1408, height: 1152, show_in_menu: false },
+    // SD broadcast
+    NamedResolution { label: "D1 NTSC",aliases: &["d1", "ntsc"],               width: 720,  height: 480,  show_in_menu: true  },
+    NamedResolution { label: "D1 PAL", aliases: &["sd", "pal", "576p"],        width: 720,  height: 576,  show_in_menu: true  },
+    // PC / display
+    NamedResolution { label: "QQVGA",  aliases: &["qqvga"],                    width: 160,  height: 120,  show_in_menu: false },
+    NamedResolution { label: "QVGA",   aliases: &["qvga", "240p"],             width: 320,  height: 240,  show_in_menu: true  },
+    NamedResolution { label: "HVGA",   aliases: &["hvga"],                     width: 480,  height: 320,  show_in_menu: false },
+    NamedResolution { label: "360p",   aliases: &["360p"],                     width: 640,  height: 360,  show_in_menu: false },
+    NamedResolution { label: "VGA",    aliases: &["vga", "480p"],              width: 640,  height: 480,  show_in_menu: true  },
+    NamedResolution { label: "WVGA",   aliases: &["wvga"],                     width: 800,  height: 480,  show_in_menu: false },
+    NamedResolution { label: "SVGA",   aliases: &["svga"],                     width: 800,  height: 600,  show_in_menu: true  },
+    NamedResolution { label: "XGA",    aliases: &["xga"],                      width: 1024, height: 768,  show_in_menu: true  },
+    NamedResolution { label: "WXGA",   aliases: &["wxga"],                     width: 1280, height: 800,  show_in_menu: false },
+    NamedResolution { label: "SXGA",   aliases: &["sxga"],                     width: 1280, height: 1024, show_in_menu: false },
+    NamedResolution { label: "WSXGA+", aliases: &["wsxga"],                    width: 1680, height: 1050, show_in_menu: false },
+    NamedResolution { label: "UXGA",   aliases: &["uxga"],                     width: 1600, height: 1200, show_in_menu: false },
+    NamedResolution { label: "WUXGA",  aliases: &["wuxga"],                    width: 1920, height: 1200, show_in_menu: false },
+    NamedResolution { label: "QXGA",   aliases: &["qxga"],                     width: 2048, height: 1536, show_in_menu: false },
+    NamedResolution { label: "WQXGA",  aliases: &["wqxga"],                    width: 2560, height: 1600, show_in_menu: false },
+    // HD / UHD
+    NamedResolution { label: "qHD",    aliases: &["qhd"],                      width: 960,  height: 540,  show_in_menu: false },
+    NamedResolution { label: "720p",   aliases: &["hd", "720p"],               width: 1280, height: 720,  show_in_menu: true  },
+    NamedResolution { label: "1080p",  aliases: &["fhd", "fullhd", "1080p"],   width: 1920, height: 1080, show_in_menu: true  },
+    NamedResolution { label: "1440p",  aliases: &["wqhd", "1440p", "2k"],      width: 2560, height: 1440, show_in_menu: true  },
+    NamedResolution { label: "4K UHD", aliases: &["uhd", "4kuhd", "4k", "2160p"], width: 3840, height: 2160, show_in_menu: true },
+    NamedResolution { label: "8K UHD", aliases: &["8k", "4320p"],              width: 7680, height: 4320, show_in_menu: false },
+];
+
+/// Build the alias → (width, height) lookup from NAMED_RESOLUTIONS.
 fn named_resolutions() -> &'static HashMap<&'static str, (u32, u32)> {
     static MAP: OnceLock<HashMap<&'static str, (u32, u32)>> = OnceLock::new();
     MAP.get_or_init(|| {
         let mut m = HashMap::new();
-        // CIF family
-        m.insert("sqcif", (128,  96));
-        m.insert("qcif",  (176,  144));
-        m.insert("cif",   (352,  288));
-        m.insert("sif",   (352,  240));
-        m.insert("2cif",  (704,  288));
-        m.insert("4cif",  (704,  576));
-        m.insert("16cif", (1408, 1152));
-        // SD broadcast
-        m.insert("d1",    (720,  480));
-        m.insert("sd",    (720,  576));
-        m.insert("pal",   (720,  576));
-        m.insert("ntsc",  (720,  480));
-        // PC / display
-        m.insert("qqvga", (160,  120));
-        m.insert("qvga",  (320,  240));
-        m.insert("hvga",  (480,  320));
-        m.insert("vga",   (640,  480));
-        m.insert("wvga",  (800,  480));
-        m.insert("svga",  (800,  600));
-        m.insert("xga",   (1024, 768));
-        m.insert("wxga",  (1280, 800));
-        m.insert("sxga",  (1280, 1024));
-        m.insert("wsxga", (1680, 1050));
-        m.insert("uxga",  (1600, 1200));
-        m.insert("wuxga", (1920, 1200));
-        m.insert("qxga",  (2048, 1536));
-        m.insert("wqxga", (2560, 1600));
-        // HD / UHD (progressive scan names)
-        m.insert("qhd",   (960,  540));
-        m.insert("hd",    (1280, 720));
-        m.insert("fhd",   (1920, 1080));
-        m.insert("fullhd",(1920, 1080));
-        m.insert("wqhd",  (2560, 1440));
-        m.insert("uhd",   (3840, 2160));
-        m.insert("4kuhd", (3840, 2160));
-        m.insert("8k",    (7680, 4320));
-        // NNNp shorthand
-        m.insert("240p",  (320,  240));
-        m.insert("360p",  (640,  360));
-        m.insert("480p",  (640,  480));
-        m.insert("576p",  (720,  576));
-        m.insert("720p",  (1280, 720));
-        m.insert("1080p", (1920, 1080));
-        m.insert("1440p", (2560, 1440));
-        m.insert("2160p", (3840, 2160));
-        m.insert("4320p", (7680, 4320));
-        // Legacy
-        m.insert("2k",    (2560, 1440));
-        m.insert("4k",    (3840, 2160));
+        for r in NAMED_RESOLUTIONS {
+            for &alias in r.aliases {
+                // Duplicate aliases indicate a table bug; last writer wins.
+                m.insert(alias, (r.width, r.height));
+            }
+        }
         m
     })
+}
+
+/// Candidate set for file-size-based resolution guessing, sorted largest-first.
+/// Larger candidates are tried first so a 4K raw file doesn't get misinterpreted
+/// as a huge number of QCIF frames when frame-sizes coincidentally align.
+fn size_guess_candidates() -> &'static [&'static NamedResolution] {
+    static CANDIDATES: OnceLock<Vec<&'static NamedResolution>> = OnceLock::new();
+    CANDIDATES
+        .get_or_init(|| {
+            let mut v: Vec<&'static NamedResolution> = NAMED_RESOLUTIONS
+                .iter()
+                .filter(|r| r.show_in_menu)
+                .collect();
+            v.sort_by_key(|r| std::cmp::Reverse((r.width as u64) * (r.height as u64)));
+            v
+        })
+        .as_slice()
+}
+
+/// Result of a successful file-size-based guess.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SizeGuess {
+    pub width: u32,
+    pub height: u32,
+    pub format: &'static str, // e.g. "I420"
+    pub num_frames: u64,
+}
+
+/// Try to recover (width, height, format) from a raw file size.
+///
+/// Returns the first candidate (w, h, fmt) whose per-frame size divides
+/// `file_size` evenly, where candidates come from NAMED_RESOLUTIONS (menu set,
+/// largest-first) crossed with the common raw formats `I420, NV12, YUYV, RGB24`.
+/// This mirrors the original Python `MainWindow._guess_resolution` behaviour
+/// that was lost during the v0.2.0 Rust rewrite.
+pub fn guess_resolution_from_size(file_size: u64) -> Option<SizeGuess> {
+    if file_size == 0 {
+        return None;
+    }
+    const GUESS_FORMATS: &[&str] = &["I420", "NV12", "YUYV", "RGB24"];
+    for cand in size_guess_candidates() {
+        for &fmt_name in GUESS_FORMATS {
+            let Some(fmt) = crate::core::formats::get_format_by_name(fmt_name) else {
+                continue;
+            };
+            let fs = fmt.frame_size(cand.width, cand.height) as u64;
+            if fs == 0 {
+                continue;
+            }
+            if file_size.is_multiple_of(fs) {
+                let num_frames = file_size / fs;
+                if num_frames >= 1 {
+                    return Some(SizeGuess {
+                        width: cand.width,
+                        height: cand.height,
+                        format: fmt_name,
+                        num_frames,
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolved open parameters for a raw file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedParams {
+    pub width: u32,
+    pub height: u32,
+    pub format: String,
+    /// Informational message to surface to the user when a guess was applied.
+    /// None when filename hints fully specified the resolution, or when falling
+    /// back to defaults without a successful guess.
+    pub info: Option<String>,
+}
+
+/// Decide the (width, height, format) to open a raw file with, using this priority:
+///   1. Filename hints supply both width and height → use them (format from hint or default).
+///   2. File-size guess succeeds → use it, attach an info message.
+///   3. Defaults.
+pub fn resolve_raw_params(
+    path: &str,
+    file_size: Option<u64>,
+    default_width: u32,
+    default_height: u32,
+    default_format: &str,
+) -> ResolvedParams {
+    let hints = parse_filename_hints(path);
+
+    // 1. Filename hints win when they specify the resolution.
+    if let (Some(w), Some(h)) = (hints.width, hints.height) {
+        return ResolvedParams {
+            width: w,
+            height: h,
+            format: hints.format.unwrap_or_else(|| default_format.to_string()),
+            info: None,
+        };
+    }
+
+    // 2. Try file-size guess.
+    if let Some(sz) = file_size {
+        if let Some(g) = guess_resolution_from_size(sz) {
+            // Preserve filename format hint if present; otherwise use the guess's format.
+            let format = hints
+                .format
+                .clone()
+                .unwrap_or_else(|| g.format.to_string());
+            let info = Some(format!(
+                "File-size guess: {}×{} {} ({} frames) — verify via Tools → Video Parameters",
+                g.width, g.height, g.format, g.num_frames
+            ));
+            return ResolvedParams {
+                width: g.width,
+                height: g.height,
+                format,
+                info,
+            };
+        }
+    }
+
+    // 3. Defaults (format may still come from filename hint).
+    ResolvedParams {
+        width: default_width,
+        height: default_height,
+        format: hints.format.unwrap_or_else(|| default_format.to_string()),
+        info: None,
+    }
 }
 
 fn format_aliases() -> &'static HashMap<&'static str, &'static str> {
