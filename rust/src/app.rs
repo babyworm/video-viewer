@@ -16,6 +16,39 @@ use crate::ui::toolbar::{Toolbar, ToolbarAction, colorize_channel};
 /// Tagged scene detection output: (job_id, Ok(changes) | Err(message)).
 type SceneDetectOutput = Arc<std::sync::Mutex<Option<(usize, Result<Vec<usize>, String>)>>>;
 
+/// Interlace viewing mode.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum InterlaceViewMode {
+    #[default]
+    Progressive,
+    EvenField,
+    OddField,
+}
+
+/// Common video sizes for the View → Video Size menu.
+const VIDEO_SIZE_PRESETS: &[(&str, u32, u32)] = &[
+    // CIF family
+    ("SQCIF (128×96)",     128,   96),
+    ("QCIF (176×144)",     176,  144),
+    ("SIF (352×240)",      352,  240),
+    ("CIF (352×288)",      352,  288),
+    ("2CIF (704×288)",     704,  288),
+    ("4CIF (704×576)",     704,  576),
+    // SD
+    ("D1 NTSC (720×480)",  720,  480),
+    ("D1 PAL (720×576)",   720,  576),
+    // PC
+    ("QVGA (320×240)",     320,  240),
+    ("VGA (640×480)",      640,  480),
+    ("SVGA (800×600)",     800,  600),
+    ("XGA (1024×768)",    1024,  768),
+    // HD / UHD
+    ("720p (1280×720)",   1280,  720),
+    ("1080p (1920×1080)", 1920, 1080),
+    ("QHD (2560×1440)",   2560, 1440),
+    ("4K UHD (3840×2160)",3840, 2160),
+];
+
 pub struct VideoViewerApp {
     pub current_file: Option<String>,
     pub reader: Option<VideoReader>,
@@ -97,6 +130,8 @@ pub struct VideoViewerApp {
     pub sideband_show_values: bool,
     sideband_panel: crate::analysis::isp_sideband::SidebandPanel,
     sideband_dialog: Option<dialogs::SidebandFileDialog>,
+    /// Interlace field viewing mode.
+    pub interlace_view: InterlaceViewMode,
     /// Show Windows file association registration dialog.
     #[cfg(target_os = "windows")]
     show_register_assoc: bool,
@@ -182,6 +217,7 @@ impl VideoViewerApp {
             sideband_show_values: false,
             sideband_panel: crate::analysis::isp_sideband::SidebandPanel::new(),
             sideband_dialog: None,
+            interlace_view: InterlaceViewMode::Progressive,
             #[cfg(target_os = "windows")]
             show_register_assoc: false,
             #[cfg(target_os = "windows")]
@@ -273,10 +309,31 @@ impl VideoViewerApp {
         };
         let (w, h) = (reader.width(), reader.height());
         // Apply component view — use reader fields directly to avoid borrow conflict
-        let display_rgb = Self::compute_component_view(
+        let component_rgb = Self::compute_component_view(
             self.current_component, reader, &raw, &rgb, w, h,
         );
-        self.canvas.set_image(ctx, &display_rgb, w, h);
+        // Apply interlace field extraction if needed.
+        let (display_rgb, disp_w, disp_h) = match self.interlace_view {
+            InterlaceViewMode::Progressive => (component_rgb, w, h),
+            InterlaceViewMode::EvenField | InterlaceViewMode::OddField => {
+                let start_row = if self.interlace_view == InterlaceViewMode::EvenField { 0 } else { 1 };
+                let stride = (w as usize) * 3;
+                let mut field = Vec::with_capacity((w as usize) * (h as usize / 2) * 3);
+                let mut row = start_row;
+                while row < h as usize {
+                    let off = row * stride;
+                    if off + stride <= component_rgb.len() {
+                        // Duplicate each field line for full-height display
+                        field.extend_from_slice(&component_rgb[off..off + stride]);
+                        field.extend_from_slice(&component_rgb[off..off + stride]);
+                    }
+                    row += 2;
+                }
+                let field_h = (h / 2) * 2; // even height from line doubling
+                (field, w, field_h)
+            }
+        };
+        self.canvas.set_image(ctx, &display_rgb, disp_w, disp_h);
         // Only keep prev_rgb for sequential navigation (metrics compare adjacent frames).
         if idx == self.current_frame_idx + 1 {
             self.prev_rgb = self.current_rgb.take();
@@ -1221,6 +1278,53 @@ impl eframe::App for VideoViewerApp {
                     ui.checkbox(&mut self.loop_playback, "Loop Playback");
                     ui.checkbox(&mut self.canvas.show_magnifier, "Magnifier (M)");
                     ui.checkbox(&mut self.sidebar.show_analysis, "Show Analysis");
+                    ui.separator();
+
+                    // --- Video Size submenu ---
+                    let has_raw_file = self.reader.is_some()
+                        && !self.reader.as_ref().unwrap().is_y4m()
+                        && !self.current_file.as_ref().is_some_and(|p| {
+                            let ext = std::path::Path::new(p.as_str())
+                                .extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                            crate::core::reader::is_auto_detect_ext(&ext)
+                        });
+                    ui.add_enabled_ui(has_raw_file, |ui| {
+                        ui.menu_button("Video Size", |ui| {
+                            for &(label, w, h) in VIDEO_SIZE_PRESETS {
+                                let is_current = self.reader.as_ref()
+                                    .is_some_and(|r| r.width() == w && r.height() == h);
+                                if ui.add(egui::Button::new(label).selected(is_current)).clicked() {
+                                    ui.close_menu();
+                                    if let Some(ref path) = self.current_file.clone() {
+                                        let fmt = self.reader.as_ref()
+                                            .map(|r| r.format_name().to_string())
+                                            .unwrap_or_else(|| "I420".to_string());
+                                        self.open_file(ctx, path.clone(), w, h, &fmt);
+                                    }
+                                }
+                            }
+                        });
+                    });
+
+                    // --- Interlace View submenu ---
+                    ui.menu_button("Interlace", |ui| {
+                        let modes = [
+                            ("Progressive (full frame)", InterlaceViewMode::Progressive),
+                            ("Even field (top)",         InterlaceViewMode::EvenField),
+                            ("Odd field (bottom)",       InterlaceViewMode::OddField),
+                        ];
+                        for (label, mode) in modes {
+                            let selected = self.interlace_view == mode;
+                            if ui.add(egui::Button::new(label).selected(selected)).clicked() {
+                                self.interlace_view = mode;
+                                // Refresh current frame to apply new mode
+                                let idx = self.current_frame_idx;
+                                self.goto_frame(ctx, idx);
+                                ui.close_menu();
+                            }
+                        }
+                    });
+
                     ui.separator();
                     let mut dark = self.settings.display.dark_theme;
                     if ui.checkbox(&mut dark, "Dark Theme").changed() {

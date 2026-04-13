@@ -16,21 +16,56 @@ fn named_resolutions() -> &'static HashMap<&'static str, (u32, u32)> {
     static MAP: OnceLock<HashMap<&'static str, (u32, u32)>> = OnceLock::new();
     MAP.get_or_init(|| {
         let mut m = HashMap::new();
+        // CIF family
+        m.insert("sqcif", (128,  96));
         m.insert("qcif",  (176,  144));
         m.insert("cif",   (352,  288));
+        m.insert("sif",   (352,  240));
+        m.insert("2cif",  (704,  288));
+        m.insert("4cif",  (704,  576));
+        m.insert("16cif", (1408, 1152));
+        // SD broadcast
+        m.insert("d1",    (720,  480));
+        m.insert("sd",    (720,  576));
+        m.insert("pal",   (720,  576));
+        m.insert("ntsc",  (720,  480));
+        // PC / display
+        m.insert("qqvga", (160,  120));
         m.insert("qvga",  (320,  240));
+        m.insert("hvga",  (480,  320));
         m.insert("vga",   (640,  480));
         m.insert("wvga",  (800,  480));
         m.insert("svga",  (800,  600));
         m.insert("xga",   (1024, 768));
+        m.insert("wxga",  (1280, 800));
+        m.insert("sxga",  (1280, 1024));
+        m.insert("wsxga", (1680, 1050));
+        m.insert("uxga",  (1600, 1200));
+        m.insert("wuxga", (1920, 1200));
+        m.insert("qxga",  (2048, 1536));
+        m.insert("wqxga", (2560, 1600));
+        // HD / UHD (progressive scan names)
+        m.insert("qhd",   (960,  540));
         m.insert("hd",    (1280, 720));
+        m.insert("fhd",   (1920, 1080));
+        m.insert("fullhd",(1920, 1080));
+        m.insert("wqhd",  (2560, 1440));
+        m.insert("uhd",   (3840, 2160));
+        m.insert("4kuhd", (3840, 2160));
+        m.insert("8k",    (7680, 4320));
+        // NNNp shorthand
+        m.insert("240p",  (320,  240));
+        m.insert("360p",  (640,  360));
+        m.insert("480p",  (640,  480));
+        m.insert("576p",  (720,  576));
         m.insert("720p",  (1280, 720));
         m.insert("1080p", (1920, 1080));
+        m.insert("1440p", (2560, 1440));
+        m.insert("2160p", (3840, 2160));
+        m.insert("4320p", (7680, 4320));
+        // Legacy
         m.insert("2k",    (2560, 1440));
         m.insert("4k",    (3840, 2160));
-        m.insert("sd",    (720,  576));
-        m.insert("pal",   (720,  576));
-        m.insert("ntsc",  (720,  480));
         m
     })
 }
