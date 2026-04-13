@@ -404,6 +404,7 @@ fn write_header_v(buf: &mut Vec<u8>, version: u8, num_ctus: usize) {
 }
 
 /// Build a 28-byte v1 frame param block (20B v0 + 8B v1 extension).
+#[allow(clippy::too_many_arguments)] // mirrors the v1 schema field list
 fn write_frame_params_v1(
     buf: &mut Vec<u8>,
     frame_id: i32,
@@ -448,6 +449,7 @@ fn write_frame_params_v1(
 }
 
 /// Build a 24-byte v1 CTU param block (16B v0 + 8B v1 extension).
+#[allow(clippy::too_many_arguments)] // mirrors the v1 schema field list
 fn write_ctu_params_v1(
     buf: &mut Vec<u8>,
     noise_sigma_q8: u8,
