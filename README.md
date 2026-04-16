@@ -8,7 +8,7 @@ Raw/YUV/RGB video viewer built with Rust + egui. Supports 75+ pixel formats for 
 
 ### Pixel Formats & Decoding
 - **75+ pixel formats**: YUV (I420, NV12, NV21, YUY2, UYVY, P010, ...), RGB (RGB24, BGR24, RGB565, RGBA32, ...), Bayer (8/10/12/16-bit), Grayscale
-- **Y4M support**: Auto-detect parameters from Y4M headers (resolution, format, fps)
+- **Auto-detection**: Read parameters from Y4M headers and Image files (PPM, PNG, JPEG, etc.) automatically
 - **Smart auto-detection**: Resolution guessing from file size, filename metadata extraction (resolution, format, fps patterns)
 - **BT.601 / BT.709**: Selectable YUV-RGB color matrix
 
@@ -186,6 +186,9 @@ RGGB, BGGR, GBRG, GRBG (8/10/10-packed/12/16-bit variants = 20 formats)
 
 ### Grayscale
 Greyscale 8-bit, 10-bit, 12-bit, 16-bit
+
+### Image Formats
+PPM (P6), PNG, JPEG, BMP, GIF, TIFF, WebP
 
 ## Dependencies
 

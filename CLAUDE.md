@@ -83,6 +83,7 @@
 | `tests/metrics_test.rs` | PSNR, SSIM, frame difference (4 tests) |
 | `tests/scene_test.rs` | Scene detection, threshold, save/load (4 tests) |
 | `tests/sideband_test.rs` | Sideband binary parsing, extended header, signed fields, display (13 tests) |
+| `tests/ppm_test.rs` | PPM parsing, writing, reading, and conversion (10 tests) |
 | `tests/integration_test.rs` | Real Y4M file (conditional) (1 test) |
 
 ## Filename Hint Reference
