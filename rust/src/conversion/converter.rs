@@ -823,7 +823,7 @@ fn avg_neighbors_cross(data: &[u8], w: usize, h: usize, x: usize, y: usize) -> u
     if x + 1 < w { sum += data[y * w + x + 1] as u32; count += 1; }
     if y > 0 { sum += data[(y - 1) * w + x] as u32; count += 1; }
     if y + 1 < h { sum += data[(y + 1) * w + x] as u32; count += 1; }
-    if count == 0 { data[y * w + x] } else { (sum / count) as u8 }
+    avg_or_center(data, w, x, y, sum, count)
 }
 
 fn avg_neighbors_diag(data: &[u8], w: usize, h: usize, x: usize, y: usize) -> u8 {
@@ -833,7 +833,7 @@ fn avg_neighbors_diag(data: &[u8], w: usize, h: usize, x: usize, y: usize) -> u8
     if x+1 < w && y > 0 { sum += data[(y-1) * w + x+1] as u32; count += 1; }
     if x > 0 && y+1 < h { sum += data[(y+1) * w + x-1] as u32; count += 1; }
     if x+1 < w && y+1 < h { sum += data[(y+1) * w + x+1] as u32; count += 1; }
-    if count == 0 { data[y * w + x] } else { (sum / count) as u8 }
+    avg_or_center(data, w, x, y, sum, count)
 }
 
 fn avg_neighbors_h(data: &[u8], w: usize, x: usize, y: usize) -> u8 {
@@ -841,7 +841,7 @@ fn avg_neighbors_h(data: &[u8], w: usize, x: usize, y: usize) -> u8 {
     let mut count = 0u32;
     if x > 0 { sum += data[y * w + x - 1] as u32; count += 1; }
     if x + 1 < w { sum += data[y * w + x + 1] as u32; count += 1; }
-    if count == 0 { data[y * w + x] } else { (sum / count) as u8 }
+    avg_or_center(data, w, x, y, sum, count)
 }
 
 fn avg_neighbors_v(data: &[u8], w: usize, h: usize, x: usize, y: usize) -> u8 {
@@ -849,7 +849,12 @@ fn avg_neighbors_v(data: &[u8], w: usize, h: usize, x: usize, y: usize) -> u8 {
     let mut count = 0u32;
     if y > 0 { sum += data[(y - 1) * w + x] as u32; count += 1; }
     if y + 1 < h { sum += data[(y + 1) * w + x] as u32; count += 1; }
-    if count == 0 { data[y * w + x] } else { (sum / count) as u8 }
+    avg_or_center(data, w, x, y, sum, count)
+}
+
+fn avg_or_center(data: &[u8], w: usize, x: usize, y: usize, sum: u32, count: u32) -> u8 {
+    sum.checked_div(count)
+        .map_or(data[y * w + x], |avg| avg as u8)
 }
 
 /// High bit-depth Bayer (10/12/16-bit, 2 bytes LE per pixel) → RGB24.
@@ -934,4 +939,3 @@ fn rgb24_to_grey_highbit(rgb: &[u8], w: u32, h: u32, fmt: &VideoFormat) -> Resul
     }
     Ok(out)
 }
-
