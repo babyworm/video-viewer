@@ -1,7 +1,7 @@
 use eframe::egui;
 
-/// Grid size cycle for main grid
-const GRID_SIZES: &[u32] = &[0, 16, 32, 64, 128];
+/// Direct-selectable main grid sizes.
+pub const GRID_SIZES: &[u32] = &[0, 128, 64, 32, 16];
 /// Grid size cycle for sub-grid
 const SUB_GRID_SIZES: &[u32] = &[0, 4, 8, 16];
 
@@ -17,7 +17,7 @@ pub struct Toolbar {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolbarAction {
     SetComponent(u8),
-    ToggleGrid,
+    GridChanged,
     ToggleSubGrid,
     FitToView,
     ToggleAutoFit,
@@ -38,6 +38,20 @@ impl Toolbar {
             grid_idx: 0,
             sub_grid_idx: 0,
         }
+    }
+
+    pub fn set_grid_size(&mut self, size: u32) -> bool {
+        let Some(idx) = GRID_SIZES.iter().position(|&candidate| candidate == size) else {
+            return false;
+        };
+        self.grid_size = size;
+        self.grid_idx = idx;
+        true
+    }
+
+    pub fn cycle_grid_size(&mut self) {
+        self.grid_idx = (self.grid_idx + 1) % GRID_SIZES.len();
+        self.grid_size = GRID_SIZES[self.grid_idx];
     }
 
     /// Show the toolbar. Returns an action if one was triggered.
@@ -77,16 +91,25 @@ impl Toolbar {
 
             ui.separator();
 
-            // --- Grid toggle ---
-            let grid_label = if self.grid_size > 0 {
-                format!("Grid({})", self.grid_size)
-            } else {
-                "Grid".to_string()
-            };
-            if ui.button(grid_label).clicked() {
-                self.grid_idx = (self.grid_idx + 1) % GRID_SIZES.len();
-                self.grid_size = GRID_SIZES[self.grid_idx];
-                action = Some(ToolbarAction::ToggleGrid);
+            // --- Grid selector ---
+            ui.label("Grid:");
+            let before_grid_size = self.grid_size;
+            egui::ComboBox::from_id_salt("main_grid_size_combo")
+                .selected_text(grid_size_label(self.grid_size))
+                .width(86.0)
+                .show_ui(ui, |ui| {
+                    for (idx, &size) in GRID_SIZES.iter().enumerate() {
+                        if ui
+                            .selectable_value(&mut self.grid_size, size, grid_size_label(size))
+                            .clicked()
+                        {
+                            self.grid_idx = idx;
+                        }
+                    }
+                });
+            if self.grid_size != before_grid_size {
+                self.set_grid_size(self.grid_size);
+                action = Some(ToolbarAction::GridChanged);
             }
 
             // --- Sub-grid toggle ---
@@ -135,9 +158,72 @@ impl Toolbar {
     }
 }
 
+fn grid_size_label(size: u32) -> String {
+    if size == 0 {
+        "Off".to_string()
+    } else {
+        format!("{}×{}", size, size)
+    }
+}
+
 impl Default for Toolbar {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_sizes_are_in_direct_selector_order() {
+        assert_eq!(GRID_SIZES, &[0, 128, 64, 32, 16]);
+    }
+
+    #[test]
+    fn toolbar_defaults_to_grid_off() {
+        let toolbar = Toolbar::new();
+
+        assert_eq!(toolbar.grid_size, 0);
+        assert_eq!(toolbar.grid_idx, 0);
+    }
+
+    #[test]
+    fn set_grid_size_updates_index_for_supported_sizes() {
+        for (idx, &size) in GRID_SIZES.iter().enumerate() {
+            let mut toolbar = Toolbar::new();
+
+            assert!(toolbar.set_grid_size(size));
+            assert_eq!(toolbar.grid_size, size);
+            assert_eq!(toolbar.grid_idx, idx);
+        }
+    }
+
+    #[test]
+    fn set_grid_size_rejects_unsupported_sizes_without_mutating() {
+        let mut toolbar = Toolbar::new();
+        assert!(toolbar.set_grid_size(64));
+
+        assert!(!toolbar.set_grid_size(48));
+        assert_eq!(toolbar.grid_size, 64);
+        assert_eq!(toolbar.grid_idx, 2);
+    }
+
+    #[test]
+    fn cycle_grid_size_uses_direct_selector_order() {
+        let mut toolbar = Toolbar::new();
+        let mut seen = vec![toolbar.grid_size];
+
+        for _ in 1..GRID_SIZES.len() {
+            toolbar.cycle_grid_size();
+            seen.push(toolbar.grid_size);
+        }
+
+        assert_eq!(seen, GRID_SIZES);
+        toolbar.cycle_grid_size();
+        assert_eq!(toolbar.grid_size, 0);
+        assert_eq!(toolbar.grid_idx, 0);
     }
 }
 

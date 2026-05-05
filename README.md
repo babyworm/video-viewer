@@ -31,15 +31,18 @@ Raw/YUV/RGB video viewer built with Rust + egui. Supports 75+ pixel formats for 
 - **Waveform**: Luma waveform monitor showing pixel value distribution by column
 - **Vectorscope**: BT.709 Cb vs Cr scatter plot centered at origin with ±128 boundary box
 - **Metrics**: PSNR, SSIM, and frame difference between consecutive frames
+- **Video Diff**: Load a reference and current video side-by-side with signed luma diff,
+  MS-PSNR, MS-SSIM, and a dependency-free VMAF-NEG proxy heatmap; main grid size drives
+  per-region values when enabled; frame stepping and zoom/pan are synchronized across panes
 - **Zoom controls**: +/- buttons and scroll zoom on all analysis plots, with Reset View
 
 ### Grid Overlay
-- **Main grid**: Configurable block boundary overlay (16/32/64/128 pixels), cycled with `G`
+- **Main grid**: Directly selectable block boundary overlay (Off/128/64/32/16 pixels), cycled with `G`
 - **Sub-grid**: Secondary overlay (4/8/16 pixels) for finer block structure inspection
 - **Pixel inspector integration**: Grid/sub-grid boundaries are visualized in the 8x8 neighborhood display
 
 ### Comparison & Export
-- **A/B comparison**: Side-by-side, overlay, and diff modes for comparing two videos
+- **A/B comparison**: Three-pane reference/current/diff view for comparing two videos
 - **Format conversion**: Convert between formats with background progress tracking
 - **Frame export**: Save frames as PNG
 
@@ -157,11 +160,11 @@ video-viewer input.yuv -W 1920 -H 1080 --vi I420 --vo NV12 -o output.nv12
 | `4` | Split view (2x2) |
 | `F` | Fit to view |
 | `C` | Center image |
-| `G` | Cycle grid overlay (off/16/32/64/128) |
+| `G` | Cycle grid overlay (off/128/64/32/16); toolbar selector can set it directly |
 | `M` | Toggle magnifier |
 | `B` | Toggle bookmark |
-| Scroll wheel | Zoom in/out (anchored to cursor) |
-| Middle-click drag | Pan image |
+| Scroll wheel | Zoom in/out (anchored to cursor; synchronized across comparison panes) |
+| Middle-click drag | Pan image (drag any comparison pane to pan all panes together) |
 | `Ctrl+O` | Open file |
 | `Ctrl+S` | Save frame as PNG |
 | `Ctrl+C` | Copy frame to clipboard |
@@ -218,6 +221,9 @@ cd rust
 # Run all tests
 cargo test
 
+# Run CI-equivalent lint locally
+cargo clippy -- -D warnings
+
 # Run specific test
 cargo test test_pixel_info_yuyv
 
@@ -240,7 +246,7 @@ rust/
 │   ├── ui/              # Canvas, toolbar, sidebar, dialogs, comparison
 │   ├── analysis/        # Histogram, waveform, vectorscope, metrics, scene
 │   └── conversion/      # Format converter, chroma resampling
-├── tests/               # Integration tests (140+ tests)
+├── tests/               # Integration tests (250+ tests)
 scripts/
 └── generate_test_data.py  # Test data generator (Python)
 test_data/                 # Sample QCIF files (I420, NV12, RGB565, YUYV)
@@ -252,7 +258,7 @@ Contributions are welcome! Please follow these guidelines:
 
 1. **Fork & branch**: Create a feature branch from `main`.
 2. **Build & test**: Ensure `cargo build` and `cargo test` pass with no failures.
-3. **Code style**: Follow Rust conventions (`cargo fmt`, `cargo clippy`).
+3. **Code quality**: Keep touched code formatted consistently and ensure `cargo clippy -- -D warnings` passes.
 4. **Commit messages**: Use concise, descriptive messages (e.g., "Add YVYU pixel inspector support").
 5. **One concern per PR**: Keep pull requests focused on a single feature or fix.
 

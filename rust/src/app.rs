@@ -7,6 +7,7 @@ use eframe::egui;
 use crate::core::reader::VideoReader;
 use crate::core::sideband::SidebandOverlayMode;
 use crate::ui::canvas::ImageCanvas;
+use crate::ui::comparison::{ComparisonUiAction, ComparisonView};
 use crate::ui::dialogs::{self, DialogState};
 use crate::ui::navigation::{NavigationBar, NavigationAction};
 use crate::ui::settings::Settings;
@@ -15,6 +16,38 @@ use crate::ui::toolbar::{Toolbar, ToolbarAction, colorize_channel};
 
 /// Tagged scene detection output: (job_id, Ok(changes) | Err(message)).
 type SceneDetectOutput = Arc<std::sync::Mutex<Option<(usize, Result<Vec<usize>, String>)>>>;
+
+fn matching_reference_frame_idx(
+    current_frame_idx: usize,
+    reference_total_frames: usize,
+) -> Option<usize> {
+    if reference_total_frames == 0 {
+        None
+    } else {
+        Some(current_frame_idx.min(reference_total_frames - 1))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matching_reference_frame_idx;
+
+    #[test]
+    fn comparison_reference_frame_tracks_current_frame() {
+        assert_eq!(matching_reference_frame_idx(0, 5), Some(0));
+        assert_eq!(matching_reference_frame_idx(3, 5), Some(3));
+    }
+
+    #[test]
+    fn comparison_reference_frame_clamps_when_reference_is_shorter() {
+        assert_eq!(matching_reference_frame_idx(9, 4), Some(3));
+    }
+
+    #[test]
+    fn comparison_reference_frame_handles_empty_reference() {
+        assert_eq!(matching_reference_frame_idx(2, 0), None);
+    }
+}
 
 /// Interlace viewing mode.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -33,6 +66,7 @@ pub struct VideoViewerApp {
     pub current_file: Option<String>,
     pub reader: Option<VideoReader>,
     pub canvas: ImageCanvas,
+    pub comparison: ComparisonView,
     pub toolbar: Toolbar,
     pub nav: NavigationBar,
     pub sidebar: Sidebar,
@@ -49,6 +83,11 @@ pub struct VideoViewerApp {
     pub current_rgb: Option<Vec<u8>>,
     /// Previous frame RGB (for metrics: PSNR, SSIM, frame diff).
     prev_rgb: Option<Vec<u8>>,
+    /// Optional reference frame stream for video diff mode.
+    reference_reader: Option<VideoReader>,
+    reference_file: Option<String>,
+    reference_raw: Option<Vec<u8>>,
+    reference_rgb: Option<Vec<u8>>,
     /// CLI-provided args for auto-open on startup.
     startup_input: Option<String>,
     startup_width: Option<u32>,
@@ -62,6 +101,7 @@ pub struct VideoViewerApp {
     dialog_state: DialogState,
     /// Dialog instances (created on demand).
     open_file_dialog: Option<dialogs::OpenFileDialog>,
+    reference_file_dialog: Option<dialogs::OpenFileDialog>,
     save_file_dialog: Option<dialogs::SaveFileDialog>,
     params_dialog: Option<dialogs::ParametersDialog>,
     export_dialog: Option<dialogs::ExportDialog>,
@@ -141,6 +181,7 @@ impl VideoViewerApp {
             current_file: None,
             reader: None,
             canvas: ImageCanvas::new(),
+            comparison: ComparisonView::new(),
             toolbar: Toolbar::new(),
             nav: NavigationBar::new(),
             sidebar: Sidebar::new(),
@@ -154,6 +195,10 @@ impl VideoViewerApp {
             current_raw: None,
             current_rgb: None,
             prev_rgb: None,
+            reference_reader: None,
+            reference_file: None,
+            reference_raw: None,
+            reference_rgb: None,
             startup_input: input,
             startup_width: width,
             startup_height: height,
@@ -162,6 +207,7 @@ impl VideoViewerApp {
             status_info: None,
             dialog_state: DialogState::None,
             open_file_dialog: None,
+            reference_file_dialog: None,
             save_file_dialog: None,
             params_dialog: None,
             export_dialog: None,
@@ -294,6 +340,147 @@ impl VideoViewerApp {
         }
     }
 
+    fn new_reference_file_dialog(&self) -> dialogs::OpenFileDialog {
+        let (default_w, default_h, default_fmt) = self
+            .reader
+            .as_ref()
+            .map(|r| (r.width(), r.height(), r.format_name().to_string()))
+            .unwrap_or_else(|| {
+                (
+                    self.settings.defaults.width,
+                    self.settings.defaults.height,
+                    self.settings.defaults.format.clone(),
+                )
+            });
+        let initial_dir = self.reference_file
+            .as_ref()
+            .or(self.current_file.as_ref())
+            .and_then(|f| std::path::Path::new(f).parent())
+            .and_then(|p| p.to_str());
+        dialogs::OpenFileDialog::new(default_w, default_h, &default_fmt, initial_dir)
+    }
+
+    fn open_reference_file(
+        &mut self,
+        ctx: &egui::Context,
+        path: String,
+        width: u32,
+        height: u32,
+        format: &str,
+    ) {
+        let color_matrix = self.reader
+            .as_ref()
+            .map(|r| r.color_matrix.clone())
+            .unwrap_or_else(|| self.settings.defaults.color_matrix.clone());
+
+        match VideoReader::open(&path, width, height, format, &color_matrix) {
+            Ok(reader) => {
+                self.reference_file = Some(path);
+                self.reference_reader = Some(reader);
+                self.reference_raw = None;
+                self.reference_rgb = None;
+                self.comparison.is_open = true;
+                self.status_error = None;
+                self.sync_reference_frame(ctx);
+                self.refresh_comparison(ctx);
+            }
+            Err(e) => {
+                self.status_error = Some(format!("Reference open error: {e}"));
+            }
+        }
+    }
+
+    fn sync_reference_frame(&mut self, ctx: &egui::Context) -> bool {
+        let Some(reader) = self.reference_reader.as_mut() else {
+            return false;
+        };
+        let Some(ref_idx) = matching_reference_frame_idx(
+            self.current_frame_idx,
+            reader.total_frames(),
+        ) else {
+            self.reference_raw = None;
+            self.reference_rgb = None;
+            self.comparison.message = Some("Reference has no frames.".to_string());
+            return false;
+        };
+        let raw = match reader.seek_frame(ref_idx) {
+            Ok(raw) => raw,
+            Err(e) => {
+                self.reference_raw = None;
+                self.reference_rgb = None;
+                self.comparison.message = Some(format!("Reference seek error: {e}"));
+                return false;
+            }
+        };
+        let rgb = match reader.convert_to_rgb(&raw) {
+            Ok(rgb) => rgb,
+            Err(e) => {
+                self.reference_raw = None;
+                self.reference_rgb = None;
+                self.comparison.message = Some(format!("Reference convert error: {e}"));
+                return false;
+            }
+        };
+        self.comparison
+            .set_reference_image(ctx, &rgb, reader.width(), reader.height());
+        self.reference_raw = Some(raw);
+        self.reference_rgb = Some(rgb);
+        true
+    }
+
+    fn refresh_comparison(&mut self, ctx: &egui::Context) {
+        if !self.comparison.is_open {
+            return;
+        }
+
+        let (w, h) = match self.reader.as_ref() {
+            Some(r) => (r.width(), r.height()),
+            None => {
+                self.comparison.message = Some("Load a current file first.".to_string());
+                self.comparison.metric_texture = None;
+                self.comparison.metric_map = None;
+                return;
+            }
+        };
+        let Some(current_rgb) = self.current_rgb.as_ref() else {
+            self.comparison.message = Some("Current frame is not decoded yet.".to_string());
+            return;
+        };
+        self.comparison.set_current_image(ctx, current_rgb, w, h);
+
+        let Some(reference_rgb) = self.reference_rgb.as_ref() else {
+            self.comparison.message = Some("Open a reference file for video diff.".to_string());
+            self.comparison.metric_texture = None;
+            self.comparison.metric_map = None;
+            return;
+        };
+        let Some(reference_reader) = self.reference_reader.as_ref() else {
+            self.comparison.message = Some("Open a reference file for video diff.".to_string());
+            return;
+        };
+        if reference_reader.width() != w || reference_reader.height() != h {
+            self.comparison.message = Some(format!(
+                "Reference size {}x{} does not match current {}x{}.",
+                reference_reader.width(),
+                reference_reader.height(),
+                w,
+                h
+            ));
+            self.comparison.metric_texture = None;
+            self.comparison.metric_map = None;
+            return;
+        }
+
+        self.comparison.compute_metric_map(
+            ctx,
+            reference_rgb,
+            current_rgb,
+            w,
+            h,
+            self.toolbar.grid_size,
+        );
+    }
+
     /// Seek to `idx`, decode, and push to canvas.
     fn goto_frame(&mut self, ctx: &egui::Context, idx: usize) -> bool {
         let total = self.total_frames();
@@ -357,6 +544,10 @@ impl VideoViewerApp {
         self.current_raw = Some(raw);
         self.current_frame_idx = idx;
         self.status_error = None;
+        if self.comparison.is_open {
+            self.sync_reference_frame(ctx);
+            self.refresh_comparison(ctx);
+        }
         // Track playback FPS (actual frame change rate).
         let now = Instant::now();
         self.playback_frame_times.push_back(now);
@@ -1069,9 +1260,10 @@ impl eframe::App for VideoViewerApp {
         }
         if keys.6 {
             // G: cycle grid
-            self.toolbar.grid_idx = (self.toolbar.grid_idx + 1) % 5;
-            self.toolbar.grid_size = [0, 16, 32, 64, 128][self.toolbar.grid_idx];
+            self.toolbar.cycle_grid_size();
             self.canvas.set_grid_size(self.toolbar.grid_size);
+            self.sidebar.grid_size = self.toolbar.grid_size;
+            self.refresh_comparison(ctx);
         }
         if keys.7 {
             // B: toggle bookmark
@@ -1264,8 +1456,7 @@ impl eframe::App for VideoViewerApp {
                     ui.separator();
 
                     // --- Video Size submenu ---
-                    let has_raw_file = self.reader.is_some()
-                        && !self.reader.as_ref().unwrap().is_y4m()
+                    let has_raw_file = self.reader.as_ref().is_some_and(|reader| !reader.is_y4m())
                         && !self.current_file.as_ref().is_some_and(|p| {
                             let ext = std::path::Path::new(p.as_str())
                                 .extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
@@ -1378,6 +1569,24 @@ impl eframe::App for VideoViewerApp {
                     }
                 });
                 ui.menu_button("Analysis", |ui| {
+                    if ui.button("Video Diff...").clicked() {
+                        ui.close_menu();
+                        self.comparison.is_open = true;
+                        if self.reference_reader.is_none() {
+                            self.reference_file_dialog = Some(self.new_reference_file_dialog());
+                            self.dialog_state = DialogState::OpenReference;
+                        } else {
+                            self.sync_reference_frame(ctx);
+                            self.refresh_comparison(ctx);
+                        }
+                    }
+                    if ui.button("Open Diff Reference...").clicked() {
+                        ui.close_menu();
+                        self.comparison.is_open = true;
+                        self.reference_file_dialog = Some(self.new_reference_file_dialog());
+                        self.dialog_state = DialogState::OpenReference;
+                    }
+                    ui.separator();
                     if ui.button("Detect Scene Changes...").clicked() {
                         ui.close_menu();
                         self.show_scene_detect_dialog = true;
@@ -1490,9 +1699,10 @@ impl eframe::App for VideoViewerApp {
                             self.goto_frame(ctx, self.current_frame_idx);
                         }
                     }
-                    ToolbarAction::ToggleGrid => {
+                    ToolbarAction::GridChanged => {
                         self.canvas.set_grid_size(self.toolbar.grid_size);
                         self.sidebar.grid_size = self.toolbar.grid_size;
+                        self.refresh_comparison(ctx);
                     }
                     ToolbarAction::ToggleSubGrid => {
                         self.canvas.set_sub_grid_size(self.toolbar.sub_grid_size);
@@ -1714,7 +1924,8 @@ impl eframe::App for VideoViewerApp {
         // Analysis as a separate floating window.
         self.sidebar.show_analysis_window(ctx);
 
-        // --- Central panel (canvas) ---
+        // --- Central panel (canvas / video diff) ---
+        let mut comparison_action = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             // Detect window resize and force repaints (fixes WSLg compositor artifacts).
             {
@@ -1735,7 +1946,16 @@ impl eframe::App for VideoViewerApp {
                 }
             }
 
-            if self.reader.is_some() {
+            if self.comparison.is_open {
+                self.sidebar.pixel_active = false;
+                self.sidebar.set_pixel_info(None);
+                comparison_action = self.comparison.show(
+                    ui,
+                    self.reference_file.as_deref(),
+                    self.current_file.as_deref(),
+                    self.toolbar.grid_size,
+                );
+            } else if self.reader.is_some() {
                 let response = self.canvas.show(ui);
 
                 // Draw sideband CTU overlay on top of the image.
@@ -1789,6 +2009,21 @@ impl eframe::App for VideoViewerApp {
                 });
             }
         });
+        if let Some(action) = comparison_action {
+            match action {
+                ComparisonUiAction::OpenReference => {
+                    self.reference_file_dialog = Some(self.new_reference_file_dialog());
+                    self.dialog_state = DialogState::OpenReference;
+                }
+                ComparisonUiAction::Refresh => {
+                    self.sync_reference_frame(ctx);
+                    self.refresh_comparison(ctx);
+                }
+                ComparisonUiAction::Close => {
+                    self.comparison.is_open = false;
+                }
+            }
+        }
 
         // --- Dialogs ---
         self.show_dialogs(ctx);
@@ -1807,6 +2042,19 @@ impl VideoViewerApp {
                     }
                     self.dialog_state = DialogState::None;
                     self.open_file_dialog = None;
+                }
+            }
+        }
+
+        // Open reference file dialog for video diff
+        if self.dialog_state == DialogState::OpenReference {
+            if let Some(ref mut dlg) = self.reference_file_dialog {
+                if let Some(result) = dlg.show(ctx) {
+                    if let Some((path, w, h, fmt)) = result {
+                        self.open_reference_file(ctx, path, w, h, &fmt);
+                    }
+                    self.dialog_state = DialogState::None;
+                    self.reference_file_dialog = None;
                 }
             }
         }

@@ -7,6 +7,7 @@ pub enum DialogState {
     #[default]
     None,
     OpenFile,
+    OpenReference,
     SaveFile,
     Parameters,
     Export,
@@ -403,14 +404,12 @@ impl ConvertDialog {
                 });
 
                 // Directory browser with "Select this folder" button
-                if self.dir_browser.is_some() {
+                if let Some(browser) = self.dir_browser.as_ref() {
                     ui.separator();
 
                     // Collect needed values before borrowing browser
-                    let cur_dir_display = self.dir_browser.as_ref().unwrap()
-                        .current_dir.display().to_string();
-                    let cur_dir_clone = self.dir_browser.as_ref().unwrap()
-                        .current_dir.clone();
+                    let cur_dir_display = browser.current_dir.display().to_string();
+                    let cur_dir_clone = browser.current_dir.clone();
                     let fmt_name = self.selectable_formats
                         .get(self.output_format_idx)
                         .cloned()
@@ -1450,7 +1449,7 @@ pub fn show_shortcuts_dialog(ctx: &egui::Context) -> bool {
                         ("Home / End", "First / Last frame"),
                         ("0-4", "Component view (Full/Y/U/V/Split)"),
                         ("F", "Fit to view"),
-                        ("G", "Cycle grid size"),
+                        ("G", "Cycle grid size (off/128/64/32/16)"),
                         ("B", "Toggle bookmark"),
                         ("M", "Toggle magnifier"),
                         ("C", "Center image"),

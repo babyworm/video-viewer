@@ -1,26 +1,122 @@
 use eframe::egui;
 
-/// Comparison display mode.
+use crate::analysis::metrics::{MetricBlock, SpatialMetricKind, SpatialMetricMap};
+
+const MIN_VIEW_ZOOM: f32 = 1.0;
+const MAX_VIEW_ZOOM: f32 = 32.0;
+
+/// User actions requested from the comparison panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ComparisonMode {
-    Split,
-    Overlay,
-    Diff,
+pub enum ComparisonUiAction {
+    OpenReference,
+    Refresh,
+    Close,
 }
 
-/// A/B comparison view for two video frames.
+/// Three-pane video diff view: reference, current, and selected diff/metric map.
 pub struct ComparisonView {
-    pub mode: ComparisonMode,
-    /// Normalised split position (0.0 = full reference, 1.0 = full main).
-    pub split_pos: f32,
-    /// Overlay opacity for the reference image.
-    pub overlay_opacity: f32,
-    /// Reference image texture.
-    pub ref_texture: Option<egui::TextureHandle>,
-    /// Amplified-difference heatmap texture.
-    pub diff_texture: Option<egui::TextureHandle>,
     /// Whether the comparison panel is visible.
     pub is_open: bool,
+    /// Selected right-pane metric.
+    pub metric_kind: SpatialMetricKind,
+    /// Difference heatmap gain for signed luma diff mode.
+    pub diff_gain: f32,
+    /// Shared zoom/pan viewport for all comparison panes.
+    pub viewport: ComparisonViewport,
+    /// Reference image texture.
+    pub ref_texture: Option<egui::TextureHandle>,
+    /// Current image texture.
+    pub current_texture: Option<egui::TextureHandle>,
+    /// Right-pane diff/metric texture.
+    pub metric_texture: Option<egui::TextureHandle>,
+    /// Last computed spatial metric values, used for labels and summary.
+    pub metric_map: Option<SpatialMetricMap>,
+    /// Last source image size.
+    pub image_size: Option<(u32, u32)>,
+    /// Last comparison status/error.
+    pub message: Option<String>,
+}
+
+/// Normalized image viewport shared by all comparison panes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ComparisonViewport {
+    /// Center point in normalized image coordinates.
+    pub center: egui::Vec2,
+    /// Magnification relative to the full image view.
+    pub zoom: f32,
+}
+
+impl Default for ComparisonViewport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ComparisonViewport {
+    pub fn new() -> Self {
+        Self {
+            center: egui::vec2(0.5, 0.5),
+            zoom: MIN_VIEW_ZOOM,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    pub fn uv_rect(&self) -> egui::Rect {
+        let visible = self.visible_size();
+        let center = self.clamped_center_for_visible(visible);
+        egui::Rect::from_center_size(egui::pos2(center.x, center.y), visible)
+    }
+
+    pub fn zoom_at(&mut self, rel_norm: egui::Vec2, factor: f32) {
+        if !rel_norm.is_finite() || !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+
+        let rel_norm = clamp_vec2(rel_norm, 0.0, 1.0);
+        let old_uv = self.uv_rect();
+        let anchor = old_uv.min.to_vec2() + rel_norm * old_uv.size();
+
+        self.zoom = (self.zoom * factor).clamp(MIN_VIEW_ZOOM, MAX_VIEW_ZOOM);
+        let visible = self.visible_size();
+        self.center = anchor - (rel_norm - egui::vec2(0.5, 0.5)) * visible;
+        self.clamp_center();
+    }
+
+    pub fn pan_by_pixels(&mut self, delta_pixels: egui::Vec2, display_size: egui::Vec2) {
+        if !delta_pixels.is_finite()
+            || !display_size.is_finite()
+            || display_size.x <= 0.0
+            || display_size.y <= 0.0
+        {
+            return;
+        }
+
+        let visible = self.visible_size();
+        self.center.x -= delta_pixels.x / display_size.x * visible.x;
+        self.center.y -= delta_pixels.y / display_size.y * visible.y;
+        self.clamp_center();
+    }
+
+    fn visible_size(&self) -> egui::Vec2 {
+        let side = 1.0 / self.zoom.clamp(MIN_VIEW_ZOOM, MAX_VIEW_ZOOM);
+        egui::vec2(side, side)
+    }
+
+    fn clamp_center(&mut self) {
+        let visible = self.visible_size();
+        self.center = self.clamped_center_for_visible(visible);
+    }
+
+    fn clamped_center_for_visible(&self, visible: egui::Vec2) -> egui::Vec2 {
+        let half = visible * 0.5;
+        egui::vec2(
+            self.center.x.clamp(half.x, 1.0 - half.x),
+            self.center.y.clamp(half.y, 1.0 - half.y),
+        )
+    }
 }
 
 impl Default for ComparisonView {
@@ -32,190 +128,593 @@ impl Default for ComparisonView {
 impl ComparisonView {
     pub fn new() -> Self {
         Self {
-            mode: ComparisonMode::Split,
-            split_pos: 0.5,
-            overlay_opacity: 0.5,
-            ref_texture: None,
-            diff_texture: None,
             is_open: false,
+            metric_kind: SpatialMetricKind::SignedDiff,
+            diff_gain: 4.0,
+            viewport: ComparisonViewport::new(),
+            ref_texture: None,
+            current_texture: None,
+            metric_texture: None,
+            metric_map: None,
+            image_size: None,
+            message: None,
         }
     }
 
     /// Upload an RGB buffer as the reference image.
-    pub fn set_reference_image(
-        &mut self,
-        ctx: &egui::Context,
-        rgb: &[u8],
-        w: u32,
-        h: u32,
-    ) {
-        let color_image =
-            egui::ColorImage::from_rgb([w as usize, h as usize], rgb);
-        self.ref_texture = Some(ctx.load_texture(
-            "comparison_ref",
-            color_image,
-            egui::TextureOptions::LINEAR,
-        ));
+    pub fn set_reference_image(&mut self, ctx: &egui::Context, rgb: &[u8], w: u32, h: u32) {
+        self.ref_texture = Some(load_rgb_texture(ctx, "comparison_ref", rgb, w, h));
+        self.image_size = Some((w, h));
     }
 
-    /// Compute an amplified (10x) absolute-difference heatmap between two RGB
-    /// buffers and store the result as `diff_texture`.
-    pub fn compute_diff(
-        &mut self,
-        ctx: &egui::Context,
-        main_rgb: &[u8],
-        ref_rgb: &[u8],
-        w: u32,
-        h: u32,
-    ) {
-        let len = (w as usize) * (h as usize) * 3;
-        let mut diff_buf = vec![0u8; len];
-        for i in 0..len.min(main_rgb.len()).min(ref_rgb.len()) {
-            let d = (main_rgb[i] as i16 - ref_rgb[i] as i16).unsigned_abs();
-            diff_buf[i] = (d.saturating_mul(10)).min(255) as u8;
-        }
-        let color_image =
-            egui::ColorImage::from_rgb([w as usize, h as usize], &diff_buf);
-        self.diff_texture = Some(ctx.load_texture(
-            "comparison_diff",
-            color_image,
-            egui::TextureOptions::LINEAR,
-        ));
+    /// Upload an RGB buffer as the current image.
+    pub fn set_current_image(&mut self, ctx: &egui::Context, rgb: &[u8], w: u32, h: u32) {
+        self.current_texture = Some(load_rgb_texture(ctx, "comparison_current", rgb, w, h));
+        self.image_size = Some((w, h));
     }
 
-    /// Render the comparison view.
-    ///
-    /// `main_texture` is the currently displayed frame; `image_size` is its
-    /// (width, height) in pixels.
+    /// Recompute the selected right-pane map.
+    pub fn compute_metric_map(
+        &mut self,
+        ctx: &egui::Context,
+        reference_rgb: &[u8],
+        current_rgb: &[u8],
+        w: u32,
+        h: u32,
+        grid_size: u32,
+    ) {
+        let map = crate::analysis::metrics::calculate_spatial_metric_map(
+            reference_rgb,
+            current_rgb,
+            w,
+            h,
+            grid_size,
+            self.metric_kind,
+        );
+        let heatmap = match self.metric_kind {
+            SpatialMetricKind::SignedDiff => {
+                self.signed_diff_heatmap(reference_rgb, current_rgb, w, h)
+            }
+            _ => metric_tile_heatmap(&map),
+        };
+
+        self.metric_texture = Some(load_rgb_texture(ctx, "comparison_metric", &heatmap, w, h));
+        self.metric_map = Some(map);
+        self.image_size = Some((w, h));
+        self.message = None;
+    }
+
+    /// Clear loaded comparison frames.
+    pub fn clear(&mut self) {
+        self.viewport.reset();
+        self.ref_texture = None;
+        self.current_texture = None;
+        self.metric_texture = None;
+        self.metric_map = None;
+        self.image_size = None;
+        self.message = None;
+    }
+
+    /// Render the comparison view and return requested app actions.
     pub fn show(
         &mut self,
-        _ctx: &egui::Context,
         ui: &mut egui::Ui,
-        main_texture: Option<&egui::TextureHandle>,
-        image_size: Option<(u32, u32)>,
-    ) {
+        reference_path: Option<&str>,
+        current_path: Option<&str>,
+        grid_size: u32,
+    ) -> Option<ComparisonUiAction> {
         if !self.is_open {
-            return;
+            return None;
         }
 
-        // Mode selector
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.mode, ComparisonMode::Split, "Split");
-            ui.selectable_value(&mut self.mode, ComparisonMode::Overlay, "Overlay");
-            ui.selectable_value(&mut self.mode, ComparisonMode::Diff, "Diff");
+        let mut action = None;
+        let prev_metric = self.metric_kind;
+        let prev_gain = self.diff_gain;
+
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("Video Diff");
+            ui.separator();
+            if ui.button("Open reference...").clicked() {
+                action = Some(ComparisonUiAction::OpenReference);
+            }
+            if ui.button("Refresh").clicked() {
+                action = Some(ComparisonUiAction::Refresh);
+            }
+            if ui.button("Reset view").clicked() {
+                self.viewport.reset();
+            }
+            if ui.button("Close").clicked() {
+                action = Some(ComparisonUiAction::Close);
+            }
+            ui.separator();
+            egui::ComboBox::from_id_salt("comparison_metric_kind")
+                .selected_text(self.metric_kind.display_name())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.metric_kind,
+                        SpatialMetricKind::SignedDiff,
+                        "Diff ΔY",
+                    );
+                    ui.selectable_value(
+                        &mut self.metric_kind,
+                        SpatialMetricKind::MsPsnr,
+                        "MS-PSNR",
+                    );
+                    ui.selectable_value(
+                        &mut self.metric_kind,
+                        SpatialMetricKind::MsSsim,
+                        "MS-SSIM",
+                    );
+                    ui.selectable_value(
+                        &mut self.metric_kind,
+                        SpatialMetricKind::VmafNegProxy,
+                        "VMAF-NEG proxy",
+                    );
+                });
+            if self.metric_kind == SpatialMetricKind::SignedDiff {
+                ui.add(
+                    egui::Slider::new(&mut self.diff_gain, 1.0..=16.0)
+                        .text("diff gain")
+                        .clamping(egui::SliderClamping::Always),
+                );
+            }
         });
+
+        if action.is_none()
+            && (self.metric_kind != prev_metric
+                || (self.diff_gain - prev_gain).abs() > f32::EPSILON)
+        {
+            action = Some(ComparisonUiAction::Refresh);
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Reference:");
+            ui.monospace(reference_path.unwrap_or("--"));
+            ui.separator();
+            ui.label("Current:");
+            ui.monospace(current_path.unwrap_or("--"));
+            ui.separator();
+            let grid_text = if grid_size > 0 {
+                format!("main grid: {} px", grid_size)
+            } else {
+                "main grid: off (64 px analysis tiles)".to_string()
+            };
+            ui.label(grid_text);
+        });
+
+        if let Some(ref message) = self.message {
+            ui.colored_label(egui::Color32::YELLOW, message);
+        }
+
+        if let Some(ref map) = self.metric_map {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("Overall {}:", map.kind.display_name()));
+                ui.monospace(format_metric_value(map.kind, map.overall));
+                if map.kind.higher_is_better() {
+                    ui.weak("higher/green = closer to reference");
+                } else {
+                    ui.weak("signed ΔY: green +, red -");
+                }
+            });
+        }
+
         ui.separator();
 
-        let (w, h) = match image_size {
-            Some(s) => s,
+        let (w, h) = match self.image_size {
+            Some(size) => size,
             None => {
-                ui.label("No image loaded.");
-                return;
+                ui.centered_and_justified(|ui| {
+                    ui.label("Load a current file and a reference file to start video diff.");
+                });
+                return action;
             }
         };
 
-        let avail = ui.available_size();
+        let available = ui.available_size();
+        let gap = 8.0_f32;
+        let label_h = 22.0_f32;
+        let pane_w = ((available.x - gap * 2.0) / 3.0).max(80.0);
+        let pane_h = (available.y - label_h).max(80.0);
         let aspect = w as f32 / h as f32;
-        let display_w = avail.x.min(avail.y * aspect);
-        let display_h = display_w / aspect;
-        let display_size = egui::vec2(display_w, display_h);
-
-        match self.mode {
-            ComparisonMode::Split => self.show_split(ui, main_texture, display_size),
-            ComparisonMode::Overlay => self.show_overlay(ui, main_texture, display_size),
-            ComparisonMode::Diff => self.show_diff(ui, display_size),
+        let mut image_w = pane_w;
+        let mut image_h = image_w / aspect;
+        if image_h > pane_h {
+            image_h = pane_h;
+            image_w = image_h * aspect;
         }
+        let display_size = egui::vec2(image_w, image_h);
+
+        let ref_texture_id = self.ref_texture.as_ref().map(|texture| texture.id());
+        let current_texture_id = self.current_texture.as_ref().map(|texture| texture.id());
+        let metric_texture_id = self.metric_texture.as_ref().map(|texture| texture.id());
+        let metric_label = self.metric_kind.display_name();
+
+        ui.horizontal_top(|ui| {
+            self.show_pane(ui, "Reference", ref_texture_id, display_size, false);
+            ui.add_space(gap);
+            self.show_pane(ui, "Current", current_texture_id, display_size, false);
+            ui.add_space(gap);
+            self.show_pane(ui, metric_label, metric_texture_id, display_size, true);
+        });
+
+        ui.add_space(4.0);
+        ui.weak("Mouse wheel zooms every pane together; drag any pane to pan the shared view. MS-SSIM uses tile-local multi-scale SSIM. VMAF-NEG proxy is a no-new-dependency spatial triage proxy, not official libvmaf output.");
+
+        action
     }
 
-    // ── Split mode ───────────────────────────────────────────────────
-
-    fn show_split(
+    fn show_pane(
         &mut self,
         ui: &mut egui::Ui,
-        main_texture: Option<&egui::TextureHandle>,
+        label: &str,
+        texture_id: Option<egui::TextureId>,
         display_size: egui::Vec2,
+        draw_metric_labels: bool,
     ) {
-        ui.label("Drag the divider to adjust split position.");
-        ui.add(egui::Slider::new(&mut self.split_pos, 0.0..=1.0).text("Split"));
+        ui.vertical(|ui| {
+            ui.label(egui::RichText::new(label).strong());
+            let (rect, response) =
+                ui.allocate_exact_size(display_size, egui::Sense::click_and_drag());
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
 
-        let (rect, response) =
-            ui.allocate_exact_size(display_size, egui::Sense::click_and_drag());
+            if response.hovered() {
+                let scroll_delta = ui.input(|input| input.smooth_scroll_delta.y);
+                if scroll_delta.abs() > f32::EPSILON {
+                    if let Some(pointer_pos) = ui.input(|input| input.pointer.hover_pos()) {
+                        if rect.contains(pointer_pos) {
+                            let rel = pointer_pos - rect.min;
+                            let rel_norm =
+                                egui::vec2(rel.x / rect.width(), rel.y / rect.height());
+                            let zoom_change = (scroll_delta * 0.001).clamp(-0.10, 0.10);
+                            self.viewport.zoom_at(rel_norm, 1.0 + zoom_change);
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                }
+            }
 
-        // Drag to move the split divider
-        if response.dragged() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                self.split_pos =
-                    ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            if response.dragged_by(egui::PointerButton::Primary)
+                || response.dragged_by(egui::PointerButton::Middle)
+            {
+                let delta = ui.input(|input| input.pointer.delta());
+                self.viewport.pan_by_pixels(delta, rect.size());
+                ui.ctx().request_repaint();
+            }
+
+            let uv = self.viewport.uv_rect();
+            if let Some(texture_id) = texture_id {
+                painter.image(texture_id, rect, uv, egui::Color32::WHITE);
+            } else {
+                painter.rect_stroke(
+                    rect,
+                    0.0,
+                    egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.fg_stroke.color),
+                    egui::StrokeKind::Outside,
+                );
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "not loaded",
+                    egui::FontId::proportional(13.0),
+                    ui.visuals().weak_text_color(),
+                );
+            }
+
+            if draw_metric_labels {
+                if let (Some(map), Some((iw, ih))) = (&self.metric_map, self.image_size) {
+                    draw_metric_overlay(&painter, rect, uv, map, iw, ih);
+                }
+            }
+        });
+    }
+
+    fn signed_diff_heatmap(
+        &self,
+        reference_rgb: &[u8],
+        current_rgb: &[u8],
+        w: u32,
+        h: u32,
+    ) -> Vec<u8> {
+        let len = (w as usize) * (h as usize);
+        let mut out = vec![0u8; len * 3];
+        let gain = self.diff_gain as f64;
+
+        for i in 0..len {
+            let base = i * 3;
+            if base + 2 >= reference_rgb.len() || base + 2 >= current_rgb.len() {
+                continue;
+            }
+            let ref_y = luma_at(reference_rgb, base);
+            let cur_y = luma_at(current_rgb, base);
+            let delta = (cur_y - ref_y) * gain;
+            let mag = delta.abs().min(255.0) as u8;
+            if delta >= 0.0 {
+                out[base] = 10;
+                out[base + 1] = mag;
+                out[base + 2] = 40;
+            } else {
+                out[base] = mag;
+                out[base + 1] = 20;
+                out[base + 2] = 10;
             }
         }
 
-        let painter = ui.painter_at(rect);
-        let split_x = rect.left() + rect.width() * self.split_pos;
+        out
+    }
+}
 
-        // Left half: main texture
-        if let Some(tex) = main_texture {
-            let left_rect = egui::Rect::from_min_max(rect.min, egui::pos2(split_x, rect.max.y));
-            let uv_right = self.split_pos;
-            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(uv_right, 1.0));
-            painter.image(tex.id(), left_rect, uv, egui::Color32::WHITE);
-        }
+fn clamp_vec2(value: egui::Vec2, min: f32, max: f32) -> egui::Vec2 {
+    egui::vec2(value.x.clamp(min, max), value.y.clamp(min, max))
+}
 
-        // Right half: reference texture
-        if let Some(ref tex) = self.ref_texture {
-            let right_rect =
-                egui::Rect::from_min_max(egui::pos2(split_x, rect.min.y), rect.max);
-            let uv =
-                egui::Rect::from_min_max(egui::pos2(self.split_pos, 0.0), egui::pos2(1.0, 1.0));
-            painter.image(tex.id(), right_rect, uv, egui::Color32::WHITE);
-        }
+fn load_rgb_texture(
+    ctx: &egui::Context,
+    name: &str,
+    rgb: &[u8],
+    w: u32,
+    h: u32,
+) -> egui::TextureHandle {
+    let color_image = egui::ColorImage::from_rgb([w as usize, h as usize], rgb);
+    ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR)
+}
 
-        // Divider line
-        painter.line_segment(
-            [
-                egui::pos2(split_x, rect.top()),
-                egui::pos2(split_x, rect.bottom()),
-            ],
-            egui::Stroke::new(2.0, egui::Color32::YELLOW),
-        );
+fn luma_at(rgb: &[u8], base: usize) -> f64 {
+    0.2126 * rgb[base] as f64 + 0.7152 * rgb[base + 1] as f64 + 0.0722 * rgb[base + 2] as f64
+}
+
+fn metric_tile_heatmap(map: &SpatialMetricMap) -> Vec<u8> {
+    let width = map.width as usize;
+    let height = map.height as usize;
+    let mut out = vec![0u8; width * height * 3];
+
+    for block in &map.blocks {
+        let color = metric_color(map.kind, block.value);
+        fill_block(&mut out, width, height, block, color);
     }
 
-    // ── Overlay mode ─────────────────────────────────────────────────
+    out
+}
 
-    fn show_overlay(
-        &mut self,
-        ui: &mut egui::Ui,
-        main_texture: Option<&egui::TextureHandle>,
-        display_size: egui::Vec2,
-    ) {
-        ui.add(
-            egui::Slider::new(&mut self.overlay_opacity, 0.0..=1.0).text("Ref opacity"),
-        );
-
-        let (rect, _response) =
-            ui.allocate_exact_size(display_size, egui::Sense::hover());
-        let painter = ui.painter_at(rect);
-        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-
-        // Main texture at full opacity
-        if let Some(tex) = main_texture {
-            painter.image(tex.id(), rect, uv, egui::Color32::WHITE);
-        }
-
-        // Reference texture blended on top
-        if let Some(ref tex) = self.ref_texture {
-            let alpha = (self.overlay_opacity * 255.0) as u8;
-            let tint = egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
-            painter.image(tex.id(), rect, uv, tint);
+fn fill_block(out: &mut [u8], full_w: usize, full_h: usize, block: &MetricBlock, color: [u8; 3]) {
+    let x0 = block.x as usize;
+    let y0 = block.y as usize;
+    let x1 = (x0 + block.w as usize).min(full_w);
+    let y1 = (y0 + block.h as usize).min(full_h);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let idx = (y * full_w + x) * 3;
+            out[idx] = color[0];
+            out[idx + 1] = color[1];
+            out[idx + 2] = color[2];
         }
     }
+}
 
-    // ── Diff mode ────────────────────────────────────────────────────
-
-    fn show_diff(&self, ui: &mut egui::Ui, display_size: egui::Vec2) {
-        if let Some(ref tex) = self.diff_texture {
-            ui.image(egui::load::SizedTexture::new(tex.id(), display_size));
-        } else {
-            ui.label("No diff computed. Load a reference image first.");
+fn metric_color(kind: SpatialMetricKind, value: f64) -> [u8; 3] {
+    match kind {
+        SpatialMetricKind::SignedDiff => {
+            let mag = value.abs().min(64.0) / 64.0;
+            if value >= 0.0 {
+                [20, (40.0 + 215.0 * mag) as u8, 40]
+            } else {
+                [(40.0 + 215.0 * mag) as u8, 35, 25]
+            }
         }
+        SpatialMetricKind::MsPsnr => {
+            let t = if value.is_infinite() {
+                1.0
+            } else {
+                ((value - 20.0) / 30.0).clamp(0.0, 1.0)
+            };
+            quality_color(t)
+        }
+        SpatialMetricKind::MsSsim => {
+            let t = ((value - 0.85) / 0.15).clamp(0.0, 1.0);
+            quality_color(t)
+        }
+        SpatialMetricKind::VmafNegProxy => {
+            let t = (value / 100.0).clamp(0.0, 1.0);
+            quality_color(t)
+        }
+    }
+}
+
+fn quality_color(t: f64) -> [u8; 3] {
+    // Red -> amber -> green, with enough blue removed to keep labels legible.
+    let r = (220.0 * (1.0 - t) + 30.0 * t) as u8;
+    let g = (45.0 * (1.0 - t) + 210.0 * t) as u8;
+    let b = (35.0 * (1.0 - t) + 70.0 * t) as u8;
+    [r, g, b]
+}
+
+fn draw_metric_overlay(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    uv: egui::Rect,
+    map: &SpatialMetricMap,
+    image_w: u32,
+    image_h: u32,
+) {
+    if image_w == 0 || image_h == 0 || uv.width() <= 0.0 || uv.height() <= 0.0 {
+        return;
+    }
+
+    let stroke = egui::Stroke::new(0.5, egui::Color32::from_black_alpha(140));
+
+    for block in &map.blocks {
+        let block_uv = egui::Rect::from_min_max(
+            egui::pos2(
+                block.x as f32 / image_w as f32,
+                block.y as f32 / image_h as f32,
+            ),
+            egui::pos2(
+                (block.x + block.w) as f32 / image_w as f32,
+                (block.y + block.h) as f32 / image_h as f32,
+            ),
+        );
+        let Some(visible_uv) = intersect_rect(block_uv, uv) else {
+            continue;
+        };
+
+        let min = uv_to_screen(rect, uv, visible_uv.min);
+        let max = uv_to_screen(rect, uv, visible_uv.max);
+        let block_rect = egui::Rect::from_min_max(min, max);
+        painter.rect_stroke(block_rect, 0.0, stroke, egui::StrokeKind::Inside);
+
+        if block_rect.width() >= 42.0 && block_rect.height() >= 18.0 {
+            painter.text(
+                block_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                format_metric_value(map.kind, block.value),
+                egui::FontId::monospace(10.0),
+                text_color_for_value(map.kind, block.value),
+            );
+        }
+    }
+}
+
+fn intersect_rect(a: egui::Rect, b: egui::Rect) -> Option<egui::Rect> {
+    let min = egui::pos2(a.left().max(b.left()), a.top().max(b.top()));
+    let max = egui::pos2(a.right().min(b.right()), a.bottom().min(b.bottom()));
+    if min.x >= max.x || min.y >= max.y {
+        None
+    } else {
+        Some(egui::Rect::from_min_max(min, max))
+    }
+}
+
+fn uv_to_screen(rect: egui::Rect, uv: egui::Rect, point: egui::Pos2) -> egui::Pos2 {
+    egui::pos2(
+        rect.left() + (point.x - uv.left()) / uv.width() * rect.width(),
+        rect.top() + (point.y - uv.top()) / uv.height() * rect.height(),
+    )
+}
+
+fn text_color_for_value(kind: SpatialMetricKind, value: f64) -> egui::Color32 {
+    let bg = metric_color(kind, value);
+    let luminance = 0.2126 * bg[0] as f64 + 0.7152 * bg[1] as f64 + 0.0722 * bg[2] as f64;
+    if luminance > 120.0 {
+        egui::Color32::BLACK
+    } else {
+        egui::Color32::WHITE
+    }
+}
+
+pub fn format_metric_value(kind: SpatialMetricKind, value: f64) -> String {
+    match kind {
+        SpatialMetricKind::SignedDiff => format!("{:+.1}", value),
+        SpatialMetricKind::MsPsnr => {
+            if value.is_infinite() {
+                "∞ dB".to_string()
+            } else {
+                format!("{:.1} dB", value)
+            }
+        }
+        SpatialMetricKind::MsSsim => format!("{:.4}", value),
+        SpatialMetricKind::VmafNegProxy => format!("{:.1}", value),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viewport_default_shows_full_image() {
+        let viewport = ComparisonViewport::new();
+        let uv = viewport.uv_rect();
+
+        assert_close(uv.left(), 0.0);
+        assert_close(uv.top(), 0.0);
+        assert_close(uv.right(), 1.0);
+        assert_close(uv.bottom(), 1.0);
+        assert_close(viewport.zoom, 1.0);
+    }
+
+    #[test]
+    fn viewport_zoom_at_center_keeps_centered_crop() {
+        let mut viewport = ComparisonViewport::new();
+        viewport.zoom_at(egui::vec2(0.5, 0.5), 2.0);
+
+        let uv = viewport.uv_rect();
+        assert_close(uv.left(), 0.25);
+        assert_close(uv.top(), 0.25);
+        assert_close(uv.right(), 0.75);
+        assert_close(uv.bottom(), 0.75);
+    }
+
+    #[test]
+    fn viewport_zoom_keeps_hovered_source_point_stable() {
+        let mut viewport = ComparisonViewport::new();
+        let rel = egui::vec2(0.25, 0.75);
+        let before = uv_point(viewport.uv_rect(), rel);
+
+        viewport.zoom_at(rel, 4.0);
+
+        let after = uv_point(viewport.uv_rect(), rel);
+        assert_close(before.x, after.x);
+        assert_close(before.y, after.y);
+    }
+
+    #[test]
+    fn viewport_pan_clamps_to_image_bounds() {
+        let mut viewport = ComparisonViewport::new();
+        viewport.zoom_at(egui::vec2(0.5, 0.5), 4.0);
+
+        viewport.pan_by_pixels(egui::vec2(10_000.0, 10_000.0), egui::vec2(100.0, 100.0));
+        let uv = viewport.uv_rect();
+
+        assert!(uv.left() >= 0.0);
+        assert!(uv.top() >= 0.0);
+        assert!(uv.right() <= 1.0);
+        assert!(uv.bottom() <= 1.0);
+        assert_close(uv.left(), 0.0);
+        assert_close(uv.top(), 0.0);
+    }
+
+    #[test]
+    fn viewport_ignores_non_finite_zoom_anchor() {
+        let mut viewport = ComparisonViewport::new();
+        let before = viewport;
+
+        viewport.zoom_at(egui::vec2(f32::NAN, 0.5), 2.0);
+
+        assert_eq!(viewport, before);
+    }
+
+    #[test]
+    fn viewport_ignores_non_finite_pan_delta() {
+        let mut viewport = ComparisonViewport::new();
+        viewport.zoom_at(egui::vec2(0.5, 0.5), 2.0);
+        let before = viewport;
+
+        viewport.pan_by_pixels(egui::vec2(f32::NAN, 10.0), egui::vec2(100.0, 100.0));
+
+        assert_eq!(viewport, before);
+    }
+
+    #[test]
+    fn intersect_rect_returns_visible_overlap_only() {
+        let a = egui::Rect::from_min_max(egui::pos2(0.25, 0.25), egui::pos2(0.75, 0.75));
+        let b = egui::Rect::from_min_max(egui::pos2(0.50, 0.00), egui::pos2(1.00, 0.50));
+
+        let overlap = intersect_rect(a, b).expect("rectangles should overlap");
+
+        assert_close(overlap.left(), 0.50);
+        assert_close(overlap.top(), 0.25);
+        assert_close(overlap.right(), 0.75);
+        assert_close(overlap.bottom(), 0.50);
+    }
+
+    fn uv_point(rect: egui::Rect, rel: egui::Vec2) -> egui::Vec2 {
+        rect.min.to_vec2() + rel * rect.size()
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 1e-5,
+            "expected {expected}, got {actual}"
+        );
     }
 }

@@ -34,14 +34,14 @@
     - `sidebar.rs` - Sidebar (analysis tabs: histogram, waveform, vectorscope, metrics)
     - `navigation.rs` - NavigationBar (frame slider, playback controls)
     - `dialogs.rs` - Open, Save, Parameters, Export, Convert, Settings dialogs
-    - `comparison.rs` - ComparisonView (split, overlay, diff modes)
+    - `comparison.rs` - ComparisonView (three-pane video diff, spatial metric labels, synchronized zoom/pan)
     - `settings.rs` - Settings persistence (toml)
     - `sideband_overlay.rs` - Sideband CTU heatmap overlay rendering
   - `src/analysis/` - Analysis tools
     - `histogram.rs` - RGB and luma histograms
     - `waveform.rs` - Waveform display
     - `vectorscope.rs` - BT.709 YCbCr vectorscope
-    - `metrics.rs` - PSNR, SSIM, frame difference
+    - `metrics.rs` - PSNR, SSIM, frame difference, MS-PSNR, MS-SSIM, VMAF-NEG proxy, spatial metric maps
     - `scene.rs` - Scene change detection
     - `isp_sideband.rs` - SidebandPanel UI (load/unload, overlay mode, opacity)
   - `src/conversion/` - Format conversion
@@ -54,7 +54,7 @@
 
 - Run tests: `cd rust && cargo test`
 - All tests must pass before any release.
-- Framework: Rust integration tests in `rust/tests/`
+- Framework: Rust integration tests in `rust/tests/` plus focused inline unit tests in `rust/src/**`
 
 ### Test Patterns
 
@@ -67,12 +67,16 @@
 
 | File | Scope |
 |------|-------|
+| `src/*` inline tests | App comparison sync, comparison viewport math, toolbar grid selector, sideband schema (20 tests) |
+| `tests/colorspace_test.rs` | RGB/YUV color conversion sanity checks (12 tests) |
 | `tests/formats_test.rs` | Format lookup, frame_size, categories (21 tests) |
 | `tests/formats_extra_test.rs` | RGB16/32, semi-planar, packed frame sizes (9 tests) |
 | `tests/reader_test.rs` | VideoReader open, seek, Y4M, RGB convert, channels (6 tests) |
 | `tests/pixel_test.rs` | Pixel info: I420, YV12, NV12, NV21, RGB24, BGR24, Grey (12 tests) |
 | `tests/pixel_packed_test.rs` | Pixel info: YUYV, UYVY, NV16 packed formats (5 tests) |
-| `tests/hints_test.rs` | Filename hint parsing (10 tests) |
+| `tests/highbit_test.rs` | 10/12/16-bit YUV/Grey/Bayer format, reader, pixel, and Y4M coverage (49 tests) |
+| `tests/hints_test.rs` | Filename hint parsing and file-size resolution guessing (22 tests) |
+| `tests/image_test.rs` | Image/PPM/Y4M stills, image sequences, and interlace metadata (27 tests) |
 | `tests/y4m_test.rs` | Y4M header parsing, frame offsets (8 tests) |
 | `tests/cache_test.rs` | LRU cache operations (6 tests) |
 | `tests/converter_test.rs` | I420→NV12, identity, multi-frame, roundtrip, cancel (5 tests) |
@@ -80,9 +84,9 @@
 | `tests/histogram_test.rs` | Histogram RGB/Y modes (2 tests) |
 | `tests/waveform_test.rs` | Waveform luma/R/G/B, edge cases (6 tests) |
 | `tests/vectorscope_test.rs` | Vectorscope neutral/red/blue, subsampling (5 tests) |
-| `tests/metrics_test.rs` | PSNR, SSIM, frame difference (4 tests) |
-| `tests/scene_test.rs` | Scene detection, threshold, save/load (4 tests) |
-| `tests/sideband_test.rs` | Sideband binary parsing, extended header, signed fields, display (13 tests) |
+| `tests/metrics_test.rs` | PSNR, SSIM, frame difference, MS metrics, spatial metric maps, empty images (12 tests) |
+| `tests/scene_test.rs` | Scene detection algorithms, thresholds, save/load (12 tests) |
+| `tests/sideband_test.rs` | Sideband binary parsing, extended header, signed fields, display (20 tests) |
 | `tests/ppm_test.rs` | PPM parsing, writing, reading, and conversion (10 tests) |
 | `tests/integration_test.rs` | Real Y4M file (conditional) (1 test) |
 
