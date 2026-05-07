@@ -16,6 +16,7 @@ pub enum DialogState {
     Settings,
     BatchConvert,
     SidebandFile,
+    GuessHint,
 }
 
 // ---------------------------------------------------------------------------
@@ -91,6 +92,127 @@ impl ParametersDialog {
                             .cloned()
                             .unwrap_or_else(|| "I420".to_string());
                         result = Some(Some((self.width, self.height, fmt)));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(None);
+                    }
+                });
+            });
+
+        if !open {
+            return Some(None);
+        }
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Guess-with-Hint Dialog
+// ---------------------------------------------------------------------------
+
+/// Dialog where the user supplies a frame count and we list all
+/// (width, height, format) candidates whose per-frame size divides
+/// `file_size` evenly into that many frames.
+pub struct GuessHintDialog {
+    pub file_size: u64,
+    pub num_frames: u64,
+    pub candidates: Vec<crate::core::hints::SizeGuess>,
+    pub selected_idx: Option<usize>,
+    pub last_query_frames: u64,
+}
+
+impl GuessHintDialog {
+    pub fn new(file_size: u64, default_frames: u64) -> Self {
+        let initial = default_frames.max(1);
+        let candidates =
+            crate::core::hints::guess_resolutions_with_frame_count(file_size, initial);
+        let selected_idx = if candidates.is_empty() { None } else { Some(0) };
+        Self {
+            file_size,
+            num_frames: initial,
+            candidates,
+            selected_idx,
+            last_query_frames: initial,
+        }
+    }
+
+    fn recompute(&mut self) {
+        self.candidates = crate::core::hints::guess_resolutions_with_frame_count(
+            self.file_size,
+            self.num_frames,
+        );
+        self.selected_idx = if self.candidates.is_empty() { None } else { Some(0) };
+        self.last_query_frames = self.num_frames;
+    }
+
+    /// Returns Some(Some(SizeGuess)) on OK, Some(None) on Cancel, None while open.
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<Option<crate::core::hints::SizeGuess>> {
+        let mut result = None;
+        let mut open = true;
+
+        egui::Window::new("Guess Resolution from Frame Count")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                ui.label(format!("File size: {} bytes", self.file_size));
+                ui.horizontal(|ui| {
+                    ui.label("Frame count:");
+                    let resp = ui.add(
+                        egui::DragValue::new(&mut self.num_frames)
+                            .range(1u64..=u64::MAX)
+                            .speed(1.0),
+                    );
+                    if resp.changed() && self.num_frames != self.last_query_frames {
+                        self.recompute();
+                    }
+                    if ui.button("Recompute").clicked() {
+                        self.recompute();
+                    }
+                });
+
+                if self.file_size > 0 && self.num_frames > 0 {
+                    let bpf = self.file_size as f64 / self.num_frames as f64;
+                    let exact = self.file_size.is_multiple_of(self.num_frames);
+                    let suffix = if exact { "" } else { "  (not divisible — no candidates)" };
+                    ui.label(format!("Bytes per frame: {:.2}{}", bpf, suffix));
+                }
+
+                ui.separator();
+                ui.label(format!("Candidates ({}):", self.candidates.len()));
+
+                egui::ScrollArea::vertical()
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        if self.candidates.is_empty() {
+                            ui.colored_label(
+                                egui::Color32::GRAY,
+                                "No (resolution × format) combination matches this frame count.",
+                            );
+                        } else {
+                            for (i, c) in self.candidates.iter().enumerate() {
+                                let label =
+                                    format!("{}×{}  {}", c.width, c.height, c.format);
+                                ui.radio_value(&mut self.selected_idx, Some(i), label);
+                            }
+                        }
+                    });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let can_apply =
+                        self.selected_idx.is_some() && !self.candidates.is_empty();
+                    if ui
+                        .add_enabled(can_apply, egui::Button::new("Apply"))
+                        .clicked()
+                    {
+                        if let Some(idx) = self.selected_idx {
+                            result = Some(Some(self.candidates[idx].clone()));
+                        }
                     }
                     if ui.button("Cancel").clicked() {
                         result = Some(None);

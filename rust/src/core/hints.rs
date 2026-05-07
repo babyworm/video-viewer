@@ -47,6 +47,7 @@ pub const NAMED_RESOLUTIONS: &[NamedResolution] = &[
     NamedResolution { label: "360p",   aliases: &["360p"],                     width: 640,  height: 360,  show_in_menu: false },
     NamedResolution { label: "VGA",    aliases: &["vga", "480p"],              width: 640,  height: 480,  show_in_menu: true  },
     NamedResolution { label: "WVGA",   aliases: &["wvga"],                     width: 800,  height: 480,  show_in_menu: false },
+    NamedResolution { label: "HEVC C", aliases: &["classc", "hevc_c"],         width: 832,  height: 480,  show_in_menu: true  },
     NamedResolution { label: "SVGA",   aliases: &["svga"],                     width: 800,  height: 600,  show_in_menu: true  },
     NamedResolution { label: "XGA",    aliases: &["xga"],                      width: 1024, height: 768,  show_in_menu: true  },
     NamedResolution { label: "WXGA",   aliases: &["wxga"],                     width: 1280, height: 800,  show_in_menu: false },
@@ -141,6 +142,53 @@ pub fn guess_resolution_from_size(file_size: u64) -> Option<SizeGuess> {
         }
     }
     None
+}
+
+/// Find all (w, h, format) candidates whose per-frame byte size, multiplied by
+/// `num_frames`, equals `file_size` exactly. Returns largest-resolution-first.
+///
+/// Used by the View → Video Size → "Guess with hint…" flow: when a user knows
+/// the frame count of a raw file but not the (w, h, format), we can solve
+/// `bytes_per_frame = file_size / num_frames` and intersect that with the
+/// menu's NAMED_RESOLUTIONS × common formats.
+pub fn guess_resolutions_with_frame_count(file_size: u64, num_frames: u64) -> Vec<SizeGuess> {
+    if file_size == 0 || num_frames == 0 {
+        return Vec::new();
+    }
+    if !file_size.is_multiple_of(num_frames) {
+        return Vec::new();
+    }
+    let bytes_per_frame = file_size / num_frames;
+    if bytes_per_frame == 0 {
+        return Vec::new();
+    }
+    // Broader than the open-time guess set: the user is explicitly disambiguating,
+    // so include common 4:2:2/4:4:4/grey variants too.
+    const HINT_FORMATS: &[&str] = &[
+        "I420", "YV12", "NV12", "NV21",
+        "YUV422P", "NV16", "NV61", "YUYV", "UYVY", "YVYU",
+        "YUV444P",
+        "RGB24", "BGR24",
+        "Greyscale (8-bit)",
+    ];
+    let mut results = Vec::new();
+    for cand in size_guess_candidates() {
+        for &fmt_name in HINT_FORMATS {
+            let Some(fmt) = crate::core::formats::get_format_by_name(fmt_name) else {
+                continue;
+            };
+            let fs = fmt.frame_size(cand.width, cand.height) as u64;
+            if fs == bytes_per_frame {
+                results.push(SizeGuess {
+                    width: cand.width,
+                    height: cand.height,
+                    format: fmt_name,
+                    num_frames,
+                });
+            }
+        }
+    }
+    results
 }
 
 /// Resolved open parameters for a raw file.

@@ -152,6 +152,11 @@ pub struct VideoViewerApp {
     pub sideband_show_values: bool,
     sideband_panel: crate::analysis::isp_sideband::SidebandPanel,
     sideband_dialog: Option<dialogs::SidebandFileDialog>,
+    /// Whether the ISP sideband side panel is visible.
+    /// Default false: hidden until the user invokes Tools → "Load ISP sideband info…".
+    show_sideband_panel: bool,
+    /// Active "Guess with hint" dialog (View → Video Size → Guess with hint…).
+    guess_hint_dialog: Option<dialogs::GuessHintDialog>,
     /// Interlace field viewing mode.
     pub interlace_view: InterlaceViewMode,
     /// Show Windows file association registration dialog.
@@ -246,6 +251,8 @@ impl VideoViewerApp {
             sideband_show_values: false,
             sideband_panel: crate::analysis::isp_sideband::SidebandPanel::new(),
             sideband_dialog: None,
+            show_sideband_panel: false,
+            guess_hint_dialog: None,
             interlace_view: InterlaceViewMode::Progressive,
             #[cfg(target_os = "windows")]
             show_register_assoc: false,
@@ -1482,6 +1489,43 @@ impl eframe::App for VideoViewerApp {
                                     }
                                 }
                             }
+                            ui.separator();
+                            if ui.button("Custom Size…").clicked() {
+                                ui.close_menu();
+                                if let Some(ref r) = self.reader {
+                                    self.params_dialog = Some(dialogs::ParametersDialog::new(
+                                        r.width(),
+                                        r.height(),
+                                        r.format_name(),
+                                    ));
+                                } else {
+                                    self.params_dialog = Some(dialogs::ParametersDialog::new(
+                                        self.settings.defaults.width,
+                                        self.settings.defaults.height,
+                                        &self.settings.defaults.format,
+                                    ));
+                                }
+                                self.dialog_state = DialogState::Parameters;
+                            }
+                            if ui.button("Guess with hint…").clicked() {
+                                ui.close_menu();
+                                if let Some(ref path) = self.current_file {
+                                    let file_size = std::fs::metadata(path)
+                                        .map(|m| m.len())
+                                        .unwrap_or(0);
+                                    let default_frames = self
+                                        .reader
+                                        .as_ref()
+                                        .map(|r| r.total_frames() as u64)
+                                        .unwrap_or(1)
+                                        .max(1);
+                                    self.guess_hint_dialog = Some(dialogs::GuessHintDialog::new(
+                                        file_size,
+                                        default_frames,
+                                    ));
+                                    self.dialog_state = DialogState::GuessHint;
+                                }
+                            }
                         });
                     });
 
@@ -1566,6 +1610,25 @@ impl eframe::App for VideoViewerApp {
                     if ui.button("Copy Frame (Ctrl+C)").clicked() {
                         ui.close_menu();
                         self.copy_frame_to_clipboard();
+                    }
+                    ui.separator();
+                    // --- ISP Sideband entry point ---
+                    // The sidebar panel is hidden by default; this is the user-visible
+                    // entry point for loading sideband files (per UX request).
+                    if ui.button("Load ISP sideband info…").clicked() {
+                        ui.close_menu();
+                        let initial_dir = self.current_file.as_ref()
+                            .and_then(|f| std::path::Path::new(f).parent())
+                            .and_then(|p| p.to_str());
+                        self.sideband_dialog = Some(dialogs::SidebandFileDialog::new(initial_dir));
+                        self.dialog_state = DialogState::SidebandFile;
+                    }
+                    let sb_loaded = self.sideband_file.is_some();
+                    if ui.add_enabled(sb_loaded, egui::Button::new("Unload ISP sideband"))
+                        .clicked() {
+                        ui.close_menu();
+                        self.unload_sideband();
+                        self.show_sideband_panel = false;
                     }
                 });
                 ui.menu_button("Analysis", |ui| {
@@ -1701,6 +1764,10 @@ impl eframe::App for VideoViewerApp {
                     }
                     ToolbarAction::GridChanged => {
                         self.canvas.set_grid_size(self.toolbar.grid_size);
+                        // Main grid change may have clamped sub-grid (max = main / 2).
+                        // Mirror the (possibly clamped) sub size so the overlay matches
+                        // the toolbar combo immediately.
+                        self.canvas.set_sub_grid_size(self.toolbar.sub_grid_size);
                         self.sidebar.grid_size = self.toolbar.grid_size;
                         self.refresh_comparison(ctx);
                     }
@@ -1748,6 +1815,11 @@ impl eframe::App for VideoViewerApp {
         });
 
         // --- Status bar (declared first → stacks above navigation) ---
+        // Layout: [download progress] [path | WxH FORMAT (clickable) | zoom% | frame x/y | fps]
+        // Errors / info messages are shown as an *additional* segment when present,
+        // never as a substitute for the resolution+format readout — earlier versions
+        // hid the readout while a status message was active, which removed the
+        // single-click affordance for changing video parameters.
         let mut status_params_clicked = false;
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1768,40 +1840,42 @@ impl eframe::App for VideoViewerApp {
                         ui.separator();
                     }
                 }
+                // File / parameters readout. Always shown when a file is loaded.
+                if let (Some(path), Some(r)) = (self.current_file.as_ref(), self.reader.as_ref()) {
+                    ui.label(format!("{}  |", path));
+                    let interlace_str = match r.interlace() {
+                        "tff" => " [TFF]",
+                        "bff" => " [BFF]",
+                        "mixed" => " [Mixed]",
+                        _ => "",
+                    };
+                    let res_text = format!(
+                        "  {}x{} {}{}  ",
+                        r.width(), r.height(), r.format_name(), interlace_str,
+                    );
+                    if ui.add(
+                        egui::Button::new(egui::RichText::new(&res_text).strong())
+                            .frame(false)
+                    ).on_hover_text("Click to change video parameters").clicked() {
+                        status_params_clicked = true;
+                    }
+                    ui.label(format!(
+                        "|  {:.0}%  |  Frame {}/{}  |  {:.1} fps",
+                        self.canvas.zoom_level() * 100.0,
+                        self.current_frame_idx,
+                        r.total_frames().saturating_sub(1),
+                        self.playback_fps,
+                    ));
+                } else if self.current_file.is_none() {
+                    ui.label("No file loaded — drop a file or use File → Open");
+                }
+                // Status messages: shown *in addition* to the readout, separated.
                 if let Some(ref err) = self.status_error {
+                    ui.separator();
                     ui.colored_label(egui::Color32::RED, err);
                 } else if let Some(ref info) = self.status_info {
+                    ui.separator();
                     ui.colored_label(egui::Color32::LIGHT_BLUE, info);
-                } else if let Some(ref path) = self.current_file {
-                    if let Some(ref r) = self.reader {
-                        ui.label(format!("{}  |", path));
-                        // Clickable resolution + format (opens Parameters dialog)
-                        let interlace_str = match r.interlace() {
-                            "tff" => " [TFF]",
-                            "bff" => " [BFF]",
-                            "mixed" => " [Mixed]",
-                            _ => "",
-                        };
-                        let res_text = format!(
-                            "  {}x{} {}{}  ",
-                            r.width(), r.height(), r.format_name(), interlace_str,
-                        );
-                        if ui.add(
-                            egui::Button::new(egui::RichText::new(&res_text).strong())
-                                .frame(false)
-                        ).on_hover_text("Click to change video parameters").clicked() {
-                            status_params_clicked = true;
-                        }
-                        ui.label(format!(
-                            "|  {:.0}%  |  Frame {}/{}  |  {:.1} fps",
-                            self.canvas.zoom_level() * 100.0,
-                            self.current_frame_idx,
-                            r.total_frames().saturating_sub(1),
-                            self.playback_fps,
-                        ));
-                    }
-                } else {
-                    ui.label("No file loaded — drop a file or use File → Open");
                 }
             });
         });
@@ -1871,23 +1945,26 @@ impl eframe::App for VideoViewerApp {
         let mut sb_show_vals = self.sideband_show_values;
         let sb_frame_idx = self.current_frame_idx;
         let mut sb_action: Option<crate::analysis::isp_sideband::SidebandAction> = None;
+        let show_sb_panel = self.show_sideband_panel;
         egui::SidePanel::right("sidebar")
             .default_width(250.0)
             .show(ctx, |ui| {
                 self.sidebar.show(ui);
-                ui.separator();
-                sb_action = self.sideband_panel.show(
-                    ui,
-                    &mut crate::analysis::isp_sideband::SidebandPanelContext {
-                        sideband: sb_file_ref,
-                        sideband_path: sb_path_ref,
-                        current_frame: sb_frame_ref,
-                        mode: &mut sb_mode,
-                        opacity: &mut sb_opacity,
-                        show_values: &mut sb_show_vals,
-                        current_frame_idx: sb_frame_idx,
-                    },
-                );
+                if show_sb_panel {
+                    ui.separator();
+                    sb_action = self.sideband_panel.show(
+                        ui,
+                        &mut crate::analysis::isp_sideband::SidebandPanelContext {
+                            sideband: sb_file_ref,
+                            sideband_path: sb_path_ref,
+                            current_frame: sb_frame_ref,
+                            mode: &mut sb_mode,
+                            opacity: &mut sb_opacity,
+                            show_values: &mut sb_show_vals,
+                            current_frame_idx: sb_frame_idx,
+                        },
+                    );
+                }
             });
         // Write back sideband UI state changes.
         self.sideband_overlay_mode = sb_mode;
@@ -2092,12 +2169,39 @@ impl VideoViewerApp {
             if let Some(ref mut dlg) = self.sideband_dialog {
                 if let Some(result) = dlg.show(ctx) {
                     if let Some(path) = result {
-                        if let Err(e) = self.load_sideband(&path) {
-                            self.status_error = Some(format!("Sideband load error: {}", e));
+                        match self.load_sideband(&path) {
+                            Ok(()) => {
+                                // Reveal the sideband side panel only when a file actually loads.
+                                self.show_sideband_panel = true;
+                            }
+                            Err(e) => {
+                                self.status_error = Some(format!("Sideband load error: {}", e));
+                            }
                         }
                     }
                     self.dialog_state = DialogState::None;
                     self.sideband_dialog = None;
+                }
+            }
+        }
+
+        // Guess-with-hint dialog
+        if self.dialog_state == DialogState::GuessHint {
+            if let Some(ref mut dlg) = self.guess_hint_dialog {
+                if let Some(result) = dlg.show(ctx) {
+                    if let Some(guess) = result {
+                        if let Some(ref path) = self.current_file.clone() {
+                            self.open_file(
+                                ctx,
+                                path.clone(),
+                                guess.width,
+                                guess.height,
+                                guess.format,
+                            );
+                        }
+                    }
+                    self.dialog_state = DialogState::None;
+                    self.guess_hint_dialog = None;
                 }
             }
         }

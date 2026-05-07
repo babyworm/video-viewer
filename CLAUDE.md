@@ -113,6 +113,7 @@ When adding new aliases, update `rust/src/core/hints.rs` tables AND this section
 | `hvga` | 480 | 320 | Half VGA |
 | `vga` | 640 | 480 | |
 | `wvga` | 800 | 480 | Wide VGA |
+| `classc` / `hevc_c` | 832 | 480 | HEVC CTC Class C (BasketballDrill, BQMall, PartyScene, RaceHorses) |
 | `svga` | 800 | 600 | |
 | `xga` | 1024 | 768 | |
 | `wxga` | 1280 | 800 | Wide XGA |

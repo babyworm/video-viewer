@@ -1,5 +1,6 @@
 use video_viewer::core::hints::{
-    guess_resolution_from_size, parse_filename_hints, resolve_raw_params, NAMED_RESOLUTIONS,
+    guess_resolution_from_size, guess_resolutions_with_frame_count, parse_filename_hints,
+    resolve_raw_params, NAMED_RESOLUTIONS,
 };
 
 #[test]
@@ -99,10 +100,58 @@ fn test_named_resolutions_sif_roundtrip() {
 
 #[test]
 fn test_named_resolutions_menu_preset_count() {
-    // Menu size should match the 16 original hardcoded VIDEO_SIZE_PRESETS.
-    // If a reviewer changes this on purpose, update the expectation.
+    // Originally 16 (matching the Python VIDEO_SIZE_PRESETS); +1 after HEVC CTC
+    // Class C (832×480) was added. Update the expectation only with intent.
     let count = NAMED_RESOLUTIONS.iter().filter(|r| r.show_in_menu).count();
-    assert_eq!(count, 16, "Video Size menu entry count drifted");
+    assert_eq!(count, 17, "Video Size menu entry count drifted");
+}
+
+#[test]
+fn test_named_resolution_hevc_class_c_present() {
+    // HEVC CTC Class C (BasketballDrill / BQMall / PartyScene / RaceHorses).
+    let entry = NAMED_RESOLUTIONS
+        .iter()
+        .find(|r| r.width == 832 && r.height == 480)
+        .expect("HEVC class C resolution missing from NAMED_RESOLUTIONS");
+    assert!(entry.show_in_menu, "HEVC C must appear in Video Size menu");
+    assert!(entry.aliases.contains(&"classc"));
+}
+
+// --- Guess-with-frame-count (View → Video Size → Guess with hint…) ---
+
+#[test]
+fn test_guess_with_frames_returns_matching_candidates() {
+    // 1920×1080 I420 = 3,110,400 bytes/frame; pick 5 frames.
+    let size = 1920u64 * 1080 * 3 / 2 * 5;
+    let cands = guess_resolutions_with_frame_count(size, 5);
+    assert!(
+        cands.iter().any(|c| c.width == 1920 && c.height == 1080 && c.format == "I420"),
+        "expected 1080p I420 in candidates"
+    );
+    assert!(cands.iter().all(|c| c.num_frames == 5));
+}
+
+#[test]
+fn test_guess_with_frames_zero_frames_returns_empty() {
+    assert!(guess_resolutions_with_frame_count(1024, 0).is_empty());
+}
+
+#[test]
+fn test_guess_with_frames_indivisible_returns_empty() {
+    // file_size = 100 bytes, 7 frames → not evenly divisible.
+    assert!(guess_resolutions_with_frame_count(100, 7).is_empty());
+}
+
+#[test]
+fn test_guess_with_frames_hevc_classc_yuv420_disambiguates() {
+    // 832×480 I420 = 599,040 bytes/frame.
+    let size = 832u64 * 480 * 3 / 2 * 100;
+    let cands = guess_resolutions_with_frame_count(size, 100);
+    assert!(
+        cands.iter().any(|c| c.width == 832 && c.height == 480 && c.format == "I420"),
+        "expected 832×480 I420 in candidates: {:?}",
+        cands
+    );
 }
 
 // --- File-size guess (recovered from Python v0.1 main_window._guess_resolution) ---

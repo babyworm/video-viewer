@@ -2,8 +2,20 @@ use eframe::egui;
 
 /// Direct-selectable main grid sizes.
 pub const GRID_SIZES: &[u32] = &[0, 128, 64, 32, 16];
-/// Grid size cycle for sub-grid
-const SUB_GRID_SIZES: &[u32] = &[0, 4, 8, 16];
+/// Direct-selectable sub-grid sizes (Off, then 4 doubling up to 64).
+/// The visible subset depends on the main grid size: only entries with
+/// `size <= max_sub_grid(main)` are enabled.
+pub const SUB_GRID_SIZES: &[u32] = &[0, 4, 8, 16, 32, 64];
+
+/// Largest sub-grid value selectable for a given main grid size.
+/// Sub-grid is forbidden when main grid is Off, otherwise capped to half of main.
+pub fn max_sub_grid(main_grid_size: u32) -> u32 {
+    if main_grid_size == 0 {
+        0
+    } else {
+        main_grid_size / 2
+    }
+}
 
 pub struct Toolbar {
     /// Component index: 0=Full, 1=Y/R, 2=U/G, 3=V/B, 4=Split
@@ -46,12 +58,35 @@ impl Toolbar {
         };
         self.grid_size = size;
         self.grid_idx = idx;
+        self.enforce_sub_grid_constraint();
         true
     }
 
     pub fn cycle_grid_size(&mut self) {
         self.grid_idx = (self.grid_idx + 1) % GRID_SIZES.len();
         self.grid_size = GRID_SIZES[self.grid_idx];
+        self.enforce_sub_grid_constraint();
+    }
+
+    pub fn set_sub_grid_size(&mut self, size: u32) -> bool {
+        let Some(idx) = SUB_GRID_SIZES.iter().position(|&candidate| candidate == size) else {
+            return false;
+        };
+        if size > max_sub_grid(self.grid_size) {
+            return false;
+        }
+        self.sub_grid_size = size;
+        self.sub_grid_idx = idx;
+        true
+    }
+
+    /// Clamp sub-grid to the constraint (size <= main / 2). Resets to Off when violated.
+    /// Should be called whenever the main grid size changes.
+    pub fn enforce_sub_grid_constraint(&mut self) {
+        if self.sub_grid_size > max_sub_grid(self.grid_size) {
+            self.sub_grid_size = 0;
+            self.sub_grid_idx = 0;
+        }
     }
 
     /// Show the toolbar. Returns an action if one was triggered.
@@ -112,16 +147,38 @@ impl Toolbar {
                 action = Some(ToolbarAction::GridChanged);
             }
 
-            // --- Sub-grid toggle ---
-            let sub_label = if self.sub_grid_size > 0 {
-                format!("Sub({})", self.sub_grid_size)
-            } else {
-                "Sub-Grid".to_string()
-            };
-            if ui.button(sub_label).clicked() {
-                self.sub_grid_idx = (self.sub_grid_idx + 1) % SUB_GRID_SIZES.len();
-                self.sub_grid_size = SUB_GRID_SIZES[self.sub_grid_idx];
-                action = Some(ToolbarAction::ToggleSubGrid);
+            // --- Sub-grid selector ---
+            ui.label("Sub:");
+            let max_sub = max_sub_grid(self.grid_size);
+            let before_sub_size = self.sub_grid_size;
+            egui::ComboBox::from_id_salt("sub_grid_size_combo")
+                .selected_text(grid_size_label(self.sub_grid_size))
+                .width(86.0)
+                .show_ui(ui, |ui| {
+                    for (idx, &size) in SUB_GRID_SIZES.iter().enumerate() {
+                        // Off is always selectable; non-zero entries gated by main grid.
+                        let allowed = size == 0 || size <= max_sub;
+                        ui.add_enabled_ui(allowed, |ui| {
+                            if ui
+                                .selectable_value(
+                                    &mut self.sub_grid_size,
+                                    size,
+                                    grid_size_label(size),
+                                )
+                                .clicked()
+                            {
+                                self.sub_grid_idx = idx;
+                            }
+                        });
+                    }
+                });
+            if self.sub_grid_size != before_sub_size {
+                // Sanity-check: never let a click bypass the constraint.
+                if self.sub_grid_size > max_sub {
+                    self.sub_grid_size = before_sub_size;
+                } else {
+                    action = Some(ToolbarAction::ToggleSubGrid);
+                }
             }
 
             ui.separator();
@@ -169,61 +226,6 @@ fn grid_size_label(size: u32) -> String {
 impl Default for Toolbar {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn grid_sizes_are_in_direct_selector_order() {
-        assert_eq!(GRID_SIZES, &[0, 128, 64, 32, 16]);
-    }
-
-    #[test]
-    fn toolbar_defaults_to_grid_off() {
-        let toolbar = Toolbar::new();
-
-        assert_eq!(toolbar.grid_size, 0);
-        assert_eq!(toolbar.grid_idx, 0);
-    }
-
-    #[test]
-    fn set_grid_size_updates_index_for_supported_sizes() {
-        for (idx, &size) in GRID_SIZES.iter().enumerate() {
-            let mut toolbar = Toolbar::new();
-
-            assert!(toolbar.set_grid_size(size));
-            assert_eq!(toolbar.grid_size, size);
-            assert_eq!(toolbar.grid_idx, idx);
-        }
-    }
-
-    #[test]
-    fn set_grid_size_rejects_unsupported_sizes_without_mutating() {
-        let mut toolbar = Toolbar::new();
-        assert!(toolbar.set_grid_size(64));
-
-        assert!(!toolbar.set_grid_size(48));
-        assert_eq!(toolbar.grid_size, 64);
-        assert_eq!(toolbar.grid_idx, 2);
-    }
-
-    #[test]
-    fn cycle_grid_size_uses_direct_selector_order() {
-        let mut toolbar = Toolbar::new();
-        let mut seen = vec![toolbar.grid_size];
-
-        for _ in 1..GRID_SIZES.len() {
-            toolbar.cycle_grid_size();
-            seen.push(toolbar.grid_size);
-        }
-
-        assert_eq!(seen, GRID_SIZES);
-        toolbar.cycle_grid_size();
-        assert_eq!(toolbar.grid_size, 0);
-        assert_eq!(toolbar.grid_idx, 0);
     }
 }
 
@@ -287,4 +289,106 @@ pub fn colorize_channel(gray: &[u8], width: u32, height: u32, name: &str) -> Vec
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_sizes_are_in_direct_selector_order() {
+        assert_eq!(GRID_SIZES, &[0, 128, 64, 32, 16]);
+    }
+
+    #[test]
+    fn toolbar_defaults_to_grid_off() {
+        let toolbar = Toolbar::new();
+
+        assert_eq!(toolbar.grid_size, 0);
+        assert_eq!(toolbar.grid_idx, 0);
+    }
+
+    #[test]
+    fn set_grid_size_updates_index_for_supported_sizes() {
+        for (idx, &size) in GRID_SIZES.iter().enumerate() {
+            let mut toolbar = Toolbar::new();
+
+            assert!(toolbar.set_grid_size(size));
+            assert_eq!(toolbar.grid_size, size);
+            assert_eq!(toolbar.grid_idx, idx);
+        }
+    }
+
+    #[test]
+    fn set_grid_size_rejects_unsupported_sizes_without_mutating() {
+        let mut toolbar = Toolbar::new();
+        assert!(toolbar.set_grid_size(64));
+
+        assert!(!toolbar.set_grid_size(48));
+        assert_eq!(toolbar.grid_size, 64);
+        assert_eq!(toolbar.grid_idx, 2);
+    }
+
+    #[test]
+    fn cycle_grid_size_uses_direct_selector_order() {
+        let mut toolbar = Toolbar::new();
+        let mut seen = vec![toolbar.grid_size];
+
+        for _ in 1..GRID_SIZES.len() {
+            toolbar.cycle_grid_size();
+            seen.push(toolbar.grid_size);
+        }
+
+        assert_eq!(seen, GRID_SIZES);
+        toolbar.cycle_grid_size();
+        assert_eq!(toolbar.grid_size, 0);
+        assert_eq!(toolbar.grid_idx, 0);
+    }
+
+    #[test]
+    fn sub_grid_sizes_are_doubling_from_4_to_64() {
+        assert_eq!(SUB_GRID_SIZES, &[0, 4, 8, 16, 32, 64]);
+    }
+
+    #[test]
+    fn max_sub_grid_is_half_of_main_or_zero() {
+        assert_eq!(max_sub_grid(0), 0);
+        assert_eq!(max_sub_grid(16), 8);
+        assert_eq!(max_sub_grid(32), 16);
+        assert_eq!(max_sub_grid(64), 32);
+        assert_eq!(max_sub_grid(128), 64);
+    }
+
+    #[test]
+    fn set_sub_grid_size_respects_main_grid_cap() {
+        let mut toolbar = Toolbar::new();
+        toolbar.set_grid_size(64);
+        assert!(toolbar.set_sub_grid_size(32));
+        assert_eq!(toolbar.sub_grid_size, 32);
+        // 64 disallowed when main is 64 (would equal main, not <= main/2).
+        assert!(!toolbar.set_sub_grid_size(64));
+        assert_eq!(toolbar.sub_grid_size, 32);
+        // Off is always allowed.
+        assert!(toolbar.set_sub_grid_size(0));
+    }
+
+    #[test]
+    fn shrinking_main_grid_clamps_oversized_sub_grid_to_off() {
+        let mut toolbar = Toolbar::new();
+        toolbar.set_grid_size(128);
+        assert!(toolbar.set_sub_grid_size(64));
+        toolbar.set_grid_size(32); // max_sub becomes 16, current sub is 64 → reset.
+        assert_eq!(toolbar.sub_grid_size, 0);
+        assert_eq!(toolbar.sub_grid_idx, 0);
+    }
+
+    #[test]
+    fn main_grid_off_forbids_any_sub_grid() {
+        let mut toolbar = Toolbar::new();
+        // Off is always allowed.
+        assert!(toolbar.set_sub_grid_size(0));
+        // Non-zero rejected when main is Off.
+        assert!(!toolbar.set_sub_grid_size(4));
+        assert!(!toolbar.set_sub_grid_size(8));
+    }
 }
