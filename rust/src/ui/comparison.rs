@@ -13,6 +13,15 @@ pub enum ComparisonUiAction {
     Close,
 }
 
+/// Pane role inside the comparison view. Used to gate drop-target behaviour and
+/// hover-overlay rendering on a per-pane basis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneRole {
+    Reference,
+    Current,
+    Metric,
+}
+
 /// Three-pane video diff view: reference, current, and selected diff/metric map.
 pub struct ComparisonView {
     /// Whether the comparison panel is visible.
@@ -35,6 +44,11 @@ pub struct ComparisonView {
     pub image_size: Option<(u32, u32)>,
     /// Last comparison status/error.
     pub message: Option<String>,
+    /// Last frame's Reference pane rect, in screen coords. Updated each frame
+    /// the comparison view renders. Consumed by the app's drop router.
+    pub last_ref_pane_rect: Option<egui::Rect>,
+    /// Last frame's Current pane rect, in screen coords.
+    pub last_current_pane_rect: Option<egui::Rect>,
 }
 
 /// Normalized image viewport shared by all comparison panes.
@@ -138,6 +152,8 @@ impl ComparisonView {
             metric_map: None,
             image_size: None,
             message: None,
+            last_ref_pane_rect: None,
+            last_current_pane_rect: None,
         }
     }
 
@@ -300,15 +316,11 @@ impl ComparisonView {
 
         ui.separator();
 
-        let (w, h) = match self.image_size {
-            Some(size) => size,
-            None => {
-                ui.centered_and_justified(|ui| {
-                    ui.label("Load a current file and a reference file to start video diff.");
-                });
-                return action;
-            }
-        };
+        // Layout: render panes even when image_size is None so users can drop
+        // files into Reference / Current panes before any image is loaded.
+        // Without an image, fall back to a 16:9 placeholder aspect so the panes
+        // still occupy useful space.
+        let (w, h) = self.image_size.unwrap_or((16, 9));
 
         let available = ui.available_size();
         let gap = 8.0_f32;
@@ -329,16 +341,42 @@ impl ComparisonView {
         let metric_texture_id = self.metric_texture.as_ref().map(|texture| texture.id());
         let metric_label = self.metric_kind.display_name();
 
+        // Reset cached rects each frame; show_pane fills them in for ref/current.
+        self.last_ref_pane_rect = None;
+        self.last_current_pane_rect = None;
+        let drag_in_progress = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
+
         ui.horizontal_top(|ui| {
-            self.show_pane(ui, "Reference", ref_texture_id, display_size, false);
+            self.show_pane(
+                ui,
+                "Reference",
+                ref_texture_id,
+                display_size,
+                PaneRole::Reference,
+                drag_in_progress,
+            );
             ui.add_space(gap);
-            self.show_pane(ui, "Current", current_texture_id, display_size, false);
+            self.show_pane(
+                ui,
+                "Current",
+                current_texture_id,
+                display_size,
+                PaneRole::Current,
+                drag_in_progress,
+            );
             ui.add_space(gap);
-            self.show_pane(ui, metric_label, metric_texture_id, display_size, true);
+            self.show_pane(
+                ui,
+                metric_label,
+                metric_texture_id,
+                display_size,
+                PaneRole::Metric,
+                drag_in_progress,
+            );
         });
 
         ui.add_space(4.0);
-        ui.weak("Mouse wheel zooms every pane together; drag any pane to pan the shared view. MS-SSIM uses tile-local multi-scale SSIM. VMAF-NEG proxy is a no-new-dependency spatial triage proxy, not official libvmaf output.");
+        ui.weak("Drop a file on Reference or Current to load it there. Mouse wheel zooms every pane; drag pans the shared view.");
 
         action
     }
@@ -349,12 +387,22 @@ impl ComparisonView {
         label: &str,
         texture_id: Option<egui::TextureId>,
         display_size: egui::Vec2,
-        draw_metric_labels: bool,
+        role: PaneRole,
+        drag_in_progress: bool,
     ) {
         ui.vertical(|ui| {
             ui.label(egui::RichText::new(label).strong());
             let (rect, response) =
                 ui.allocate_exact_size(display_size, egui::Sense::click_and_drag());
+
+            // Cache rect for ref / current so the app's drop handler can route
+            // a dropped file to the correct slot.
+            match role {
+                PaneRole::Reference => self.last_ref_pane_rect = Some(rect),
+                PaneRole::Current => self.last_current_pane_rect = Some(rect),
+                PaneRole::Metric => {}
+            }
+
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
 
@@ -392,19 +440,54 @@ impl ComparisonView {
                     egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.fg_stroke.color),
                     egui::StrokeKind::Outside,
                 );
+                let placeholder = match role {
+                    PaneRole::Reference => "drop a file here for reference",
+                    PaneRole::Current => "drop a file here for current",
+                    PaneRole::Metric => "not loaded",
+                };
                 painter.text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "not loaded",
+                    placeholder,
                     egui::FontId::proportional(13.0),
                     ui.visuals().weak_text_color(),
                 );
             }
 
-            if draw_metric_labels {
+            if matches!(role, PaneRole::Metric) {
                 if let (Some(map), Some((iw, ih))) = (&self.metric_map, self.image_size) {
                     draw_metric_overlay(&painter, rect, uv, map, iw, ih);
                 }
+            }
+
+            // Drop-target hover overlay: only ref / current accept files.
+            if drag_in_progress && !matches!(role, PaneRole::Metric) {
+                let pointer = ui.input(|i| i.pointer.hover_pos());
+                let active = pointer.map(|p| rect.contains(p)).unwrap_or(false);
+                let tint = if active {
+                    egui::Color32::from_rgba_unmultiplied(40, 110, 220, 110)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(40, 110, 220, 50)
+                };
+                painter.rect_filled(rect, 0.0, tint);
+                painter.rect_stroke(
+                    rect,
+                    0.0,
+                    egui::Stroke::new(2.0, egui::Color32::from_rgb(60, 140, 240)),
+                    egui::StrokeKind::Inside,
+                );
+                let hint = match role {
+                    PaneRole::Reference => "Drop here for Reference",
+                    PaneRole::Current => "Drop here for Current",
+                    PaneRole::Metric => "",
+                };
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    hint,
+                    egui::FontId::proportional(16.0),
+                    egui::Color32::WHITE,
+                );
             }
         });
     }

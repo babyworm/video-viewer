@@ -1176,16 +1176,48 @@ impl eframe::App for VideoViewerApp {
         }
 
         // --- Drag & drop ---
-        let dropped: Vec<_> = ctx.input(|i| {
-            i.raw.dropped_files
+        // Capture both the path list and the cursor position so we can route
+        // drops over the comparison panes to the matching slot (Reference /
+        // Current). Drops outside the comparison view fall through to the
+        // default "load as current" behaviour.
+        let (dropped, drop_pos): (Vec<String>, Option<egui::Pos2>) = ctx.input(|i| {
+            let paths: Vec<String> = i
+                .raw
+                .dropped_files
                 .iter()
                 .filter_map(|f| f.path.as_ref().map(|p| p.display().to_string()))
-                .collect()
+                .collect();
+            // pointer.hover_pos() persists at the drop site for one frame.
+            // Fall back to interact_pos if hover_pos already cleared.
+            let pos = i.pointer.hover_pos().or(i.pointer.interact_pos());
+            (paths, pos)
         });
         if let Some(path) = dropped.into_iter().next() {
-            let (w, h, fmt, info) = self.resolve_raw_open_params(&path);
-            self.open_file(ctx, path, w, h, &fmt);
-            self.status_info = info;
+            let routed_to_ref = self.comparison.is_open
+                && matches!(
+                    (drop_pos, self.comparison.last_ref_pane_rect),
+                    (Some(p), Some(rect)) if rect.contains(p)
+                );
+            let routed_to_current = self.comparison.is_open
+                && matches!(
+                    (drop_pos, self.comparison.last_current_pane_rect),
+                    (Some(p), Some(rect)) if rect.contains(p)
+                );
+
+            if routed_to_ref {
+                let (w, h, fmt, info) = self.resolve_raw_open_params(&path);
+                self.open_reference_file(ctx, path, w, h, &fmt);
+                if info.is_some() {
+                    self.status_info = info;
+                }
+            } else {
+                // Either dropped on Current pane or anywhere else — load as current.
+                // (routed_to_current and the fallback take the same code path.)
+                let _ = routed_to_current;
+                let (w, h, fmt, info) = self.resolve_raw_open_params(&path);
+                self.open_file(ctx, path, w, h, &fmt);
+                self.status_info = info;
+            }
         }
 
         // --- Playback tick ---
