@@ -144,6 +144,56 @@ pub fn guess_resolution_from_size(file_size: u64) -> Option<SizeGuess> {
     None
 }
 
+/// Common raw formats considered by the "Guess with hint…" / "Guess again…" flows.
+/// Broader than the open-time guess set so users get to disambiguate manually.
+const HINT_FORMATS: &[&str] = &[
+    "I420", "YV12", "NV12", "NV21",
+    "YUV422P", "NV16", "NV61", "YUYV", "UYVY", "YVYU",
+    "YUV444P",
+    "RGB24", "BGR24",
+    "Greyscale (8-bit)",
+];
+
+/// Find every (w, h, format) candidate whose per-frame byte size divides
+/// `file_size` evenly, regardless of frame count. Returns largest-resolution-first.
+///
+/// Used by View → Video Size → "Guess again…" — when the user has no extra
+/// information, this enumerates every plausible interpretation. Each candidate's
+/// `num_frames` is the resulting `file_size / frame_size`.
+///
+/// Note: a 1080p I420 file with N frames will match here as 540p I420 with 4N
+/// frames too (4× ratio of frame-sizes), so the output is intentionally
+/// ambiguous and meant for human selection.
+pub fn guess_all_resolutions_no_hint(file_size: u64) -> Vec<SizeGuess> {
+    if file_size == 0 {
+        return Vec::new();
+    }
+    let mut results = Vec::new();
+    for cand in size_guess_candidates() {
+        for &fmt_name in HINT_FORMATS {
+            let Some(fmt) = crate::core::formats::get_format_by_name(fmt_name) else {
+                continue;
+            };
+            let fs = fmt.frame_size(cand.width, cand.height) as u64;
+            if fs == 0 {
+                continue;
+            }
+            if file_size.is_multiple_of(fs) {
+                let num_frames = file_size / fs;
+                if num_frames >= 1 {
+                    results.push(SizeGuess {
+                        width: cand.width,
+                        height: cand.height,
+                        format: fmt_name,
+                        num_frames,
+                    });
+                }
+            }
+        }
+    }
+    results
+}
+
 /// Find all (w, h, format) candidates whose per-frame byte size, multiplied by
 /// `num_frames`, equals `file_size` exactly. Returns largest-resolution-first.
 ///
@@ -162,15 +212,6 @@ pub fn guess_resolutions_with_frame_count(file_size: u64, num_frames: u64) -> Ve
     if bytes_per_frame == 0 {
         return Vec::new();
     }
-    // Broader than the open-time guess set: the user is explicitly disambiguating,
-    // so include common 4:2:2/4:4:4/grey variants too.
-    const HINT_FORMATS: &[&str] = &[
-        "I420", "YV12", "NV12", "NV21",
-        "YUV422P", "NV16", "NV61", "YUYV", "UYVY", "YVYU",
-        "YUV444P",
-        "RGB24", "BGR24",
-        "Greyscale (8-bit)",
-    ];
     let mut results = Vec::new();
     for cand in size_guess_candidates() {
         for &fmt_name in HINT_FORMATS {

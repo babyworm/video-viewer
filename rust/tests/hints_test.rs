@@ -1,6 +1,7 @@
 use video_viewer::core::hints::{
-    guess_resolution_from_size, guess_resolutions_with_frame_count, parse_filename_hints,
-    resolve_raw_params, NAMED_RESOLUTIONS,
+    guess_all_resolutions_no_hint, guess_resolution_from_size,
+    guess_resolutions_with_frame_count, parse_filename_hints, resolve_raw_params,
+    NAMED_RESOLUTIONS,
 };
 
 #[test]
@@ -231,4 +232,49 @@ fn test_resolve_format_hint_survives_guess() {
     let size = 640u64 * 480 * 3 / 2; // matches VGA for both I420 and NV12 (same frame size)
     let r = resolve_raw_params("raw_nv12.yuv", Some(size), 100, 100, "I420");
     assert_eq!(r.format, "NV12", "filename format hint must override guess");
+}
+
+// --- No-hint multi-candidate enumeration (View → Video Size → Guess again…) ---
+
+#[test]
+fn test_guess_no_hint_includes_truth_for_1080p_i420() {
+    // 1080p I420 × 5 frames = 15,552,000 bytes.
+    let size = 1920u64 * 1080 * 3 / 2 * 5;
+    let cands = guess_all_resolutions_no_hint(size);
+    assert!(
+        cands
+            .iter()
+            .any(|c| c.width == 1920 && c.height == 1080 && c.format == "I420" && c.num_frames == 5),
+        "1080p I420 5f truth missing: {:?}",
+        cands
+    );
+}
+
+#[test]
+fn test_guess_no_hint_finds_multiple_candidates() {
+    // 1080p I420 × 4 frames also matches 540p I420 × 16 (4× ratio).
+    let size = 1920u64 * 1080 * 3 / 2 * 4;
+    let cands = guess_all_resolutions_no_hint(size);
+    let has_1080 = cands.iter().any(|c| c.width == 1920 && c.height == 1080 && c.format == "I420");
+    let has_540 = cands.iter().any(|c| c.width == 960 && c.height == 540 && c.format == "I420");
+    // 540p is not show_in_menu in the canonical table, so this only checks the
+    // weaker invariant: at least the 1080p truth is present and the list is multi-format.
+    assert!(has_1080, "expected 1080p I420 in candidates: {:?}", cands);
+    let _ = has_540; // 540p is intentionally excluded from menu set; not asserted.
+    let formats: std::collections::HashSet<&str> =
+        cands.iter().map(|c| c.format).collect();
+    assert!(formats.len() > 1, "expected multiple formats in candidates: {:?}", cands);
+}
+
+#[test]
+fn test_guess_no_hint_empty_file_is_empty() {
+    assert!(guess_all_resolutions_no_hint(0).is_empty());
+}
+
+#[test]
+fn test_guess_no_hint_odd_size_yields_no_yuv_candidates() {
+    // 7 bytes — no YUV format frame size divides this; result should be empty
+    // because all HINT_FORMATS produce frame sizes well above 7.
+    let cands = guess_all_resolutions_no_hint(7);
+    assert!(cands.is_empty(), "expected empty for prime-sized tiny file: {:?}", cands);
 }

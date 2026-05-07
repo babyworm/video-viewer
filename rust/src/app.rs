@@ -1526,6 +1526,26 @@ impl eframe::App for VideoViewerApp {
                                     self.dialog_state = DialogState::GuessHint;
                                 }
                             }
+                            if ui.button("Guess again (no hint)…").clicked() {
+                                ui.close_menu();
+                                if let Some(ref path) = self.current_file {
+                                    let file_size = std::fs::metadata(path)
+                                        .map(|m| m.len())
+                                        .unwrap_or(0);
+                                    let default_frames = self
+                                        .reader
+                                        .as_ref()
+                                        .map(|r| r.total_frames() as u64)
+                                        .unwrap_or(1)
+                                        .max(1);
+                                    self.guess_hint_dialog =
+                                        Some(dialogs::GuessHintDialog::new_no_hint(
+                                            file_size,
+                                            default_frames,
+                                        ));
+                                    self.dialog_state = DialogState::GuessHint;
+                                }
+                            }
                         });
                     });
 
