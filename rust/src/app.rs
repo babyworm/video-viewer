@@ -1667,13 +1667,20 @@ impl eframe::App for VideoViewerApp {
                     if ui.button("Video Diff...").clicked() {
                         ui.close_menu();
                         self.comparison.is_open = true;
-                        if self.reference_reader.is_none() {
-                            self.reference_file_dialog = Some(self.new_reference_file_dialog());
-                            self.dialog_state = DialogState::OpenReference;
-                        } else {
+                        // Sync ref first (if any) so refresh_comparison sees a
+                        // reference_rgb consistent with current_frame_idx.
+                        if self.reference_reader.is_some() {
                             self.sync_reference_frame(ctx);
-                            self.refresh_comparison(ctx);
+                        } else {
+                            self.reference_file_dialog =
+                                Some(self.new_reference_file_dialog());
+                            self.dialog_state = DialogState::OpenReference;
                         }
+                        // Upload the currently loaded video as Current immediately,
+                        // so the Current pane is populated even before a reference
+                        // is chosen. refresh_comparison handles missing-reference
+                        // gracefully (sets a hint message and skips the diff map).
+                        self.refresh_comparison(ctx);
                     }
                     if ui.button("Open Diff Reference...").clicked() {
                         ui.close_menu();
