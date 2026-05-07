@@ -157,6 +157,11 @@ pub struct VideoViewerApp {
     show_sideband_panel: bool,
     /// Active "Guess with hint" dialog (View → Video Size → Guess with hint…).
     guess_size_dialog: Option<dialogs::GuessSizeDialog>,
+    /// Pointer position captured while a file drag is in progress
+    /// (`hovered_files` non-empty). Used to route drops to the correct
+    /// comparison pane — reading `hover_pos()` at drop time is unreliable
+    /// because the frame that delivers the drop may not contain a hover event.
+    last_drop_target_pos: Option<egui::Pos2>,
     /// Interlace field viewing mode.
     pub interlace_view: InterlaceViewMode,
     /// Show Windows file association registration dialog.
@@ -253,6 +258,7 @@ impl VideoViewerApp {
             sideband_dialog: None,
             show_sideband_panel: false,
             guess_size_dialog: None,
+            last_drop_target_pos: None,
             interlace_view: InterlaceViewMode::Progressive,
             #[cfg(target_os = "windows")]
             show_register_assoc: false,
@@ -1176,31 +1182,45 @@ impl eframe::App for VideoViewerApp {
         }
 
         // --- Drag & drop ---
-        // Capture both the path list and the cursor position so we can route
-        // drops over the comparison panes to the matching slot (Reference /
-        // Current). Drops outside the comparison view fall through to the
-        // default "load as current" behaviour.
-        let (dropped, drop_pos): (Vec<String>, Option<egui::Pos2>) = ctx.input(|i| {
+        // We can't reliably read pointer.hover_pos() in the frame that delivers
+        // the drop (some platforms drop the hover event when the file is
+        // released). Instead we sample the pointer continuously while a drag is
+        // in progress (i.raw.hovered_files non-empty) and remember the last
+        // sampled position. On drop, that captured position is matched against
+        // the comparison pane rects to route the file.
+        let (dropped, drag_in_progress, current_pointer): (
+            Vec<String>,
+            bool,
+            Option<egui::Pos2>,
+        ) = ctx.input(|i| {
             let paths: Vec<String> = i
                 .raw
                 .dropped_files
                 .iter()
                 .filter_map(|f| f.path.as_ref().map(|p| p.display().to_string()))
                 .collect();
-            // pointer.hover_pos() persists at the drop site for one frame.
-            // Fall back to interact_pos if hover_pos already cleared.
-            let pos = i.pointer.hover_pos().or(i.pointer.interact_pos());
-            (paths, pos)
+            let dragging = !i.raw.hovered_files.is_empty();
+            let ptr = i
+                .pointer
+                .hover_pos()
+                .or_else(|| i.pointer.latest_pos())
+                .or_else(|| i.pointer.interact_pos());
+            (paths, dragging, ptr)
         });
+        if drag_in_progress {
+            if let Some(p) = current_pointer {
+                self.last_drop_target_pos = Some(p);
+            }
+        }
         if let Some(path) = dropped.into_iter().next() {
+            // Prefer the last-captured drag position; fall back to whatever the
+            // pointer reports right now in case the drag-tracking missed.
+            let drop_pos = self.last_drop_target_pos.or(current_pointer);
+            self.last_drop_target_pos = None;
+
             let routed_to_ref = self.comparison.is_open
                 && matches!(
                     (drop_pos, self.comparison.last_ref_pane_rect),
-                    (Some(p), Some(rect)) if rect.contains(p)
-                );
-            let routed_to_current = self.comparison.is_open
-                && matches!(
-                    (drop_pos, self.comparison.last_current_pane_rect),
                     (Some(p), Some(rect)) if rect.contains(p)
                 );
 
@@ -1211,9 +1231,7 @@ impl eframe::App for VideoViewerApp {
                     self.status_info = info;
                 }
             } else {
-                // Either dropped on Current pane or anywhere else — load as current.
-                // (routed_to_current and the fallback take the same code path.)
-                let _ = routed_to_current;
+                // Dropped on Current pane or anywhere else — load as current.
                 let (w, h, fmt, info) = self.resolve_raw_open_params(&path);
                 self.open_file(ctx, path, w, h, &fmt);
                 self.status_info = info;
@@ -1881,7 +1899,29 @@ impl eframe::App for VideoViewerApp {
                 }
                 // File / parameters readout. Always shown when a file is loaded.
                 if let (Some(path), Some(r)) = (self.current_file.as_ref(), self.reader.as_ref()) {
-                    ui.label(format!("{}  |", path));
+                    // When a reference is also loaded, show ref/current paths
+                    // separately (basenames only, full path on hover) so the
+                    // user can verify both slots from the status bar at a glance.
+                    if let Some(ref ref_path) = self.reference_file {
+                        let ref_name = std::path::Path::new(ref_path)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(ref_path);
+                        let cur_name = std::path::Path::new(path)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(path);
+                        ui.label("ref:")
+                            .on_hover_text(ref_path.as_str());
+                        ui.monospace(ref_name)
+                            .on_hover_text(ref_path.as_str());
+                        ui.label("|");
+                        ui.label("current:").on_hover_text(path.as_str());
+                        ui.monospace(cur_name).on_hover_text(path.as_str());
+                        ui.label("|");
+                    } else {
+                        ui.label(format!("{}  |", path));
+                    }
                     let interlace_str = match r.interlace() {
                         "tff" => " [TFF]",
                         "bff" => " [BFF]",
