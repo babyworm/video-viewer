@@ -16,7 +16,7 @@ pub enum DialogState {
     Settings,
     BatchConvert,
     SidebandFile,
-    GuessHint,
+    GuessSize,
 }
 
 // ---------------------------------------------------------------------------
@@ -107,121 +107,113 @@ impl ParametersDialog {
 }
 
 // ---------------------------------------------------------------------------
-// Guess-with-Hint Dialog
+// Guess Size Dialog
 // ---------------------------------------------------------------------------
 
-/// Dialog presenting (width, height, format) candidates that match the file
-/// size. Two modes, switchable via the "Use frame-count hint" checkbox:
+/// Unified dialog for resolving (width, height, format) from file size.
+/// Behaviour driven by `num_frames`:
 ///
-/// - **Hint mode** (`use_hint = true`): user types a frame count; only
-///   candidates where `frame_size × frames == file_size` are listed.
-/// - **No-hint mode** (`use_hint = false`): every (w, h, format) where
-///   `frame_size` evenly divides `file_size` is listed, with the implied
-///   `num_frames` shown alongside.
-pub struct GuessHintDialog {
+/// - `num_frames == 0` (no hint): every (w, h, format) where `frame_size`
+///   evenly divides `file_size` is listed, with implied `num_frames` shown.
+/// - `num_frames >= 1` (with hint): only candidates whose
+///   `frame_size × num_frames == file_size` are listed.
+///
+/// The "Guess it" button forces a recompute; values also auto-recompute on
+/// change. Status bar size click and View → Video Size → "Guess Size…" both
+/// open this dialog (no hint by default).
+pub struct GuessSizeDialog {
     pub file_size: u64,
+    /// Frame count hint. 0 means "no hint": enumerate every match.
     pub num_frames: u64,
-    pub use_hint: bool,
     pub candidates: Vec<crate::core::hints::SizeGuess>,
     pub selected_idx: Option<usize>,
     pub last_query_frames: u64,
 }
 
-impl GuessHintDialog {
+impl GuessSizeDialog {
+    /// Open in no-hint mode (`num_frames = 0`); user can type a frame count
+    /// to switch into hint mode.
+    pub fn new_no_hint(file_size: u64) -> Self {
+        Self::new_with_frames(file_size, 0)
+    }
+
+    /// Open with a default frame count pre-filled (hint mode).
     pub fn new(file_size: u64, default_frames: u64) -> Self {
-        Self::new_with_mode(file_size, default_frames, true)
+        Self::new_with_frames(file_size, default_frames)
     }
 
-    /// Construct a dialog initially in no-hint mode (Guess again…).
-    /// `default_frames` is preserved for when the user re-enables the hint.
-    pub fn new_no_hint(file_size: u64, default_frames: u64) -> Self {
-        Self::new_with_mode(file_size, default_frames, false)
-    }
-
-    fn new_with_mode(file_size: u64, default_frames: u64, use_hint: bool) -> Self {
-        let initial = default_frames.max(1);
+    fn new_with_frames(file_size: u64, num_frames: u64) -> Self {
         let mut s = Self {
             file_size,
-            num_frames: initial,
-            use_hint,
+            num_frames,
             candidates: Vec::new(),
             selected_idx: None,
-            last_query_frames: initial,
+            last_query_frames: num_frames,
         };
         s.recompute();
         s
     }
 
     fn recompute(&mut self) {
-        self.candidates = if self.use_hint {
+        self.candidates = if self.num_frames == 0 {
+            crate::core::hints::guess_all_resolutions_no_hint(self.file_size)
+        } else {
             crate::core::hints::guess_resolutions_with_frame_count(
                 self.file_size,
                 self.num_frames,
             )
-        } else {
-            crate::core::hints::guess_all_resolutions_no_hint(self.file_size)
         };
         self.selected_idx = if self.candidates.is_empty() { None } else { Some(0) };
         self.last_query_frames = self.num_frames;
     }
 
-    /// Returns Some(Some(SizeGuess)) on OK, Some(None) on Cancel, None while open.
+    /// Returns Some(Some(SizeGuess)) on Apply, Some(None) on Cancel, None while open.
     pub fn show(
         &mut self,
         ctx: &egui::Context,
     ) -> Option<Option<crate::core::hints::SizeGuess>> {
         let mut result = None;
         let mut open = true;
-        let title = if self.use_hint {
-            "Guess Resolution from Frame Count"
-        } else {
-            "Guess Resolution (no hint)"
-        };
 
-        egui::Window::new(title)
+        egui::Window::new("Guess Size")
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
-            .default_width(380.0)
+            .default_width(400.0)
             .show(ctx, |ui| {
                 ui.label(format!("File size: {} bytes", self.file_size));
-                let mut use_hint_now = self.use_hint;
-                if ui
-                    .checkbox(&mut use_hint_now, "Use frame-count hint")
-                    .changed()
-                {
-                    self.use_hint = use_hint_now;
-                    self.recompute();
-                }
 
-                ui.add_enabled_ui(self.use_hint, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Frame count:");
-                        let resp = ui.add(
-                            egui::DragValue::new(&mut self.num_frames)
-                                .range(1u64..=u64::MAX)
-                                .speed(1.0),
-                        );
-                        if resp.changed()
-                            && self.num_frames != self.last_query_frames
-                        {
-                            self.recompute();
-                        }
-                        if ui.button("Recompute").clicked() {
-                            self.recompute();
-                        }
-                    });
-                    if self.file_size > 0 && self.num_frames > 0 {
-                        let bpf = self.file_size as f64 / self.num_frames as f64;
-                        let exact = self.file_size.is_multiple_of(self.num_frames);
-                        let suffix = if exact {
-                            ""
-                        } else {
-                            "  (not divisible — no candidates)"
-                        };
-                        ui.label(format!("Bytes per frame: {:.2}{}", bpf, suffix));
+                ui.horizontal(|ui| {
+                    ui.label("Frame count (0 = no hint):");
+                    let resp = ui.add(
+                        egui::DragValue::new(&mut self.num_frames)
+                            .range(0u64..=u64::MAX)
+                            .speed(1.0),
+                    );
+                    if resp.changed() && self.num_frames != self.last_query_frames {
+                        self.recompute();
+                    }
+                    if ui.button("Guess it").clicked() {
+                        self.recompute();
                     }
                 });
+
+                if self.num_frames == 0 {
+                    ui.label(
+                        egui::RichText::new(
+                            "No hint: listing every resolution × format that divides the file size.",
+                        )
+                        .small(),
+                    );
+                } else if self.file_size > 0 {
+                    let bpf = self.file_size as f64 / self.num_frames as f64;
+                    let exact = self.file_size.is_multiple_of(self.num_frames);
+                    let suffix = if exact { "" } else { "  (not divisible — no candidates)" };
+                    ui.label(
+                        egui::RichText::new(format!("Bytes per frame: {:.2}{}", bpf, suffix))
+                            .small(),
+                    );
+                }
 
                 ui.separator();
                 ui.label(format!("Candidates ({}):", self.candidates.len()));
@@ -235,15 +227,13 @@ impl GuessHintDialog {
                                 "No (resolution × format) combination matches.",
                             );
                         } else {
+                            // Always show implied frame count — useful in both modes
+                            // to disambiguate identical resolutions across formats.
                             for (i, c) in self.candidates.iter().enumerate() {
-                                let label = if self.use_hint {
-                                    format!("{}×{}  {}", c.width, c.height, c.format)
-                                } else {
-                                    format!(
-                                        "{}×{}  {}  ({} frames)",
-                                        c.width, c.height, c.format, c.num_frames
-                                    )
-                                };
+                                let label = format!(
+                                    "{}×{}  {}  ({} frames)",
+                                    c.width, c.height, c.format, c.num_frames
+                                );
                                 ui.radio_value(&mut self.selected_idx, Some(i), label);
                             }
                         }

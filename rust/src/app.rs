@@ -156,7 +156,7 @@ pub struct VideoViewerApp {
     /// Default false: hidden until the user invokes Tools → "Load ISP sideband info…".
     show_sideband_panel: bool,
     /// Active "Guess with hint" dialog (View → Video Size → Guess with hint…).
-    guess_hint_dialog: Option<dialogs::GuessHintDialog>,
+    guess_size_dialog: Option<dialogs::GuessSizeDialog>,
     /// Interlace field viewing mode.
     pub interlace_view: InterlaceViewMode,
     /// Show Windows file association registration dialog.
@@ -252,7 +252,7 @@ impl VideoViewerApp {
             sideband_panel: crate::analysis::isp_sideband::SidebandPanel::new(),
             sideband_dialog: None,
             show_sideband_panel: false,
-            guess_hint_dialog: None,
+            guess_size_dialog: None,
             interlace_view: InterlaceViewMode::Progressive,
             #[cfg(target_os = "windows")]
             show_register_assoc: false,
@@ -1110,6 +1110,21 @@ impl VideoViewerApp {
         Ok(())
     }
 
+    /// Open the unified Guess Size dialog in no-hint mode.
+    /// User may type a frame count inside to switch into hint mode.
+    /// Used by both the View → Video Size menu and the status bar click.
+    fn open_guess_size_dialog(&mut self) {
+        let Some(ref path) = self.current_file else {
+            return;
+        };
+        let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if file_size == 0 {
+            return;
+        }
+        self.guess_size_dialog = Some(dialogs::GuessSizeDialog::new_no_hint(file_size));
+        self.dialog_state = DialogState::GuessSize;
+    }
+
     pub fn unload_sideband(&mut self) {
         self.sideband_file = None;
         self.sideband_path = None;
@@ -1507,44 +1522,9 @@ impl eframe::App for VideoViewerApp {
                                 }
                                 self.dialog_state = DialogState::Parameters;
                             }
-                            if ui.button("Guess with hint…").clicked() {
+                            if ui.button("Guess Size…").clicked() {
                                 ui.close_menu();
-                                if let Some(ref path) = self.current_file {
-                                    let file_size = std::fs::metadata(path)
-                                        .map(|m| m.len())
-                                        .unwrap_or(0);
-                                    let default_frames = self
-                                        .reader
-                                        .as_ref()
-                                        .map(|r| r.total_frames() as u64)
-                                        .unwrap_or(1)
-                                        .max(1);
-                                    self.guess_hint_dialog = Some(dialogs::GuessHintDialog::new(
-                                        file_size,
-                                        default_frames,
-                                    ));
-                                    self.dialog_state = DialogState::GuessHint;
-                                }
-                            }
-                            if ui.button("Guess again (no hint)…").clicked() {
-                                ui.close_menu();
-                                if let Some(ref path) = self.current_file {
-                                    let file_size = std::fs::metadata(path)
-                                        .map(|m| m.len())
-                                        .unwrap_or(0);
-                                    let default_frames = self
-                                        .reader
-                                        .as_ref()
-                                        .map(|r| r.total_frames() as u64)
-                                        .unwrap_or(1)
-                                        .max(1);
-                                    self.guess_hint_dialog =
-                                        Some(dialogs::GuessHintDialog::new_no_hint(
-                                            file_size,
-                                            default_frames,
-                                        ));
-                                    self.dialog_state = DialogState::GuessHint;
-                                }
+                                self.open_guess_size_dialog();
                             }
                         });
                     });
@@ -1900,14 +1880,12 @@ impl eframe::App for VideoViewerApp {
             });
         });
 
-        // Handle status bar resolution click → open Parameters dialog
+        // Handle status bar resolution click → open Guess Size dialog
+        // (was Parameters in v0.6.x; user prefers exploratory guess flow there.
+        // Manual entry is still available via Tools → Video Parameters and
+        // View → Video Size → Custom Size…)
         if status_params_clicked {
-            if let Some(ref r) = self.reader {
-                self.params_dialog = Some(dialogs::ParametersDialog::new(
-                    r.width(), r.height(), r.format_name(),
-                ));
-                self.dialog_state = DialogState::Parameters;
-            }
+            self.open_guess_size_dialog();
         }
 
         // --- Navigation bar (declared second → sits at bottom edge) ---
@@ -2206,8 +2184,8 @@ impl VideoViewerApp {
         }
 
         // Guess-with-hint dialog
-        if self.dialog_state == DialogState::GuessHint {
-            if let Some(ref mut dlg) = self.guess_hint_dialog {
+        if self.dialog_state == DialogState::GuessSize {
+            if let Some(ref mut dlg) = self.guess_size_dialog {
                 if let Some(result) = dlg.show(ctx) {
                     if let Some(guess) = result {
                         if let Some(ref path) = self.current_file.clone() {
@@ -2221,7 +2199,7 @@ impl VideoViewerApp {
                         }
                     }
                     self.dialog_state = DialogState::None;
-                    self.guess_hint_dialog = None;
+                    self.guess_size_dialog = None;
                 }
             }
         }
