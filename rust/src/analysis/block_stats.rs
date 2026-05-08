@@ -1,33 +1,59 @@
 //! Per-block luma statistics for spatial structure visualization.
 //!
-//! Computes the mean and variance of luma (BT.709) for fixed-size square
-//! blocks tiling the image. Used by the Frame Analysis "Block" tab to show
-//! brightness distribution and texture/noise distribution side-by-side.
+//! Computes the mean and variance of luma for fixed-size square blocks
+//! tiling the image. Two scalar metrics are supported:
+//!
+//! - [`BlockMetric::Y`]  — BT.709 luma (Y' = 0.2126 R + 0.7152 G + 0.0722 B).
+//! - [`BlockMetric::Ms`] — `(6Y + Cb + Cr) / 8`, the chroma-aware perceptual
+//!   weighting also used by the Video Diff diff_stats readout.
+//!
+//! Both metrics are 8-bit-range scalars so the heatmap colourisation in the
+//! Block tab can use the same min/max bounds either way.
+
+/// Which scalar to compute per pixel before aggregating block statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockMetric {
+    /// BT.709 luma: `Y = 0.2126 R + 0.7152 G + 0.0722 B`.
+    Y,
+    /// Chroma-aware perceptual weighting: `(6 Y + Cb + Cr) / 8`,
+    /// matching the comparison-view diff_stats MS definition.
+    Ms,
+}
+
+impl BlockMetric {
+    pub fn label(self) -> &'static str {
+        match self {
+            BlockMetric::Y => "Y",
+            BlockMetric::Ms => "MS",
+        }
+    }
+}
 
 /// Per-block luma statistics over an image.
 #[derive(Debug, Clone)]
 pub struct BlockStats {
     pub block_size: u32,
+    /// Which scalar metric was aggregated (Y or MS).
+    pub metric: BlockMetric,
     /// Number of block columns: ceil(width / block_size).
     pub cols: u32,
     /// Number of block rows: ceil(height / block_size).
     pub rows: u32,
-    /// Block luma means in row-major order. Range [0.0, 255.0].
+    /// Block means in row-major order. Range [0.0, 255.0] (both metrics).
     pub means: Vec<f32>,
-    /// Block luma variances in row-major order. Non-negative.
+    /// Block variances in row-major order. Non-negative.
     pub vars: Vec<f32>,
     /// Source image width in pixels (for rendering aspect).
     pub width: u32,
     /// Source image height in pixels.
     pub height: u32,
-    /// Whole-frame minimum luma (BT.709). 0 when image empty.
+    /// Whole-frame minimum of the chosen metric. 0 when image empty.
     pub frame_min: f32,
-    /// Whole-frame maximum luma (BT.709). 0 when image empty.
+    /// Whole-frame maximum of the chosen metric.
     pub frame_max: f32,
-    /// Whole-frame mean luma (BT.709). 0 when image empty.
+    /// Whole-frame mean of the chosen metric.
     pub frame_mean: f32,
-    /// Whole-frame luma variance, computed as E[Y²] − (E[Y])² over every
-    /// pixel (not the average of block variances). 0 when image empty.
+    /// Whole-frame variance of the chosen metric (E[X²] − E[X]²).
     pub frame_var: f32,
 }
 
@@ -35,6 +61,7 @@ impl BlockStats {
     pub fn empty() -> Self {
         Self {
             block_size: 32,
+            metric: BlockMetric::Y,
             cols: 0,
             rows: 0,
             means: Vec::new(),
@@ -60,16 +87,46 @@ fn rgb_to_luma(r: u8, g: u8, b: u8) -> f64 {
     0.2126 * r as f64 + 0.7152 * g as f64 + 0.0722 * b as f64
 }
 
-/// Compute per-block luma mean and variance.
+/// BT.709 YCbCr conversion → MS = (6Y + Cb + Cr) / 8. Cb/Cr are returned in
+/// the centred range [-128, 127] before mixing, so MS sits roughly in [0, 255]
+/// for natural images.
+#[inline]
+fn rgb_to_ms(r: u8, g: u8, b: u8) -> f64 {
+    const KR: f64 = 0.2126;
+    const KG: f64 = 0.7152;
+    const KB: f64 = 0.0722;
+    let r = r as f64;
+    let g = g as f64;
+    let b = b as f64;
+    let y = KR * r + KG * g + KB * b;
+    let cb = -KR / (2.0 * (1.0 - KB)) * r
+        - KG / (2.0 * (1.0 - KB)) * g
+        + (1.0 - KB) / (2.0 * (1.0 - KB)) * b;
+    let cr = (1.0 - KR) / (2.0 * (1.0 - KR)) * r
+        - KG / (2.0 * (1.0 - KR)) * g
+        - KB / (2.0 * (1.0 - KR)) * b;
+    (6.0 * y + cb + cr) / 8.0
+}
+
+#[inline]
+fn pixel_value(metric: BlockMetric, r: u8, g: u8, b: u8) -> f64 {
+    match metric {
+        BlockMetric::Y => rgb_to_luma(r, g, b),
+        BlockMetric::Ms => rgb_to_ms(r, g, b),
+    }
+}
+
+/// Compute per-block mean and variance of the chosen `metric`.
 ///
 /// Returns `BlockStats` describing each `block_size × block_size` tile of
 /// the image (right/bottom edges may be partial). Uses single-pass running
-/// sums of Y and Y² and computes variance as `E[Y²] − (E[Y])²`.
+/// sums of X and X² and computes variance as `E[X²] − (E[X])²`.
 pub fn compute_block_stats(
     rgb: &[u8],
     width: u32,
     height: u32,
     block_size: u32,
+    metric: BlockMetric,
 ) -> BlockStats {
     let bs = block_size.max(1);
     if width == 0 || height == 0 {
@@ -101,7 +158,7 @@ pub fn compute_block_stats(
             let bx = x / bs;
             let bidx = (by * cols + bx) as usize;
             let pi = row_off + (x as usize) * 3;
-            let yv = rgb_to_luma(rgb[pi], rgb[pi + 1], rgb[pi + 2]);
+            let yv = pixel_value(metric, rgb[pi], rgb[pi + 1], rgb[pi + 2]);
             sum_y[bidx] += yv;
             sum_y2[bidx] += yv * yv;
             counts[bidx] += 1;
@@ -145,6 +202,7 @@ pub fn compute_block_stats(
 
     BlockStats {
         block_size: bs,
+        metric,
         cols,
         rows,
         means,
@@ -174,7 +232,7 @@ mod tests {
 
     #[test]
     fn empty_image_yields_empty_stats() {
-        let s = compute_block_stats(&[], 0, 0, 32);
+        let s = compute_block_stats(&[], 0, 0, 32, BlockMetric::Y);
         assert_eq!(s.cols, 0);
         assert_eq!(s.rows, 0);
         assert!(s.means.is_empty());
@@ -188,7 +246,7 @@ mod tests {
     #[test]
     fn frame_stats_match_uniform_image() {
         let rgb = uniform(8, 8, 100, 100, 100);
-        let s = compute_block_stats(&rgb, 8, 8, 8);
+        let s = compute_block_stats(&rgb, 8, 8, 8, BlockMetric::Y);
         // Achromatic 100 → BT.709 luma == 100.
         assert!((s.frame_min - 100.0).abs() < 0.5);
         assert!((s.frame_max - 100.0).abs() < 0.5);
@@ -208,7 +266,7 @@ mod tests {
                 rgb[p + 2] = 255;
             }
         }
-        let s = compute_block_stats(&rgb, 16, 8, 8);
+        let s = compute_block_stats(&rgb, 16, 8, 8, BlockMetric::Y);
         assert!((s.frame_min - 0.0).abs() < 0.5);
         assert!((s.frame_max - 255.0).abs() < 0.5);
         assert!((s.frame_mean - 127.5).abs() < 0.5);
@@ -218,7 +276,7 @@ mod tests {
     #[test]
     fn uniform_image_has_zero_variance() {
         let rgb = uniform(32, 32, 128, 128, 128);
-        let s = compute_block_stats(&rgb, 32, 32, 32);
+        let s = compute_block_stats(&rgb, 32, 32, 32, BlockMetric::Y);
         assert_eq!(s.cols, 1);
         assert_eq!(s.rows, 1);
         // Y = 0.2126*128 + 0.7152*128 + 0.0722*128 = 128
@@ -229,7 +287,7 @@ mod tests {
     #[test]
     fn block_grid_dimensions_round_up() {
         let rgb = uniform(33, 33, 0, 0, 0);
-        let s = compute_block_stats(&rgb, 33, 33, 32);
+        let s = compute_block_stats(&rgb, 33, 33, 32, BlockMetric::Y);
         assert_eq!(s.cols, 2);
         assert_eq!(s.rows, 2);
         assert_eq!(s.means.len(), 4);
@@ -247,7 +305,7 @@ mod tests {
                 rgb[p + 2] = 255;
             }
         }
-        let s = compute_block_stats(&rgb, 16, 16, 8);
+        let s = compute_block_stats(&rgb, 16, 16, 8, BlockMetric::Y);
         assert_eq!(s.cols, 2);
         assert_eq!(s.rows, 2);
         // Left blocks: ~0, right blocks: ~255
@@ -266,9 +324,9 @@ mod tests {
         let green = uniform(8, 8, 0, 255, 0);
         let blue = uniform(8, 8, 0, 0, 255);
 
-        let r = compute_block_stats(&red, 8, 8, 8).means[0];
-        let g = compute_block_stats(&green, 8, 8, 8).means[0];
-        let b = compute_block_stats(&blue, 8, 8, 8).means[0];
+        let r = compute_block_stats(&red, 8, 8, 8, BlockMetric::Y).means[0];
+        let g = compute_block_stats(&green, 8, 8, 8, BlockMetric::Y).means[0];
+        let b = compute_block_stats(&blue, 8, 8, 8, BlockMetric::Y).means[0];
 
         assert!((r - 0.2126 * 255.0).abs() < 0.5, "red Y: {}", r);
         assert!((g - 0.7152 * 255.0).abs() < 0.5, "green Y: {}", g);
@@ -293,7 +351,7 @@ mod tests {
                 }
             }
         }
-        let s = compute_block_stats(&rgb, 8, 8, 8);
+        let s = compute_block_stats(&rgb, 8, 8, 8, BlockMetric::Y);
         assert_eq!(s.cols, 1);
         assert_eq!(s.rows, 1);
         let mean = s.means[0];
@@ -317,7 +375,7 @@ mod tests {
                 rgb[p + 2] = 128;
             }
         }
-        let s = compute_block_stats(&rgb, 12, 7, 8);
+        let s = compute_block_stats(&rgb, 12, 7, 8, BlockMetric::Y);
         assert_eq!(s.cols, 2);
         assert_eq!(s.rows, 1);
         assert!(s.means[0] < 1.0, "left full block should be black");
@@ -330,7 +388,7 @@ mod tests {
     fn block_size_one_produces_per_pixel_stats() {
         // block_size = 1 means each pixel is its own block; variance must be 0.
         let rgb = uniform(4, 4, 200, 50, 100);
-        let s = compute_block_stats(&rgb, 4, 4, 1);
+        let s = compute_block_stats(&rgb, 4, 4, 1, BlockMetric::Y);
         assert_eq!(s.cols, 4);
         assert_eq!(s.rows, 4);
         assert_eq!(s.means.len(), 16);
@@ -348,7 +406,7 @@ mod tests {
     fn block_size_zero_is_clamped_to_one() {
         // We never want to divide by zero; bs = 0 should fall back to bs = 1.
         let rgb = uniform(4, 4, 0, 0, 0);
-        let s = compute_block_stats(&rgb, 4, 4, 0);
+        let s = compute_block_stats(&rgb, 4, 4, 0, BlockMetric::Y);
         assert_eq!(s.block_size, 1);
         assert_eq!(s.means.len(), 16);
     }
@@ -372,7 +430,7 @@ mod tests {
                 rgb[p + 2] = 255;
             }
         }
-        let s = compute_block_stats(&rgb, 16, 8, 8);
+        let s = compute_block_stats(&rgb, 16, 8, 8, BlockMetric::Y);
         let mv = s.max_var();
         assert!(mv > 1000.0, "expected non-trivial max_var, got {}", mv);
         assert_eq!(mv, s.vars.iter().copied().fold(0.0_f32, f32::max));
@@ -383,7 +441,7 @@ mod tests {
         // RGB buffer too small for the declared dimensions: must fall back
         // to empty stats instead of indexing past the slice.
         let too_small = vec![0u8; 10]; // declared 8×8 = 192 bytes
-        let s = compute_block_stats(&too_small, 8, 8, 8);
+        let s = compute_block_stats(&too_small, 8, 8, 8, BlockMetric::Y);
         assert_eq!(s.cols, 0);
         assert_eq!(s.rows, 0);
         assert!(s.means.is_empty());

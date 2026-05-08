@@ -824,9 +824,12 @@ impl VideoViewerApp {
                 shared.generation += 1;
             }
             AnalysisTab::Block => {
-                let block_size = self.sidebar.analysis.lock().block_size.max(4);
+                let (block_size, metric) = {
+                    let s = self.sidebar.analysis.lock();
+                    (s.block_size.max(4), s.block_metric)
+                };
                 let stats = crate::analysis::block_stats::compute_block_stats(
-                    rgb, w, h, block_size,
+                    rgb, w, h, block_size, metric,
                 );
                 let mut shared = self.sidebar.analysis.lock();
                 shared.block_stats = Some(stats);

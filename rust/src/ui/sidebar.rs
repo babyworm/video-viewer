@@ -32,6 +32,8 @@ pub struct AnalysisShared {
     pub block_stats: Option<crate::analysis::block_stats::BlockStats>,
     /// User-selected block size for the Block tab. Default 32.
     pub block_size: u32,
+    /// Which scalar metric the Block tab aggregates (Y or MS).
+    pub block_metric: crate::analysis::block_stats::BlockMetric,
     /// Set to true by the viewport callback when the user closes the window.
     pub close_requested: bool,
     /// Set to true when the user switches tabs, so the main loop recomputes.
@@ -64,6 +66,7 @@ impl AnalysisShared {
             frame_diff: None,
             block_stats: None,
             block_size: 32,
+            block_metric: crate::analysis::block_stats::BlockMetric::Y,
             close_requested: false,
             tab_changed: false,
             generation: 0,
@@ -351,6 +354,7 @@ impl Sidebar {
                         frame_diff,
                         block_stats,
                         mut block_size,
+                        mut block_metric,
                     ) = {
                         let data = shared.lock();
                         let wf = if data.active_tab == AnalysisTab::Waveform
@@ -375,9 +379,11 @@ impl Sidebar {
                             data.frame_diff,
                             bs,
                             data.block_size,
+                            data.block_metric,
                         )
                     };
                     let prev_block_size = block_size;
+                    let prev_block_metric = block_metric;
 
                     // Tab bar + controls — writes back to shared state only on change.
                     let mut tab = active_tab;
@@ -430,10 +436,18 @@ impl Sidebar {
                             Self::render_metrics(ui, psnr, ssim, frame_diff);
                         }
                         AnalysisTab::Block => {
-                            Self::render_block(ui, &block_stats, &mut block_size);
-                            if block_size != prev_block_size {
+                            Self::render_block(
+                                ui,
+                                &block_stats,
+                                &mut block_size,
+                                &mut block_metric,
+                            );
+                            if block_size != prev_block_size
+                                || block_metric != prev_block_metric
+                            {
                                 let mut s = shared.lock();
                                 s.block_size = block_size;
+                                s.block_metric = block_metric;
                                 // Same path as a tab change: tells the main
                                 // loop to recompute block_stats next frame.
                                 s.tab_changed = true;
@@ -659,13 +673,20 @@ impl Sidebar {
     }
 
     /// Render the Block tab: side-by-side heatmaps of per-block luma mean
-    /// and variance. `block_size` is mutable so the user can change it.
+    /// and variance. `block_size` and `block_metric` are mutable so the user
+    /// can change them — caller propagates changes back into `AnalysisShared`.
     fn render_block(
         ui: &mut egui::Ui,
         block_stats: &Option<crate::analysis::block_stats::BlockStats>,
         block_size: &mut u32,
+        block_metric: &mut crate::analysis::block_stats::BlockMetric,
     ) {
+        use crate::analysis::block_stats::BlockMetric;
         ui.horizontal(|ui| {
+            ui.label("Metric:");
+            ui.selectable_value(block_metric, BlockMetric::Y, "Y");
+            ui.selectable_value(block_metric, BlockMetric::Ms, "MS");
+            ui.separator();
             ui.label("Block size:");
             for &size in &[16u32, 32, 64, 128] {
                 ui.selectable_value(block_size, size, format!("{}×{}", size, size));
@@ -731,9 +752,10 @@ impl Sidebar {
 
         let var_summary = aggregate_block_stats(&stats.vars);
 
+        let label_metric = stats.metric.label();
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
-                ui.label(egui::RichText::new("Mean (Y)").strong());
+                ui.label(egui::RichText::new(format!("Mean ({})", label_metric)).strong());
                 Self::draw_block_pane(
                     ui,
                     mean_handle.id(),
@@ -762,7 +784,7 @@ impl Sidebar {
             });
             ui.add_space(gap);
             ui.vertical(|ui| {
-                ui.label(egui::RichText::new("Variance (Y)").strong());
+                ui.label(egui::RichText::new(format!("Variance ({})", label_metric)).strong());
                 Self::draw_block_pane(
                     ui,
                     var_handle.id(),
