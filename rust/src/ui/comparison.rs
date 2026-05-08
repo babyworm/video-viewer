@@ -30,6 +30,26 @@ pub enum PaneRole {
     Metric,
 }
 
+/// How the three Video Diff panes are arranged inside the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComparisonLayout {
+    /// Reference | Current | Diff — three equal-width columns side by side
+    /// (legacy default).
+    ThreeColumn,
+    /// Reference fills the left half (full height); the right half stacks
+    /// Current (top) and Diff (bottom).
+    RefLeftStackRight,
+}
+
+impl ComparisonLayout {
+    fn label(self) -> &'static str {
+        match self {
+            ComparisonLayout::ThreeColumn => "3-col",
+            ComparisonLayout::RefLeftStackRight => "Ref | Cur/Diff",
+        }
+    }
+}
+
 /// Three-pane video diff view: reference, current, and selected diff/metric map.
 pub struct ComparisonView {
     /// Whether the comparison panel is visible.
@@ -38,6 +58,8 @@ pub struct ComparisonView {
     pub metric_kind: SpatialMetricKind,
     /// Difference heatmap gain for signed luma diff mode.
     pub diff_gain: f32,
+    /// How the three panes are arranged inside the diff window.
+    pub layout: ComparisonLayout,
     /// Shared zoom/pan viewport for all comparison panes.
     pub viewport: ComparisonViewport,
     /// Reference image pixels (RGB ColorImage). Stored as ColorImage so it
@@ -165,6 +187,7 @@ impl ComparisonView {
             is_open: false,
             metric_kind: SpatialMetricKind::SignedDiff,
             diff_gain: 4.0,
+            layout: ComparisonLayout::ThreeColumn,
             viewport: ComparisonViewport::new(),
             ref_image: None,
             current_image: None,
@@ -312,6 +335,22 @@ impl ComparisonView {
                         .clamping(egui::SliderClamping::Always),
                 );
             }
+            ui.separator();
+            ui.label("Layout:");
+            egui::ComboBox::from_id_salt("comparison_layout")
+                .selected_text(self.layout.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.layout,
+                        ComparisonLayout::ThreeColumn,
+                        "3-col (Ref | Cur | Diff)",
+                    );
+                    ui.selectable_value(
+                        &mut self.layout,
+                        ComparisonLayout::RefLeftStackRight,
+                        "Ref left, Cur+Diff stacked right",
+                    );
+                });
         });
 
         if action.is_none()
@@ -387,16 +426,18 @@ impl ComparisonView {
         let available = ui.available_size();
         let gap = 8.0_f32;
         let label_h = 22.0_f32;
-        let pane_w = ((available.x - gap * 2.0) / 3.0).max(80.0);
-        let pane_h = (available.y - label_h).max(80.0);
         let aspect = w as f32 / h as f32;
-        let mut image_w = pane_w;
-        let mut image_h = image_w / aspect;
-        if image_h > pane_h {
-            image_h = pane_h;
-            image_w = image_h * aspect;
-        }
-        let display_size = egui::vec2(image_w, image_h);
+
+        // Helper: fit `(box_w, box_h)` to `aspect` (width / height).
+        let fit_to_box = |box_w: f32, box_h: f32| -> egui::Vec2 {
+            let mut iw = box_w;
+            let mut ih = iw / aspect;
+            if ih > box_h {
+                ih = box_h;
+                iw = ih * aspect;
+            }
+            egui::vec2(iw.max(40.0), ih.max(30.0))
+        };
 
         // Recreate textures from the stored ColorImages every frame using
         // this viewport's `ctx`. Required because TextureHandle is bound to
@@ -422,34 +463,81 @@ impl ComparisonView {
         self.last_current_pane_rect = None;
         let drag_in_progress = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
 
-        ui.horizontal_top(|ui| {
-            self.show_pane(
-                ui,
-                "Reference",
-                ref_texture_id,
-                display_size,
-                PaneRole::Reference,
-                drag_in_progress,
-            );
-            ui.add_space(gap);
-            self.show_pane(
-                ui,
-                "Current",
-                current_texture_id,
-                display_size,
-                PaneRole::Current,
-                drag_in_progress,
-            );
-            ui.add_space(gap);
-            self.show_pane(
-                ui,
-                metric_label,
-                metric_texture_id,
-                display_size,
-                PaneRole::Metric,
-                drag_in_progress,
-            );
-        });
+        match self.layout {
+            ComparisonLayout::ThreeColumn => {
+                let pane_box_w = ((available.x - gap * 2.0) / 3.0).max(80.0);
+                let pane_box_h = (available.y - label_h).max(80.0);
+                let display_size = fit_to_box(pane_box_w, pane_box_h);
+                ui.horizontal_top(|ui| {
+                    self.show_pane(
+                        ui,
+                        "Reference",
+                        ref_texture_id,
+                        display_size,
+                        PaneRole::Reference,
+                        drag_in_progress,
+                    );
+                    ui.add_space(gap);
+                    self.show_pane(
+                        ui,
+                        "Current",
+                        current_texture_id,
+                        display_size,
+                        PaneRole::Current,
+                        drag_in_progress,
+                    );
+                    ui.add_space(gap);
+                    self.show_pane(
+                        ui,
+                        metric_label,
+                        metric_texture_id,
+                        display_size,
+                        PaneRole::Metric,
+                        drag_in_progress,
+                    );
+                });
+            }
+            ComparisonLayout::RefLeftStackRight => {
+                let col_box_w = ((available.x - gap) / 2.0).max(80.0);
+                let left_box_h = (available.y - label_h).max(80.0);
+                let right_box_h =
+                    ((available.y - 2.0 * label_h - gap) / 2.0).max(60.0);
+                let left_size = fit_to_box(col_box_w, left_box_h);
+                let right_size = fit_to_box(col_box_w, right_box_h);
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        self.show_pane(
+                            ui,
+                            "Reference",
+                            ref_texture_id,
+                            left_size,
+                            PaneRole::Reference,
+                            drag_in_progress,
+                        );
+                    });
+                    ui.add_space(gap);
+                    ui.vertical(|ui| {
+                        self.show_pane(
+                            ui,
+                            "Current",
+                            current_texture_id,
+                            right_size,
+                            PaneRole::Current,
+                            drag_in_progress,
+                        );
+                        ui.add_space(gap);
+                        self.show_pane(
+                            ui,
+                            metric_label,
+                            metric_texture_id,
+                            right_size,
+                            PaneRole::Metric,
+                            drag_in_progress,
+                        );
+                    });
+                });
+            }
+        }
 
         ui.add_space(4.0);
         ui.weak("Drop a file on Reference or Current to load it there. Mouse wheel zooms every pane; drag pans the shared view.");
