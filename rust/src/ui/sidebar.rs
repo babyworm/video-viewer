@@ -72,6 +72,10 @@ pub struct Sidebar {
     /// Whether the mouse is currently over the image (values shown vs "--").
     pub pixel_active: bool,
     pub show_analysis: bool,
+    /// Whether the Pixel Inspector section is rendered. Toggled from
+    /// View → "Show Pixel Inspector". When false (and no other side-panel
+    /// content is visible), the right SidePanel itself is collapsed.
+    pub show_pixel_inspector: bool,
 
     /// Shared state for the analysis viewport.
     pub analysis: Arc<Mutex<AnalysisShared>>,
@@ -94,6 +98,7 @@ impl Sidebar {
             pixel_info: None,
             pixel_active: false,
             show_analysis: false,
+            show_pixel_inspector: true,
             analysis: Arc::new(Mutex::new(AnalysisShared::new())),
             grid_size: 0,
             sub_grid_size: 0,
@@ -105,22 +110,20 @@ impl Sidebar {
     }
 
     /// Render the sidebar contents (pixel inspector only).
-    pub fn show(&mut self, ui: &mut egui::Ui) {
+    /// Returns true if anything visible was rendered, false otherwise — caller
+    /// can use this to elide the SidePanel altogether when it would be empty.
+    pub fn show(&mut self, ui: &mut egui::Ui) -> bool {
+        if !self.show_pixel_inspector {
+            return false;
+        }
         ui.set_min_width(220.0);
 
         // ── Pixel Inspector ──────────────────────────────────────────
-        // Wrapped in a CollapsingHeader so users can hide the inspector when
-        // they don't need it (frees vertical space for the analysis toggle and
-        // the ISP sideband panel below). State persists across frames via egui's
-        // id-based memory.
-        egui::CollapsingHeader::new(
-            egui::RichText::new("Pixel Inspector").heading(),
-        )
-        .id_salt("pixel_inspector_section")
-        .default_open(true)
-        .show(ui, |ui| {
+        ui.heading("Pixel Inspector");
+        ui.separator();
+
         // Use a fixed-height frame so the content below doesn't jump
-        // when pixel info appears/disappears (only matters when expanded).
+        // when pixel info appears/disappears.
         let min_inspector_height = 160.0;
         egui::Frame::NONE.show(ui, |ui| {
             ui.set_min_height(min_inspector_height);
@@ -268,13 +271,9 @@ impl Sidebar {
                 ui.label("Hover over the image to inspect pixels.");
             }
         });
-        }); // CollapsingHeader
-
-        ui.add_space(8.0);
-        ui.separator();
-
-        // ── Analysis toggle ──────────────────────────────────────────
-        ui.checkbox(&mut self.show_analysis, "Show Analysis (separate window)");
+        // Analysis toggle was previously here; moved to the Analysis menu
+        // ("Show frame analysis") so the sidebar holds inspection content only.
+        true
     }
 
     /// Show analysis in a separate OS viewport window.

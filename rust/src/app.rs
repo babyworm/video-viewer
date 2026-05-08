@@ -1556,7 +1556,10 @@ impl eframe::App for VideoViewerApp {
                     ui.separator();
                     ui.checkbox(&mut self.loop_playback, "Loop Playback");
                     ui.checkbox(&mut self.canvas.show_magnifier, "Magnifier (M)");
-                    ui.checkbox(&mut self.sidebar.show_analysis, "Show Analysis");
+                    ui.checkbox(
+                        &mut self.sidebar.show_pixel_inspector,
+                        "Show Pixel Inspector",
+                    );
                     ui.separator();
 
                     // --- Video Size submenu ---
@@ -1714,6 +1717,14 @@ impl eframe::App for VideoViewerApp {
                     }
                 });
                 ui.menu_button("Analysis", |ui| {
+                    // Toggle the floating Frame Analysis viewport (histogram,
+                    // waveform, vectorscope, metrics). Moved here from the
+                    // sidebar / View menu — Analysis is the natural home.
+                    ui.checkbox(
+                        &mut self.sidebar.show_analysis,
+                        "Show frame analysis",
+                    );
+                    ui.separator();
                     if ui.button("Video Diff...").clicked() {
                         ui.close_menu();
                         self.comparison.is_open = true;
@@ -2055,26 +2066,34 @@ impl eframe::App for VideoViewerApp {
         let sb_frame_idx = self.current_frame_idx;
         let mut sb_action: Option<crate::analysis::isp_sideband::SidebandAction> = None;
         let show_sb_panel = self.show_sideband_panel;
-        egui::SidePanel::right("sidebar")
-            .default_width(250.0)
-            .show(ctx, |ui| {
-                self.sidebar.show(ui);
-                if show_sb_panel {
-                    ui.separator();
-                    sb_action = self.sideband_panel.show(
-                        ui,
-                        &mut crate::analysis::isp_sideband::SidebandPanelContext {
-                            sideband: sb_file_ref,
-                            sideband_path: sb_path_ref,
-                            current_frame: sb_frame_ref,
-                            mode: &mut sb_mode,
-                            opacity: &mut sb_opacity,
-                            show_values: &mut sb_show_vals,
-                            current_frame_idx: sb_frame_idx,
-                        },
-                    );
-                }
-            });
+        // Render the right SidePanel only when something inside is visible.
+        // Hides the panel entirely (frees horizontal space) when the user has
+        // collapsed both Pixel Inspector and the ISP Sideband panel.
+        let render_sidebar = self.sidebar.show_pixel_inspector || show_sb_panel;
+        if render_sidebar {
+            egui::SidePanel::right("sidebar")
+                .default_width(250.0)
+                .show(ctx, |ui| {
+                    let pixel_rendered = self.sidebar.show(ui);
+                    if show_sb_panel {
+                        if pixel_rendered {
+                            ui.separator();
+                        }
+                        sb_action = self.sideband_panel.show(
+                            ui,
+                            &mut crate::analysis::isp_sideband::SidebandPanelContext {
+                                sideband: sb_file_ref,
+                                sideband_path: sb_path_ref,
+                                current_frame: sb_frame_ref,
+                                mode: &mut sb_mode,
+                                opacity: &mut sb_opacity,
+                                show_values: &mut sb_show_vals,
+                                current_frame_idx: sb_frame_idx,
+                            },
+                        );
+                    }
+                });
+        }
         // Write back sideband UI state changes.
         self.sideband_overlay_mode = sb_mode;
         self.sideband_opacity = sb_opacity;
