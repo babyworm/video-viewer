@@ -450,7 +450,7 @@ impl VideoViewerApp {
             Some(r) => (r.width(), r.height()),
             None => {
                 self.comparison.message = Some("Load a current file first.".to_string());
-                self.comparison.metric_texture = None;
+                self.comparison.metric_image = None;
                 self.comparison.metric_map = None;
                 return;
             }
@@ -463,7 +463,7 @@ impl VideoViewerApp {
 
         let Some(reference_rgb) = self.reference_rgb.as_ref() else {
             self.comparison.message = Some("Open a reference file for video diff.".to_string());
-            self.comparison.metric_texture = None;
+            self.comparison.metric_image = None;
             self.comparison.metric_map = None;
             self.comparison.diff_stats = None;
             return;
@@ -481,7 +481,7 @@ impl VideoViewerApp {
                 w,
                 h
             ));
-            self.comparison.metric_texture = None;
+            self.comparison.metric_image = None;
             self.comparison.metric_map = None;
             self.comparison.diff_stats = None;
             return;
@@ -1153,11 +1153,11 @@ impl VideoViewerApp {
         std::mem::swap(&mut self.current_rgb, &mut self.reference_rgb);
         // The comparison view's textures must follow the file paths.
         std::mem::swap(
-            &mut self.comparison.ref_texture,
-            &mut self.comparison.current_texture,
+            &mut self.comparison.ref_image,
+            &mut self.comparison.current_image,
         );
         // Diff/metric data is now stale — drop it so the next refresh recomputes.
-        self.comparison.metric_texture = None;
+        self.comparison.metric_image = None;
         self.comparison.metric_map = None;
         self.prev_rgb = None;
 
@@ -2335,17 +2335,22 @@ impl eframe::App for VideoViewerApp {
             }
         });
 
-        // --- Video Diff floating window ---
-        // Renders on top of the central canvas so the user can compare ref/cur
-        // against the live "current" view in the main panel. Closing the window
-        // (× button or Close action) clears comparison.is_open.
+        // --- Video Diff in a real OS window (separate viewport) ---
+        // `show_viewport_immediate` opens a child OS window and runs the
+        // closure synchronously each frame; FnMut means we can capture
+        // `&mut self.comparison` directly without Arc<Mutex>.
         if self.comparison.is_open {
-            let mut keep_open = true;
-            egui::Window::new("Video Diff")
-                .open(&mut keep_open)
-                .default_size(egui::vec2(960.0, 600.0))
-                .min_size(egui::vec2(400.0, 280.0))
-                .show(ctx, |ui| {
+            let viewport_id = egui::ViewportId::from_hash_of("video_diff_viewport");
+            let builder = egui::ViewportBuilder::default()
+                .with_title("Video Diff")
+                .with_inner_size([960.0, 600.0])
+                .with_min_inner_size([400.0, 280.0]);
+            let mut close_requested = false;
+            ctx.show_viewport_immediate(viewport_id, builder, |child_ctx, _class| {
+                if child_ctx.input(|i| i.viewport().close_requested()) {
+                    close_requested = true;
+                }
+                egui::CentralPanel::default().show(child_ctx, |ui| {
                     comparison_action = self.comparison.show(
                         ui,
                         self.reference_file.as_deref(),
@@ -2353,7 +2358,8 @@ impl eframe::App for VideoViewerApp {
                         self.toolbar.grid_size,
                     );
                 });
-            if !keep_open {
+            });
+            if close_requested {
                 self.comparison.is_open = false;
             }
         }

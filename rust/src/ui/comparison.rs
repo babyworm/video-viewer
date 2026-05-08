@@ -40,12 +40,15 @@ pub struct ComparisonView {
     pub diff_gain: f32,
     /// Shared zoom/pan viewport for all comparison panes.
     pub viewport: ComparisonViewport,
-    /// Reference image texture.
-    pub ref_texture: Option<egui::TextureHandle>,
-    /// Current image texture.
-    pub current_texture: Option<egui::TextureHandle>,
-    /// Right-pane diff/metric texture.
-    pub metric_texture: Option<egui::TextureHandle>,
+    /// Reference image pixels (RGB ColorImage). Stored as ColorImage so it
+    /// can travel across viewports — TextureHandle is bound to a single ctx.
+    /// The deferred Video Diff viewport recreates a texture from this each
+    /// time it renders.
+    pub ref_image: Option<egui::ColorImage>,
+    /// Current image pixels.
+    pub current_image: Option<egui::ColorImage>,
+    /// Right-pane diff/metric image.
+    pub metric_image: Option<egui::ColorImage>,
     /// Last computed spatial metric values, used for labels and summary.
     pub metric_map: Option<SpatialMetricMap>,
     /// Last source image size.
@@ -59,6 +62,13 @@ pub struct ComparisonView {
     pub last_ref_pane_rect: Option<egui::Rect>,
     /// Last frame's Current pane rect, in screen coords.
     pub last_current_pane_rect: Option<egui::Rect>,
+    /// Action posted by the deferred viewport for the root to drain next tick.
+    pub pending_action: Option<ComparisonUiAction>,
+    /// Set by the deferred viewport when the OS close button is clicked.
+    pub close_requested: bool,
+    /// Bumped whenever any cross-viewport-relevant data changes, so the
+    /// deferred viewport's cached textures can be invalidated.
+    pub generation: u64,
 }
 
 /// Normalized image viewport shared by all comparison panes.
@@ -156,28 +166,35 @@ impl ComparisonView {
             metric_kind: SpatialMetricKind::SignedDiff,
             diff_gain: 4.0,
             viewport: ComparisonViewport::new(),
-            ref_texture: None,
-            current_texture: None,
-            metric_texture: None,
+            ref_image: None,
+            current_image: None,
+            metric_image: None,
             metric_map: None,
             image_size: None,
             message: None,
             diff_stats: None,
             last_ref_pane_rect: None,
             last_current_pane_rect: None,
+            pending_action: None,
+            close_requested: false,
+            generation: 0,
         }
     }
 
-    /// Upload an RGB buffer as the reference image.
-    pub fn set_reference_image(&mut self, ctx: &egui::Context, rgb: &[u8], w: u32, h: u32) {
-        self.ref_texture = Some(load_rgb_texture(ctx, "comparison_ref", rgb, w, h));
+    /// Store an RGB buffer as the reference image. The underlying ColorImage
+    /// is created here; the deferred Video Diff viewport recreates a texture
+    /// from it when rendering. `_ctx` is unused but kept for call-site stability.
+    pub fn set_reference_image(&mut self, _ctx: &egui::Context, rgb: &[u8], w: u32, h: u32) {
+        self.ref_image = Some(rgb_to_color_image(rgb, w, h));
         self.image_size = Some((w, h));
+        self.generation = self.generation.wrapping_add(1);
     }
 
-    /// Upload an RGB buffer as the current image.
-    pub fn set_current_image(&mut self, ctx: &egui::Context, rgb: &[u8], w: u32, h: u32) {
-        self.current_texture = Some(load_rgb_texture(ctx, "comparison_current", rgb, w, h));
+    /// Store an RGB buffer as the current image.
+    pub fn set_current_image(&mut self, _ctx: &egui::Context, rgb: &[u8], w: u32, h: u32) {
+        self.current_image = Some(rgb_to_color_image(rgb, w, h));
         self.image_size = Some((w, h));
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// Recompute the selected right-pane map.
@@ -205,21 +222,24 @@ impl ComparisonView {
             _ => metric_tile_heatmap(&map),
         };
 
-        self.metric_texture = Some(load_rgb_texture(ctx, "comparison_metric", &heatmap, w, h));
+        let _ = ctx;
+        self.metric_image = Some(rgb_to_color_image(&heatmap, w, h));
         self.metric_map = Some(map);
         self.image_size = Some((w, h));
         self.message = None;
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// Clear loaded comparison frames.
     pub fn clear(&mut self) {
         self.viewport.reset();
-        self.ref_texture = None;
-        self.current_texture = None;
-        self.metric_texture = None;
+        self.ref_image = None;
+        self.current_image = None;
+        self.metric_image = None;
         self.metric_map = None;
         self.image_size = None;
         self.message = None;
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// Render the comparison view and return requested app actions.
@@ -378,9 +398,23 @@ impl ComparisonView {
         }
         let display_size = egui::vec2(image_w, image_h);
 
-        let ref_texture_id = self.ref_texture.as_ref().map(|texture| texture.id());
-        let current_texture_id = self.current_texture.as_ref().map(|texture| texture.id());
-        let metric_texture_id = self.metric_texture.as_ref().map(|texture| texture.id());
+        // Recreate textures from the stored ColorImages every frame using
+        // this viewport's `ctx`. Required because TextureHandle is bound to
+        // the ctx that allocated it and Video Diff lives in a deferred
+        // viewport with its own ctx.
+        let ctx = ui.ctx().clone();
+        let ref_texture_id = self
+            .ref_image
+            .as_ref()
+            .map(|img| ctx.load_texture("comparison_ref", img.clone(), egui::TextureOptions::LINEAR).id());
+        let current_texture_id = self
+            .current_image
+            .as_ref()
+            .map(|img| ctx.load_texture("comparison_current", img.clone(), egui::TextureOptions::LINEAR).id());
+        let metric_texture_id = self
+            .metric_image
+            .as_ref()
+            .map(|img| ctx.load_texture("comparison_metric", img.clone(), egui::TextureOptions::LINEAR).id());
         let metric_label = self.metric_kind.display_name();
 
         // Reset cached rects each frame; show_pane fills them in for ref/current.
@@ -573,15 +607,8 @@ fn clamp_vec2(value: egui::Vec2, min: f32, max: f32) -> egui::Vec2 {
     egui::vec2(value.x.clamp(min, max), value.y.clamp(min, max))
 }
 
-fn load_rgb_texture(
-    ctx: &egui::Context,
-    name: &str,
-    rgb: &[u8],
-    w: u32,
-    h: u32,
-) -> egui::TextureHandle {
-    let color_image = egui::ColorImage::from_rgb([w as usize, h as usize], rgb);
-    ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR)
+fn rgb_to_color_image(rgb: &[u8], w: u32, h: u32) -> egui::ColorImage {
+    egui::ColorImage::from_rgb([w as usize, h as usize], rgb)
 }
 
 fn luma_at(rgb: &[u8], base: usize) -> f64 {
