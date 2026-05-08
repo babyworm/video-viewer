@@ -109,11 +109,18 @@ impl Sidebar {
         ui.set_min_width(220.0);
 
         // ── Pixel Inspector ──────────────────────────────────────────
-        ui.heading("Pixel Inspector");
-        ui.separator();
-
+        // Wrapped in a CollapsingHeader so users can hide the inspector when
+        // they don't need it (frees vertical space for the analysis toggle and
+        // the ISP sideband panel below). State persists across frames via egui's
+        // id-based memory.
+        egui::CollapsingHeader::new(
+            egui::RichText::new("Pixel Inspector").heading(),
+        )
+        .id_salt("pixel_inspector_section")
+        .default_open(true)
+        .show(ui, |ui| {
         // Use a fixed-height frame so the content below doesn't jump
-        // when pixel info appears/disappears.
+        // when pixel info appears/disappears (only matters when expanded).
         let min_inspector_height = 160.0;
         egui::Frame::NONE.show(ui, |ui| {
             ui.set_min_height(min_inspector_height);
@@ -261,6 +268,7 @@ impl Sidebar {
                 ui.label("Hover over the image to inspect pixels.");
             }
         });
+        }); // CollapsingHeader
 
         ui.add_space(8.0);
         ui.separator();

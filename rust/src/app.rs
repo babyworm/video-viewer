@@ -1200,29 +1200,61 @@ impl eframe::App for VideoViewerApp {
                 .filter_map(|f| f.path.as_ref().map(|p| p.display().to_string()))
                 .collect();
             let dragging = !i.raw.hovered_files.is_empty();
+            // Try every available pointer-position source. Some platforms
+            // (notably WSLg/Wayland) don't update hover_pos during external
+            // file drags, so we also scan the event queue for the latest
+            // pointer event as a last resort.
             let ptr = i
                 .pointer
                 .hover_pos()
                 .or_else(|| i.pointer.latest_pos())
-                .or_else(|| i.pointer.interact_pos());
+                .or_else(|| i.pointer.interact_pos())
+                .or_else(|| {
+                    i.events.iter().rev().find_map(|e| match e {
+                        egui::Event::PointerMoved(p) => Some(*p),
+                        egui::Event::PointerButton { pos, .. } => Some(*pos),
+                        _ => None,
+                    })
+                });
             (paths, dragging, ptr)
         });
-        if drag_in_progress {
-            if let Some(p) = current_pointer {
+
+        // Capture the pointer position whenever it could plausibly become a
+        // drop site. Two complementary triggers:
+        //   (a) drag_in_progress = hovered_files is non-empty — fires on
+        //       backends that emit drag-hover events.
+        //   (b) cursor over a comparison pane — fallback for backends that
+        //       don't emit drag-hover events; the user's last cursor move
+        //       over the pane is reused as the drop site.
+        if let Some(p) = current_pointer {
+            let over_drop_pane = self.comparison.is_open
+                && (self
+                    .comparison
+                    .last_ref_pane_rect
+                    .is_some_and(|r| r.contains(p))
+                    || self
+                        .comparison
+                        .last_current_pane_rect
+                        .is_some_and(|r| r.contains(p)));
+            if drag_in_progress || over_drop_pane {
                 self.last_drop_target_pos = Some(p);
             }
         }
+
         if let Some(path) = dropped.into_iter().next() {
-            // Prefer the last-captured drag position; fall back to whatever the
-            // pointer reports right now in case the drag-tracking missed.
+            // Prefer the last-captured drag/hover position; fall back to the
+            // current pointer reading.
             let drop_pos = self.last_drop_target_pos.or(current_pointer);
             self.last_drop_target_pos = None;
 
+            // Use a small expansion so drops barely outside the visible pane
+            // edge still route correctly (e.g. on the 1-pixel border).
+            const EDGE_TOLERANCE: f32 = 6.0;
             let routed_to_ref = self.comparison.is_open
-                && matches!(
-                    (drop_pos, self.comparison.last_ref_pane_rect),
-                    (Some(p), Some(rect)) if rect.contains(p)
-                );
+                && drop_pos
+                    .zip(self.comparison.last_ref_pane_rect)
+                    .map(|(p, rect)| rect.expand(EDGE_TOLERANCE).contains(p))
+                    .unwrap_or(false);
 
             if routed_to_ref {
                 let (w, h, fmt, info) = self.resolve_raw_open_params(&path);
