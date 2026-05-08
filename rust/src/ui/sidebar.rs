@@ -12,6 +12,8 @@ pub enum AnalysisTab {
     Waveform,
     Vectorscope,
     Metrics,
+    /// Per-block luma statistics (mean & variance side-by-side).
+    Block,
     IspSideband,
 }
 
@@ -26,6 +28,10 @@ pub struct AnalysisShared {
     pub psnr: Option<f64>,
     pub ssim: Option<f64>,
     pub frame_diff: Option<f64>,
+    /// Per-block luma stats for the Block tab.
+    pub block_stats: Option<crate::analysis::block_stats::BlockStats>,
+    /// User-selected block size for the Block tab. Default 32.
+    pub block_size: u32,
     /// Set to true by the viewport callback when the user closes the window.
     pub close_requested: bool,
     /// Set to true when the user switches tabs, so the main loop recomputes.
@@ -56,6 +62,8 @@ impl AnalysisShared {
             psnr: None,
             ssim: None,
             frame_diff: None,
+            block_stats: None,
+            block_size: 32,
             close_requested: false,
             tab_changed: false,
             generation: 0,
@@ -315,12 +323,27 @@ impl Sidebar {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     // Snapshot shared state and release the lock before rendering.
                     // Only clone waveform_image when the waveform tab is active AND data changed.
-                    let (active_tab, histogram, vectorscope, waveform, psnr, ssim, frame_diff) = {
+                    let (
+                        active_tab,
+                        histogram,
+                        vectorscope,
+                        waveform,
+                        psnr,
+                        ssim,
+                        frame_diff,
+                        block_stats,
+                        mut block_size,
+                    ) = {
                         let data = shared.lock();
                         let wf = if data.active_tab == AnalysisTab::Waveform
                             && data.waveform_data_gen != data.waveform_texture_gen
                         {
                             data.waveform_image.clone()
+                        } else {
+                            None
+                        };
+                        let bs = if data.active_tab == AnalysisTab::Block {
+                            data.block_stats.clone()
                         } else {
                             None
                         };
@@ -332,8 +355,11 @@ impl Sidebar {
                             data.psnr,
                             data.ssim,
                             data.frame_diff,
+                            bs,
+                            data.block_size,
                         )
                     };
+                    let prev_block_size = block_size;
 
                     // Tab bar + controls — writes back to shared state only on change.
                     let mut tab = active_tab;
@@ -345,6 +371,7 @@ impl Sidebar {
                         ui.selectable_value(&mut tab, AnalysisTab::Waveform, "Waveform");
                         ui.selectable_value(&mut tab, AnalysisTab::Vectorscope, "Vectorscope");
                         ui.selectable_value(&mut tab, AnalysisTab::Metrics, "Metrics");
+                        ui.selectable_value(&mut tab, AnalysisTab::Block, "Block");
                         ui.selectable_value(&mut tab, AnalysisTab::IspSideband, "ISP Sideband");
                         ui.separator();
                         if ui.small_button("+").on_hover_text("Zoom in").clicked() {
@@ -377,6 +404,16 @@ impl Sidebar {
                         }
                         AnalysisTab::Metrics => {
                             Self::render_metrics(ui, psnr, ssim, frame_diff);
+                        }
+                        AnalysisTab::Block => {
+                            Self::render_block(ui, &block_stats, &mut block_size);
+                            if block_size != prev_block_size {
+                                let mut s = shared.lock();
+                                s.block_size = block_size;
+                                // Same path as a tab change: tells the main
+                                // loop to recompute block_stats next frame.
+                                s.tab_changed = true;
+                            }
                         }
                         AnalysisTab::IspSideband => {
                             ui.label("ISP Sideband analysis is shown in the right sidebar panel.");
@@ -593,5 +630,119 @@ impl Sidebar {
             });
         ui.add_space(4.0);
         ui.weak("PSNR: signal-to-noise ratio (higher = more similar). SSIM: structural similarity (1.0 = identical).");
+    }
+
+    /// Render the Block tab: side-by-side heatmaps of per-block luma mean
+    /// and variance. `block_size` is mutable so the user can change it.
+    fn render_block(
+        ui: &mut egui::Ui,
+        block_stats: &Option<crate::analysis::block_stats::BlockStats>,
+        block_size: &mut u32,
+    ) {
+        ui.horizontal(|ui| {
+            ui.label("Block size:");
+            for &size in &[16u32, 32, 64, 128] {
+                ui.selectable_value(block_size, size, format!("{}×{}", size, size));
+            }
+        });
+        ui.separator();
+
+        let Some(stats) = block_stats.as_ref() else {
+            ui.centered_and_justified(|ui| {
+                ui.label("Computing block statistics…");
+            });
+            return;
+        };
+        if stats.cols == 0 || stats.rows == 0 {
+            ui.label("No image loaded.");
+            return;
+        }
+
+        let max_var = stats.max_var().max(1.0);
+        let mean_image = block_grid_to_color_image(
+            stats.cols,
+            stats.rows,
+            &stats.means,
+            |v| {
+                let g = v.clamp(0.0, 255.0) as u8;
+                egui::Color32::from_rgb(g, g, g)
+            },
+        );
+        let var_image = block_grid_to_color_image(
+            stats.cols,
+            stats.rows,
+            &stats.vars,
+            |v| {
+                // Normalize to [0,1] then map to a viridis-like ramp:
+                // 0 → dark blue, 0.5 → green, 1 → yellow.
+                let t = (v / max_var).clamp(0.0, 1.0);
+                let r = (t * 255.0) as u8;
+                let g = ((1.0 - (t - 0.5).abs() * 2.0).max(0.0) * 220.0) as u8;
+                let b = ((1.0 - t) * 200.0) as u8;
+                egui::Color32::from_rgb(r, g, b)
+            },
+        );
+
+        let aspect = stats.width as f32 / stats.height.max(1) as f32;
+        let avail = ui.available_size();
+        let gap = 8.0_f32;
+        let pane_w = ((avail.x - gap) * 0.5 - 4.0).max(120.0);
+        let pane_h_raw = (pane_w / aspect).max(80.0);
+        let pane_h = pane_h_raw.min(avail.y - 60.0);
+        let pane_w = (pane_h * aspect).min(pane_w);
+        let display_size = egui::vec2(pane_w, pane_h);
+
+        let mean_handle = ui.ctx().load_texture(
+            "block_mean",
+            mean_image,
+            egui::TextureOptions::NEAREST,
+        );
+        let var_handle = ui.ctx().load_texture(
+            "block_var",
+            var_image,
+            egui::TextureOptions::NEAREST,
+        );
+
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new("Mean (Y)").strong());
+                ui.image((mean_handle.id(), display_size));
+            });
+            ui.add_space(gap);
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new("Variance (Y)").strong());
+                ui.image((var_handle.id(), display_size));
+            });
+        });
+        ui.add_space(4.0);
+        ui.weak(format!(
+            "{} × {} blocks of {}px each. Mean: greyscale, brighter = brighter block. Variance: dark-blue → green → yellow as variance grows; max var = {:.0}.",
+            stats.cols, stats.rows, stats.block_size, max_var,
+        ));
+    }
+}
+
+/// Build a `ColorImage` of size (cols, rows) from a row-major `values`
+/// slice, using `map` to colourise each value. Returns a 1×1 transparent
+/// image when the inputs are empty.
+fn block_grid_to_color_image<F>(
+    cols: u32,
+    rows: u32,
+    values: &[f32],
+    map: F,
+) -> egui::ColorImage
+where
+    F: Fn(f32) -> egui::Color32,
+{
+    let w = cols.max(1) as usize;
+    let h = rows.max(1) as usize;
+    let mut pixels = Vec::with_capacity(w * h);
+    for i in 0..(w * h) {
+        let v = values.get(i).copied().unwrap_or(0.0);
+        pixels.push(map(v));
+    }
+    egui::ColorImage {
+        size: [w, h],
+        pixels,
     }
 }

@@ -760,3 +760,130 @@ fn luma_histogram(rgb: &[u8], pixel_count: usize) -> Vec<f64> {
     }
     hist
 }
+
+// ---------------------------------------------------------------------------
+// Whole-frame diff statistics (Reference vs Current)
+// ---------------------------------------------------------------------------
+
+/// Frame-wide diff statistics for the Video Diff header.
+///
+/// All four scalars are computed as the running mean / variance of a
+/// per-pixel "(reference − current)" signal:
+///
+/// - `avg_y` / `var_y`   → BT.709 luma diff
+/// - `avg_ms` / `var_ms` → MS-luma diff with `MS = (6Y + Cb + Cr) / 8`
+///
+/// Because (reference − current) decomposes linearly across Y, Cb, Cr, the
+/// diff-MS signal can be computed channel-by-channel and combined without
+/// re-deriving MS for each frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DiffStats {
+    pub avg_y: f32,
+    pub var_y: f32,
+    pub avg_ms: f32,
+    pub var_ms: f32,
+}
+
+/// Compute frame-wide diff statistics. Returns `None` when the buffers are
+/// mismatched or empty.
+pub fn compute_diff_stats(
+    reference_rgb: &[u8],
+    current_rgb: &[u8],
+    width: u32,
+    height: u32,
+) -> Option<DiffStats> {
+    if reference_rgb.len() != current_rgb.len() || width == 0 || height == 0 {
+        return None;
+    }
+    let n_px = (width as usize) * (height as usize);
+    let need = n_px * 3;
+    if reference_rgb.len() < need {
+        return None;
+    }
+
+    // BT.709 RGB→YCbCr full-range. The constants below sum to (1, 0, 0) for Y
+    // and to centred chroma for an achromatic input, matching the matrices
+    // documented in ITU-R BT.709 §3.
+    const KR: f64 = 0.2126;
+    const KG: f64 = 0.7152;
+    const KB: f64 = 0.0722;
+    let cb_r = -KR / (2.0 * (1.0 - KB));
+    let cb_g = -KG / (2.0 * (1.0 - KB));
+    let cb_b = (1.0 - KB) / (2.0 * (1.0 - KB));
+    let cr_r = (1.0 - KR) / (2.0 * (1.0 - KR));
+    let cr_g = -KG / (2.0 * (1.0 - KR));
+    let cr_b = -KB / (2.0 * (1.0 - KR));
+
+    let mut sum_y = 0.0_f64;
+    let mut sum_y2 = 0.0_f64;
+    let mut sum_ms = 0.0_f64;
+    let mut sum_ms2 = 0.0_f64;
+
+    for i in 0..n_px {
+        let p = i * 3;
+        let r1 = reference_rgb[p] as f64;
+        let g1 = reference_rgb[p + 1] as f64;
+        let b1 = reference_rgb[p + 2] as f64;
+        let r2 = current_rgb[p] as f64;
+        let g2 = current_rgb[p + 1] as f64;
+        let b2 = current_rgb[p + 2] as f64;
+        let dr = r1 - r2;
+        let dg = g1 - g2;
+        let db = b1 - b2;
+        let dy = KR * dr + KG * dg + KB * db;
+        let dcb = cb_r * dr + cb_g * dg + cb_b * db;
+        let dcr = cr_r * dr + cr_g * dg + cr_b * db;
+        let dms = (6.0 * dy + dcb + dcr) / 8.0;
+        sum_y += dy;
+        sum_y2 += dy * dy;
+        sum_ms += dms;
+        sum_ms2 += dms * dms;
+    }
+    let nf = n_px as f64;
+    let avg_y = sum_y / nf;
+    let avg_ms = sum_ms / nf;
+    let var_y = ((sum_y2 / nf) - avg_y * avg_y).max(0.0);
+    let var_ms = ((sum_ms2 / nf) - avg_ms * avg_ms).max(0.0);
+    Some(DiffStats {
+        avg_y: avg_y as f32,
+        var_y: var_y as f32,
+        avg_ms: avg_ms as f32,
+        var_ms: var_ms as f32,
+    })
+}
+
+#[cfg(test)]
+mod diff_stats_tests {
+    use super::*;
+
+    #[test]
+    fn identical_frames_have_zero_diff() {
+        let rgb = vec![100u8; 4 * 4 * 3];
+        let s = compute_diff_stats(&rgb, &rgb, 4, 4).unwrap();
+        assert!(s.avg_y.abs() < 1e-3);
+        assert!(s.var_y.abs() < 1e-3);
+        assert!(s.avg_ms.abs() < 1e-3);
+        assert!(s.var_ms.abs() < 1e-3);
+    }
+
+    #[test]
+    fn uniform_brightness_offset_yields_y_only_diff() {
+        // Reference = all (200, 200, 200), Current = all (100, 100, 100):
+        // Constant offset across R/G/B → dY = 100, dCb = dCr = 0,
+        // dMS = (6*100 + 0 + 0) / 8 = 75. Variance must be zero (uniform).
+        let r = vec![200u8; 8 * 8 * 3];
+        let c = vec![100u8; 8 * 8 * 3];
+        let s = compute_diff_stats(&r, &c, 8, 8).unwrap();
+        assert!((s.avg_y - 100.0).abs() < 0.5, "got {}", s.avg_y);
+        assert!(s.var_y.abs() < 1e-3);
+        assert!((s.avg_ms - 75.0).abs() < 0.5, "got {}", s.avg_ms);
+        assert!(s.var_ms.abs() < 1e-3);
+    }
+
+    #[test]
+    fn mismatched_buffers_return_none() {
+        let r = vec![0u8; 12];
+        let c = vec![0u8; 6];
+        assert!(compute_diff_stats(&r, &c, 2, 2).is_none());
+    }
+}

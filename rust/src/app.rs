@@ -465,10 +465,12 @@ impl VideoViewerApp {
             self.comparison.message = Some("Open a reference file for video diff.".to_string());
             self.comparison.metric_texture = None;
             self.comparison.metric_map = None;
+            self.comparison.diff_stats = None;
             return;
         };
         let Some(reference_reader) = self.reference_reader.as_ref() else {
             self.comparison.message = Some("Open a reference file for video diff.".to_string());
+            self.comparison.diff_stats = None;
             return;
         };
         if reference_reader.width() != w || reference_reader.height() != h {
@@ -481,6 +483,7 @@ impl VideoViewerApp {
             ));
             self.comparison.metric_texture = None;
             self.comparison.metric_map = None;
+            self.comparison.diff_stats = None;
             return;
         }
 
@@ -492,6 +495,9 @@ impl VideoViewerApp {
             h,
             self.toolbar.grid_size,
         );
+        // Whole-frame Y / MS diff means and variances for the header readout.
+        self.comparison.diff_stats =
+            crate::analysis::metrics::compute_diff_stats(reference_rgb, current_rgb, w, h);
     }
 
     /// Seek to `idx`, decode, and push to canvas.
@@ -815,6 +821,15 @@ impl VideoViewerApp {
                     shared.ssim = None;
                     shared.frame_diff = None;
                 }
+                shared.generation += 1;
+            }
+            AnalysisTab::Block => {
+                let block_size = self.sidebar.analysis.lock().block_size.max(4);
+                let stats = crate::analysis::block_stats::compute_block_stats(
+                    rgb, w, h, block_size,
+                );
+                let mut shared = self.sidebar.analysis.lock();
+                shared.block_stats = Some(stats);
                 shared.generation += 1;
             }
             AnalysisTab::IspSideband => {

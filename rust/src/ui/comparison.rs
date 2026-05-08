@@ -48,6 +48,8 @@ pub struct ComparisonView {
     pub image_size: Option<(u32, u32)>,
     /// Last comparison status/error.
     pub message: Option<String>,
+    /// Frame-wide diff statistics (avg/var of Y and MS) for the header readout.
+    pub diff_stats: Option<crate::analysis::metrics::DiffStats>,
     /// Last frame's Reference pane rect, in screen coords. Updated each frame
     /// the comparison view renders. Consumed by the app's drop router.
     pub last_ref_pane_rect: Option<egui::Rect>,
@@ -156,6 +158,7 @@ impl ComparisonView {
             metric_map: None,
             image_size: None,
             message: None,
+            diff_stats: None,
             last_ref_pane_rect: None,
             last_current_pane_rect: None,
         }
@@ -322,6 +325,16 @@ impl ComparisonView {
                 } else {
                     ui.weak("signed ΔY: green +, red -");
                 }
+            });
+        }
+        if let Some(ds) = self.diff_stats {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Diff stats:");
+                ui.monospace(format!(
+                    "avg(Y) {:+.3}  var(Y) {:.3}  avg(MS) {:+.3}  var(MS) {:.3}",
+                    ds.avg_y, ds.var_y, ds.avg_ms, ds.var_ms,
+                ));
+                ui.weak("MS = (6Y + Cb + Cr) / 8 (BT.709)");
             });
         }
 
