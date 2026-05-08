@@ -184,4 +184,136 @@ mod tests {
         assert!(s.means[2] < 1.0);
         assert!((s.means[3] - 255.0).abs() < 1.0);
     }
+
+    #[test]
+    fn bt709_weights_are_asymmetric_per_channel() {
+        // A pure red, green, blue input must produce luma equal to the BT.709
+        // coefficient ×255. This pins the implementation to BT.709 specifically
+        // — BT.601 (e.g. 0.587 for green) would fail this test.
+        let red = uniform(8, 8, 255, 0, 0);
+        let green = uniform(8, 8, 0, 255, 0);
+        let blue = uniform(8, 8, 0, 0, 255);
+
+        let r = compute_block_stats(&red, 8, 8, 8).means[0];
+        let g = compute_block_stats(&green, 8, 8, 8).means[0];
+        let b = compute_block_stats(&blue, 8, 8, 8).means[0];
+
+        assert!((r - 0.2126 * 255.0).abs() < 0.5, "red Y: {}", r);
+        assert!((g - 0.7152 * 255.0).abs() < 0.5, "green Y: {}", g);
+        assert!((b - 0.0722 * 255.0).abs() < 0.5, "blue Y: {}", b);
+        // BT.709 weights should not be the BT.601 weights.
+        assert!((g - 0.587 * 255.0).abs() > 5.0, "green should be BT.709");
+    }
+
+    #[test]
+    fn checkerboard_variance_matches_analytical_value() {
+        // 8×8 luma checkerboard (black / white) at block_size=8.
+        // Half pixels at Y=0, half at Y=255 → mean = 127.5,
+        // variance = E[Y²] − (E[Y])² = 127.5² = 16256.25.
+        let mut rgb = vec![0u8; 8 * 8 * 3];
+        for y in 0_usize..8 {
+            for x in 0_usize..8 {
+                if (x + y).is_multiple_of(2) {
+                    let p = (y * 8 + x) * 3;
+                    rgb[p] = 255;
+                    rgb[p + 1] = 255;
+                    rgb[p + 2] = 255;
+                }
+            }
+        }
+        let s = compute_block_stats(&rgb, 8, 8, 8);
+        assert_eq!(s.cols, 1);
+        assert_eq!(s.rows, 1);
+        let mean = s.means[0];
+        let var = s.vars[0];
+        assert!((mean - 127.5).abs() < 0.5, "mean {}", mean);
+        // Allow ±5 absolute tolerance on the variance (rounded BT.709 luma).
+        assert!((var - 16256.25).abs() < 5.0, "variance {}", var);
+    }
+
+    #[test]
+    fn partial_edge_blocks_are_handled() {
+        // 12×7 image with block_size 8 → 2×1 grid; the bottom-right block
+        // is 4 wide and 7 tall (clipped). Set the right column to mid-grey
+        // so the partial block has a non-trivial mean.
+        let mut rgb = vec![0u8; 12 * 7 * 3];
+        for y in 0..7 {
+            for x in 8..12 {
+                let p = (y * 12 + x) * 3;
+                rgb[p] = 128;
+                rgb[p + 1] = 128;
+                rgb[p + 2] = 128;
+            }
+        }
+        let s = compute_block_stats(&rgb, 12, 7, 8);
+        assert_eq!(s.cols, 2);
+        assert_eq!(s.rows, 1);
+        assert!(s.means[0] < 1.0, "left full block should be black");
+        assert!((s.means[1] - 128.0).abs() < 0.5, "right partial: {}", s.means[1]);
+        // Both blocks are uniform inside their footprint → zero variance.
+        assert!(s.vars[0] < 1e-3 && s.vars[1] < 1e-3);
+    }
+
+    #[test]
+    fn block_size_one_produces_per_pixel_stats() {
+        // block_size = 1 means each pixel is its own block; variance must be 0.
+        let rgb = uniform(4, 4, 200, 50, 100);
+        let s = compute_block_stats(&rgb, 4, 4, 1);
+        assert_eq!(s.cols, 4);
+        assert_eq!(s.rows, 4);
+        assert_eq!(s.means.len(), 16);
+        for v in &s.vars {
+            assert!(*v < 1e-6);
+        }
+        // Each block's mean equals the BT.709 luma of the constant pixel.
+        let expected = 0.2126 * 200.0 + 0.7152 * 50.0 + 0.0722 * 100.0;
+        for m in &s.means {
+            assert!((*m as f64 - expected).abs() < 0.5);
+        }
+    }
+
+    #[test]
+    fn block_size_zero_is_clamped_to_one() {
+        // We never want to divide by zero; bs = 0 should fall back to bs = 1.
+        let rgb = uniform(4, 4, 0, 0, 0);
+        let s = compute_block_stats(&rgb, 4, 4, 0);
+        assert_eq!(s.block_size, 1);
+        assert_eq!(s.means.len(), 16);
+    }
+
+    #[test]
+    fn max_var_returns_largest_block_variance() {
+        // Two blocks: one uniform (variance 0), one black/white split
+        // (variance > 0). max_var must return the larger one.
+        let mut rgb = vec![128u8; 16 * 8 * 3];
+        for y in 0..8 {
+            for x in 0..4 {
+                let p = (y * 16 + 8 + x) * 3;
+                rgb[p] = 0;
+                rgb[p + 1] = 0;
+                rgb[p + 2] = 0;
+            }
+            for x in 4..8 {
+                let p = (y * 16 + 8 + x) * 3;
+                rgb[p] = 255;
+                rgb[p + 1] = 255;
+                rgb[p + 2] = 255;
+            }
+        }
+        let s = compute_block_stats(&rgb, 16, 8, 8);
+        let mv = s.max_var();
+        assert!(mv > 1000.0, "expected non-trivial max_var, got {}", mv);
+        assert_eq!(mv, s.vars.iter().copied().fold(0.0_f32, f32::max));
+    }
+
+    #[test]
+    fn truncated_buffer_returns_empty_stats() {
+        // RGB buffer too small for the declared dimensions: must fall back
+        // to empty stats instead of indexing past the slice.
+        let too_small = vec![0u8; 10]; // declared 8×8 = 192 bytes
+        let s = compute_block_stats(&too_small, 8, 8, 8);
+        assert_eq!(s.cols, 0);
+        assert_eq!(s.rows, 0);
+        assert!(s.means.is_empty());
+    }
 }

@@ -886,4 +886,102 @@ mod diff_stats_tests {
         let c = vec![0u8; 6];
         assert!(compute_diff_stats(&r, &c, 2, 2).is_none());
     }
+
+    #[test]
+    fn pure_red_offset_produces_expected_chroma_diff() {
+        // Reference: pure red 200, Current: pure red 100. Other channels equal.
+        // Expected (BT.709):
+        //   dR = 100, dG = dB = 0
+        //   dY  = 0.2126 * 100 = 21.26
+        //   dCb = -0.1146 * 100 = -11.46  (Cb_r = -KR / (2*(1-KB)) = -0.2126/1.8556)
+        //   dCr =  0.5    * 100 =  50.00  (Cr_r = (1-KR)/(2*(1-KR)) = 0.5)
+        //   dMS = (6*21.26 + (-11.46) + 50.00) / 8 = (127.56 + 38.54) / 8 = 20.76
+        let mut r = vec![0u8; 4 * 4 * 3];
+        let mut c = vec![0u8; 4 * 4 * 3];
+        for i in 0..16 {
+            r[i * 3] = 200;
+            c[i * 3] = 100;
+        }
+        let s = compute_diff_stats(&r, &c, 4, 4).unwrap();
+        assert!((s.avg_y - 21.26).abs() < 0.05, "avg_y {}", s.avg_y);
+        let expected_dms = (6.0 * 21.26 + (-11.46) + 50.0) / 8.0;
+        assert!(
+            (s.avg_ms - expected_dms as f32).abs() < 0.1,
+            "avg_ms {} vs {}",
+            s.avg_ms,
+            expected_dms
+        );
+        assert!(s.var_y < 1e-3, "uniform offset → zero variance");
+        assert!(s.var_ms < 1e-3);
+    }
+
+    #[test]
+    fn achromatic_offset_centers_chroma_diff_at_zero() {
+        // Reference and current differ only in luminance (R=G=B same delta).
+        // Then dCb = dCr = 0 by definition; dMS reduces to (6dY + 0 + 0)/8 = 0.75 dY.
+        let r = vec![200u8; 6 * 6 * 3];
+        let c = vec![80u8; 6 * 6 * 3];
+        let s = compute_diff_stats(&r, &c, 6, 6).unwrap();
+        let expected_dy = 120.0;
+        assert!((s.avg_y - expected_dy).abs() < 0.05);
+        let expected_dms = 0.75 * expected_dy;
+        assert!((s.avg_ms - expected_dms).abs() < 0.1, "avg_ms {}", s.avg_ms);
+    }
+
+    #[test]
+    fn linearity_in_diff_magnitude() {
+        // Doubling the per-pixel delta must double avg_y/avg_ms exactly and
+        // quadruple var_y/var_ms (since variance is quadratic in deltas).
+        let make = |rv: u8, cv: u8| -> (Vec<u8>, Vec<u8>) {
+            let r = vec![rv; 8 * 8 * 3];
+            let c = vec![cv; 8 * 8 * 3];
+            (r, c)
+        };
+        let (r1, c1) = make(120, 100);
+        let (r2, c2) = make(140, 100);
+        let s1 = compute_diff_stats(&r1, &c1, 8, 8).unwrap();
+        let s2 = compute_diff_stats(&r2, &c2, 8, 8).unwrap();
+        assert!((s2.avg_y / s1.avg_y - 2.0).abs() < 1e-3);
+        assert!((s2.avg_ms / s1.avg_ms - 2.0).abs() < 1e-3);
+        // Both inputs uniform → variances are 0 (no variance amplification to test);
+        // the linearity check on means alone is sufficient evidence.
+        assert!(s1.var_y < 1e-3 && s2.var_y < 1e-3);
+    }
+
+    #[test]
+    fn nonuniform_diff_yields_positive_variance() {
+        // Half the image has dY=100, the other half dY=0. avg_y must be near
+        // 50 and var_y must be positive (around 50² ≈ 2500).
+        let mut r = vec![0u8; 8 * 8 * 3];
+        let mut c = vec![0u8; 8 * 8 * 3];
+        for y in 0..8 {
+            for x in 0..8 {
+                let p = (y * 8 + x) * 3;
+                if x < 4 {
+                    // R=G=B=100 vs 0 → achromatic ΔY = 100
+                    r[p] = 100;
+                    r[p + 1] = 100;
+                    r[p + 2] = 100;
+                }
+            }
+        }
+        let _ = &mut c;
+        let s = compute_diff_stats(&r, &c, 8, 8).unwrap();
+        assert!((s.avg_y - 50.0).abs() < 0.5, "avg_y {}", s.avg_y);
+        // For a 50/50 split between 0 and 100, variance ≈ (100-50)² = 2500.
+        assert!(
+            (s.var_y - 2500.0).abs() < 25.0,
+            "var_y {} expected ~2500",
+            s.var_y
+        );
+    }
+
+    #[test]
+    fn empty_dimensions_return_none() {
+        let r = vec![0u8; 0];
+        let c = vec![0u8; 0];
+        assert!(compute_diff_stats(&r, &c, 0, 0).is_none());
+        assert!(compute_diff_stats(&r, &c, 0, 4).is_none());
+        assert!(compute_diff_stats(&r, &c, 4, 0).is_none());
+    }
 }
