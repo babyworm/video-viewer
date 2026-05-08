@@ -406,6 +406,12 @@ impl Sidebar {
                         let mut s = shared.lock();
                         s.active_tab = tab;
                         s.tab_changed = true;
+                        drop(s);
+                        // Wake the root viewport so its update() loop picks up
+                        // tab_changed and runs update_analysis. Without this
+                        // the change only takes effect on the next time the
+                        // user interacts with the main window.
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
                     }
 
                     ui.separator();
@@ -431,6 +437,8 @@ impl Sidebar {
                                 // Same path as a tab change: tells the main
                                 // loop to recompute block_stats next frame.
                                 s.tab_changed = true;
+                                drop(s);
+                                ctx.request_repaint_of(egui::ViewportId::ROOT);
                             }
                         }
                         AnalysisTab::IspSideband => {
