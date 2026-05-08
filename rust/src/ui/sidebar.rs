@@ -106,7 +106,10 @@ impl Sidebar {
             pixel_info: None,
             pixel_active: false,
             show_analysis: false,
-            show_pixel_inspector: true,
+            // Default off: a thin clickable strip on the right edge offers a
+            // one-click expand affordance, plus View → "Show Pixel Inspector"
+            // for keyboard-driven users.
+            show_pixel_inspector: false,
             analysis: Arc::new(Mutex::new(AnalysisShared::new())),
             grid_size: 0,
             sub_grid_size: 0,

@@ -2123,9 +2123,10 @@ impl eframe::App for VideoViewerApp {
         let sb_frame_idx = self.current_frame_idx;
         let mut sb_action: Option<crate::analysis::isp_sideband::SidebandAction> = None;
         let show_sb_panel = self.show_sideband_panel;
-        // Render the right SidePanel only when something inside is visible.
-        // Hides the panel entirely (frees horizontal space) when the user has
-        // collapsed both Pixel Inspector and the ISP Sideband panel.
+        // Three render modes for the right sidebar area:
+        //   1. show_pixel_inspector || show_sb_panel → full sidebar
+        //   2. neither shown                         → thin clickable
+        //      "Pixel Inspector" strip that toggles the inspector back on
         let render_sidebar = self.sidebar.show_pixel_inspector || show_sb_panel;
         if render_sidebar {
             egui::SidePanel::right("sidebar")
@@ -2150,6 +2151,66 @@ impl eframe::App for VideoViewerApp {
                         );
                     }
                 });
+        } else {
+            // Collapsed strip — vertical "Pixel Inspector" label, click to expand.
+            let mut strip_clicked = false;
+            egui::SidePanel::right("sidebar_collapsed_strip")
+                .resizable(false)
+                .exact_width(24.0)
+                .show(ctx, |ui| {
+                    let avail = ui.available_size();
+                    let (rect, response) =
+                        ui.allocate_exact_size(avail, egui::Sense::click());
+                    let painter = ui.painter_at(rect);
+                    let visuals = ui.visuals();
+                    let bg = if response.hovered() {
+                        visuals.widgets.hovered.bg_fill
+                    } else {
+                        visuals.faint_bg_color
+                    };
+                    painter.rect_filled(rect, 0.0, bg);
+                    painter.line_segment(
+                        [
+                            egui::pos2(rect.min.x, rect.min.y),
+                            egui::pos2(rect.min.x, rect.max.y),
+                        ],
+                        egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
+                    );
+                    let label = "Pixel Inspector";
+                    let font = egui::FontId::proportional(11.0);
+                    let line_step = 12.0_f32;
+                    let total_height = label.chars().count() as f32 * line_step;
+                    let mut y = rect.center().y - total_height * 0.5;
+                    let cx = rect.center().x;
+                    let color = if response.hovered() {
+                        visuals.strong_text_color()
+                    } else {
+                        visuals.text_color()
+                    };
+                    for ch in label.chars() {
+                        if ch == ' ' {
+                            y += line_step * 0.5;
+                            continue;
+                        }
+                        painter.text(
+                            egui::pos2(cx, y),
+                            egui::Align2::CENTER_TOP,
+                            ch.to_string(),
+                            font.clone(),
+                            color,
+                        );
+                        y += line_step;
+                    }
+                    if response
+                        .on_hover_text("Click to expand Pixel Inspector")
+                        .clicked()
+                    {
+                        strip_clicked = true;
+                    }
+                });
+            if strip_clicked {
+                self.sidebar.show_pixel_inspector = true;
+            }
         }
         // Write back sideband UI state changes.
         self.sideband_overlay_mode = sb_mode;
