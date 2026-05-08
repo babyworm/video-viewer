@@ -1302,32 +1302,15 @@ impl eframe::App for VideoViewerApp {
         }
 
         if let Some(path) = dropped.into_iter().next() {
-            // Prefer the last-captured drag/hover position; fall back to the
-            // current pointer reading.
-            let drop_pos = self.last_drop_target_pos.or(current_pointer);
+            // Drops on the root window always become "current". Reference
+            // routing now happens inside the Video Diff child viewport's
+            // own drop handler — its pane rects are in child-viewport
+            // coordinates and don't translate to the root's pointer space.
             self.last_drop_target_pos = None;
-
-            // Use a small expansion so drops barely outside the visible pane
-            // edge still route correctly (e.g. on the 1-pixel border).
-            const EDGE_TOLERANCE: f32 = 6.0;
-            let routed_to_ref = self.comparison.is_open
-                && drop_pos
-                    .zip(self.comparison.last_ref_pane_rect)
-                    .map(|(p, rect)| rect.expand(EDGE_TOLERANCE).contains(p))
-                    .unwrap_or(false);
-
-            if routed_to_ref {
-                let (w, h, fmt, info) = self.resolve_raw_open_params(&path);
-                self.open_reference_file(ctx, path, w, h, &fmt);
-                if info.is_some() {
-                    self.status_info = info;
-                }
-            } else {
-                // Dropped on Current pane or anywhere else — load as current.
-                let (w, h, fmt, info) = self.resolve_raw_open_params(&path);
-                self.open_file(ctx, path, w, h, &fmt);
-                self.status_info = info;
-            }
+            let _ = current_pointer; // (kept for signature symmetry)
+            let (w, h, fmt, info) = self.resolve_raw_open_params(&path);
+            self.open_file(ctx, path, w, h, &fmt);
+            self.status_info = info;
         }
 
         // --- Playback tick ---
@@ -2346,6 +2329,10 @@ impl eframe::App for VideoViewerApp {
                 .with_inner_size([960.0, 600.0])
                 .with_min_inner_size([400.0, 280.0]);
             let mut close_requested = false;
+            // The outer `ctx` is root; the closure receives the child viewport's
+            // ctx. Pin a reference to root for use inside the closure
+            // (open_file / open_reference_file allocate textures on root).
+            let root_ctx: &egui::Context = ctx;
             ctx.show_viewport_immediate(viewport_id, builder, |child_ctx, _class| {
                 if child_ctx.input(|i| i.viewport().close_requested()) {
                     close_requested = true;
@@ -2358,6 +2345,62 @@ impl eframe::App for VideoViewerApp {
                         self.toolbar.grid_size,
                     );
                 });
+
+                // --- Drag & drop inside the Video Diff window ---
+                // Drops landing on this child viewport are routed to the
+                // matching pane (Reference / Current). Drops on the metric
+                // pane or empty area are ignored — root's drop handler does
+                // not see them since they belong to the child viewport.
+                let (paths, drop_pos): (Vec<String>, Option<egui::Pos2>) =
+                    child_ctx.input(|i| {
+                        let ps = i
+                            .raw
+                            .dropped_files
+                            .iter()
+                            .filter_map(|f| f.path.as_ref().map(|p| p.display().to_string()))
+                            .collect();
+                        let pos = i
+                            .pointer
+                            .hover_pos()
+                            .or_else(|| i.pointer.latest_pos())
+                            .or_else(|| i.pointer.interact_pos())
+                            .or_else(|| {
+                                i.events.iter().rev().find_map(|e| match e {
+                                    egui::Event::PointerMoved(p) => Some(*p),
+                                    egui::Event::PointerButton { pos, .. } => {
+                                        Some(*pos)
+                                    }
+                                    _ => None,
+                                })
+                            });
+                        (ps, pos)
+                    });
+                if let Some(path) = paths.into_iter().next() {
+                    const EDGE_TOLERANCE: f32 = 6.0;
+                    let routed_to_ref = drop_pos
+                        .zip(self.comparison.last_ref_pane_rect)
+                        .map(|(p, rect)| rect.expand(EDGE_TOLERANCE).contains(p))
+                        .unwrap_or(false);
+                    let routed_to_current = !routed_to_ref
+                        && drop_pos
+                            .zip(self.comparison.last_current_pane_rect)
+                            .map(|(p, rect)| rect.expand(EDGE_TOLERANCE).contains(p))
+                            .unwrap_or(false);
+                    if routed_to_ref {
+                        let (w, h, fmt, info) =
+                            self.resolve_raw_open_params(&path);
+                        self.open_reference_file(root_ctx, path, w, h, &fmt);
+                        if info.is_some() {
+                            self.status_info = info;
+                        }
+                    } else if routed_to_current {
+                        let (w, h, fmt, info) =
+                            self.resolve_raw_open_params(&path);
+                        self.open_file(root_ctx, path, w, h, &fmt);
+                        self.status_info = info;
+                    }
+                    // else: dropped on metric pane or empty area — ignore.
+                }
             });
             if close_requested {
                 self.comparison.is_open = false;
