@@ -1568,20 +1568,35 @@ impl eframe::App for VideoViewerApp {
                         self.dialog_state = DialogState::PngExport;
                     }
                     ui.separator();
-                    // Recent files
-                    if !self.settings.recent_files.is_empty() {
-                        ui.menu_button("Recent Files", |ui| {
+                    // Recent files — always visible so users can find the menu
+                    // even when the list hasn't been populated yet (first launch
+                    // or fresh ~/.config/video-viewer/settings.toml).
+                    ui.menu_button("Recent Files", |ui| {
+                        if self.settings.recent_files.is_empty() {
+                            ui.add_enabled(
+                                false,
+                                egui::Button::new("(no recent files)"),
+                            );
+                            ui.weak("Open a file to start populating this list.");
+                        } else {
                             let recent = self.settings.recent_files.clone();
                             for path in &recent {
                                 if ui.button(path).clicked() {
-                                    let (w, h, fmt, info) = self.resolve_raw_open_params(path);
+                                    let (w, h, fmt, info) =
+                                        self.resolve_raw_open_params(path);
                                     self.open_file(ctx, path.clone(), w, h, &fmt);
                                     self.status_info = info;
                                     ui.close_menu();
                                 }
                             }
-                        });
-                    }
+                            ui.separator();
+                            if ui.button("Clear list").clicked() {
+                                self.settings.recent_files.clear();
+                                self.settings.save();
+                                ui.close_menu();
+                            }
+                        }
+                    });
                     ui.separator();
                     if ui.button("Settings...").clicked() {
                         ui.close_menu();
@@ -2361,6 +2376,84 @@ impl eframe::App for VideoViewerApp {
                     );
                 });
 
+                // --- Keyboard frame navigation inside the Video Diff window ---
+                // Reads keys from the child viewport's input (only fires when
+                // the child window has focus). Skipped while a dialog is open.
+                let dialog_open = self.dialog_state != DialogState::None
+                    || self.show_shortcuts
+                    || self.show_about
+                    || self.show_scene_detect_dialog;
+                if !dialog_open {
+                    let (kleft, kright, khome, kend, kspace) = child_ctx.input(|i| {
+                        let plain = !i.modifiers.ctrl && !i.modifiers.command;
+                        (
+                            plain && i.key_pressed(egui::Key::ArrowLeft),
+                            plain && i.key_pressed(egui::Key::ArrowRight),
+                            i.key_pressed(egui::Key::Home),
+                            i.key_pressed(egui::Key::End),
+                            i.key_pressed(egui::Key::Space),
+                        )
+                    });
+                    let total = self.total_frames();
+                    if total > 0 {
+                        if kleft {
+                            let idx = self.current_frame_idx.saturating_sub(1);
+                            self.goto_frame(root_ctx, idx);
+                            self.is_playing = false;
+                        }
+                        if kright {
+                            let idx = (self.current_frame_idx + 1).min(total - 1);
+                            self.goto_frame(root_ctx, idx);
+                            self.is_playing = false;
+                        }
+                        if khome {
+                            self.goto_frame(root_ctx, 0);
+                            self.is_playing = false;
+                        }
+                        if kend {
+                            self.goto_frame(root_ctx, total - 1);
+                            self.is_playing = false;
+                        }
+                        if kspace {
+                            self.is_playing = !self.is_playing;
+                            if self.is_playing {
+                                self.last_frame_time = Some(Instant::now());
+                            }
+                            // Wake the root tick so playback advances even when
+                            // focus stays on the child window.
+                            root_ctx.request_repaint();
+                        }
+                    }
+                }
+
+                // --- File dialogs ON TOP of the Video Diff window ---
+                // When a file-open dialog was triggered from this window
+                // (icons next to ref/current paths), render it inside the
+                // child viewport so it appears above the comparison content
+                // rather than hidden behind it on the root window.
+                if self.dialog_state == DialogState::OpenFile {
+                    if let Some(ref mut dlg) = self.open_file_dialog {
+                        if let Some(result) = dlg.show(child_ctx) {
+                            if let Some((path, w, h, fmt)) = result {
+                                self.open_file(root_ctx, path, w, h, &fmt);
+                            }
+                            self.dialog_state = DialogState::None;
+                            self.open_file_dialog = None;
+                        }
+                    }
+                }
+                if self.dialog_state == DialogState::OpenReference {
+                    if let Some(ref mut dlg) = self.reference_file_dialog {
+                        if let Some(result) = dlg.show(child_ctx) {
+                            if let Some((path, w, h, fmt)) = result {
+                                self.open_reference_file(root_ctx, path, w, h, &fmt);
+                            }
+                            self.dialog_state = DialogState::None;
+                            self.reference_file_dialog = None;
+                        }
+                    }
+                }
+
                 // --- Drag & drop inside the Video Diff window ---
                 // Some egui-winit versions don't route drops on a child
                 // viewport's window to the child's input — they end up in
@@ -2479,8 +2572,10 @@ impl eframe::App for VideoViewerApp {
 // Dialog rendering (separate impl block to keep update() manageable).
 impl VideoViewerApp {
     fn show_dialogs(&mut self, ctx: &egui::Context) {
-        // Open file dialog
-        if self.dialog_state == DialogState::OpenFile {
+        // Open file / reference dialogs: when Video Diff is open, the
+        // child-viewport closure renders these on top of its window
+        // (above the comparison content). Avoid double-render here.
+        if self.dialog_state == DialogState::OpenFile && !self.comparison.is_open {
             if let Some(ref mut dlg) = self.open_file_dialog {
                 if let Some(result) = dlg.show(ctx) {
                     if let Some((path, w, h, fmt)) = result {
@@ -2492,8 +2587,7 @@ impl VideoViewerApp {
             }
         }
 
-        // Open reference file dialog for video diff
-        if self.dialog_state == DialogState::OpenReference {
+        if self.dialog_state == DialogState::OpenReference && !self.comparison.is_open {
             if let Some(ref mut dlg) = self.reference_file_dialog {
                 if let Some(result) = dlg.show(ctx) {
                     if let Some((path, w, h, fmt)) = result {
