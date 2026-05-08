@@ -1302,15 +1302,18 @@ impl eframe::App for VideoViewerApp {
         }
 
         if let Some(path) = dropped.into_iter().next() {
-            // Drops on the root window always become "current". Reference
-            // routing now happens inside the Video Diff child viewport's
-            // own drop handler — its pane rects are in child-viewport
-            // coordinates and don't translate to the root's pointer space.
             self.last_drop_target_pos = None;
-            let _ = current_pointer; // (kept for signature symmetry)
-            let (w, h, fmt, info) = self.resolve_raw_open_params(&path);
-            self.open_file(ctx, path, w, h, &fmt);
-            self.status_info = info;
+            let _ = current_pointer;
+            // When the Video Diff child viewport is open, defer drop
+            // processing entirely to its closure. egui-winit's multi-viewport
+            // backend may route drops on the child window to the root
+            // context's input, so we don't want to "load as current" here
+            // and steal the drop the user intended for the Reference pane.
+            if !self.comparison.is_open {
+                let (w, h, fmt, info) = self.resolve_raw_open_params(&path);
+                self.open_file(ctx, path, w, h, &fmt);
+                self.status_info = info;
+            }
         }
 
         // --- Playback tick ---
@@ -2347,34 +2350,44 @@ impl eframe::App for VideoViewerApp {
                 });
 
                 // --- Drag & drop inside the Video Diff window ---
-                // Drops landing on this child viewport are routed to the
-                // matching pane (Reference / Current). Drops on the metric
-                // pane or empty area are ignored — root's drop handler does
-                // not see them since they belong to the child viewport.
-                let (paths, drop_pos): (Vec<String>, Option<egui::Pos2>) =
-                    child_ctx.input(|i| {
-                        let ps = i
-                            .raw
-                            .dropped_files
-                            .iter()
-                            .filter_map(|f| f.path.as_ref().map(|p| p.display().to_string()))
-                            .collect();
-                        let pos = i
-                            .pointer
-                            .hover_pos()
-                            .or_else(|| i.pointer.latest_pos())
-                            .or_else(|| i.pointer.interact_pos())
-                            .or_else(|| {
-                                i.events.iter().rev().find_map(|e| match e {
-                                    egui::Event::PointerMoved(p) => Some(*p),
-                                    egui::Event::PointerButton { pos, .. } => {
-                                        Some(*pos)
-                                    }
-                                    _ => None,
-                                })
-                            });
-                        (ps, pos)
-                    });
+                // Some egui-winit versions don't route drops on a child
+                // viewport's window to the child's input — they end up in
+                // root's input instead. So we read drops from both contexts
+                // and use whichever populated. The cursor (drop_pos) is read
+                // from child_ctx because the user dropped on the child window;
+                // its pane rects are in child-viewport coordinates.
+                let child_drops: Vec<String> = child_ctx.input(|i| {
+                    i.raw
+                        .dropped_files
+                        .iter()
+                        .filter_map(|f| f.path.as_ref().map(|p| p.display().to_string()))
+                        .collect()
+                });
+                let root_drops: Vec<String> = root_ctx.input(|i| {
+                    i.raw
+                        .dropped_files
+                        .iter()
+                        .filter_map(|f| f.path.as_ref().map(|p| p.display().to_string()))
+                        .collect()
+                });
+                let drop_pos: Option<egui::Pos2> = child_ctx.input(|i| {
+                    i.pointer
+                        .hover_pos()
+                        .or_else(|| i.pointer.latest_pos())
+                        .or_else(|| i.pointer.interact_pos())
+                        .or_else(|| {
+                            i.events.iter().rev().find_map(|e| match e {
+                                egui::Event::PointerMoved(p) => Some(*p),
+                                egui::Event::PointerButton { pos, .. } => Some(*pos),
+                                _ => None,
+                            })
+                        })
+                });
+                let paths: Vec<String> = if !child_drops.is_empty() {
+                    child_drops
+                } else {
+                    root_drops
+                };
                 if let Some(path) = paths.into_iter().next() {
                     const EDGE_TOLERANCE: f32 = 6.0;
                     let routed_to_ref = drop_pos
@@ -2398,8 +2411,15 @@ impl eframe::App for VideoViewerApp {
                             self.resolve_raw_open_params(&path);
                         self.open_file(root_ctx, path, w, h, &fmt);
                         self.status_info = info;
+                    } else {
+                        // Drop on metric pane / outside any pane — fall back
+                        // to "load as current" so the user's intent isn't
+                        // silently dropped on the floor.
+                        let (w, h, fmt, info) =
+                            self.resolve_raw_open_params(&path);
+                        self.open_file(root_ctx, path, w, h, &fmt);
+                        self.status_info = info;
                     }
-                    // else: dropped on metric pane or empty area — ignore.
                 }
             });
             if close_requested {
