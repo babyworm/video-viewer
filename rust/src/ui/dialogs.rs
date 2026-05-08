@@ -926,6 +926,7 @@ pub struct SettingsDialog {
     pub default_width: u32,
     pub default_height: u32,
     pub color_matrix: String,
+    pub max_recent_files: usize,
 }
 
 impl SettingsDialog {
@@ -939,6 +940,7 @@ impl SettingsDialog {
             default_width: settings.defaults.width,
             default_height: settings.defaults.height,
             color_matrix: settings.defaults.color_matrix.clone(),
+            max_recent_files: settings.general.max_recent_files,
         }
     }
 
@@ -965,6 +967,18 @@ impl SettingsDialog {
                     ui.add(egui::DragValue::new(&mut self.zoom_min).speed(0.01).range(0.01..=1.0));
                     ui.label("Zoom max:");
                     ui.add(egui::DragValue::new(&mut self.zoom_max).speed(1.0).range(2.0..=100.0));
+                });
+
+                ui.separator();
+                ui.heading("General");
+                ui.horizontal(|ui| {
+                    ui.label("Recent files (File menu):");
+                    ui.add(
+                        egui::DragValue::new(&mut self.max_recent_files)
+                            .range(1usize..=100)
+                            .speed(1.0),
+                    );
+                    ui.weak("entries");
                 });
 
                 ui.separator();

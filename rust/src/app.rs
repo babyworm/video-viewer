@@ -1592,6 +1592,14 @@ impl eframe::App for VideoViewerApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
+                ui.menu_button("Edit", |ui| {
+                    if ui.button("Preferences\u{2026}").clicked() {
+                        ui.close_menu();
+                        self.settings_dialog =
+                            Some(dialogs::SettingsDialog::new(&self.settings));
+                        self.dialog_state = DialogState::Settings;
+                    }
+                });
                 ui.menu_button("View", |ui| {
                     if ui.button("Fit to View (F)").clicked() {
                         let avail = ctx.available_rect().size();
@@ -2176,31 +2184,31 @@ impl eframe::App for VideoViewerApp {
                         ],
                         egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
                     );
+                    // Render the label rotated -90° (clockwise) so it reads
+                    // top-to-bottom along the strip. egui's TextShape rotates
+                    // around its position; we offset so the rotated bounding
+                    // box centers within `rect`.
                     let label = "Pixel Inspector";
-                    let font = egui::FontId::proportional(11.0);
-                    let line_step = 12.0_f32;
-                    let total_height = label.chars().count() as f32 * line_step;
-                    let mut y = rect.center().y - total_height * 0.5;
-                    let cx = rect.center().x;
+                    let font = egui::FontId::proportional(13.0);
                     let color = if response.hovered() {
                         visuals.strong_text_color()
                     } else {
                         visuals.text_color()
                     };
-                    for ch in label.chars() {
-                        if ch == ' ' {
-                            y += line_step * 0.5;
-                            continue;
-                        }
-                        painter.text(
-                            egui::pos2(cx, y),
-                            egui::Align2::CENTER_TOP,
-                            ch.to_string(),
-                            font.clone(),
-                            color,
-                        );
-                        y += line_step;
-                    }
+                    let galley = ui.fonts(|f| {
+                        f.layout_no_wrap(label.to_string(), font, color)
+                    });
+                    let text_size = galley.size();
+                    // After -90° rotation around `pos`, the original bbox
+                    // (0..text_w, 0..text_h) maps to (0..text_h, -text_w..0).
+                    // So center (text_h/2, -text_w/2) in `rect`'s centre.
+                    let pos = egui::pos2(
+                        rect.center().x - text_size.y * 0.5,
+                        rect.center().y + text_size.x * 0.5,
+                    );
+                    let shape = egui::epaint::TextShape::new(pos, galley, color)
+                        .with_angle(-std::f32::consts::FRAC_PI_2);
+                    painter.add(shape);
                     if response
                         .on_hover_text("Click to expand Pixel Inspector")
                         .clicked()
@@ -2269,16 +2277,7 @@ impl eframe::App for VideoViewerApp {
                 }
             }
 
-            if self.comparison.is_open {
-                self.sidebar.pixel_active = false;
-                self.sidebar.set_pixel_info(None);
-                comparison_action = self.comparison.show(
-                    ui,
-                    self.reference_file.as_deref(),
-                    self.current_file.as_deref(),
-                    self.toolbar.grid_size,
-                );
-            } else if self.reader.is_some() {
+            if self.reader.is_some() {
                 let response = self.canvas.show(ui);
 
                 // Draw sideband CTU overlay on top of the image.
@@ -2332,11 +2331,48 @@ impl eframe::App for VideoViewerApp {
                 });
             }
         });
+
+        // --- Video Diff floating window ---
+        // Renders on top of the central canvas so the user can compare ref/cur
+        // against the live "current" view in the main panel. Closing the window
+        // (× button or Close action) clears comparison.is_open.
+        if self.comparison.is_open {
+            let mut keep_open = true;
+            egui::Window::new("Video Diff")
+                .open(&mut keep_open)
+                .default_size(egui::vec2(960.0, 600.0))
+                .min_size(egui::vec2(400.0, 280.0))
+                .show(ctx, |ui| {
+                    comparison_action = self.comparison.show(
+                        ui,
+                        self.reference_file.as_deref(),
+                        self.current_file.as_deref(),
+                        self.toolbar.grid_size,
+                    );
+                });
+            if !keep_open {
+                self.comparison.is_open = false;
+            }
+        }
+
         if let Some(action) = comparison_action {
             match action {
                 ComparisonUiAction::OpenReference => {
                     self.reference_file_dialog = Some(self.new_reference_file_dialog());
                     self.dialog_state = DialogState::OpenReference;
+                }
+                ComparisonUiAction::OpenCurrent => {
+                    let initial_dir = self.current_file.as_ref()
+                        .and_then(|f| std::path::Path::new(f).parent())
+                        .and_then(|p| p.to_str())
+                        .map(|s| s.to_string());
+                    self.open_file_dialog = Some(dialogs::OpenFileDialog::new(
+                        self.settings.defaults.width,
+                        self.settings.defaults.height,
+                        &self.settings.defaults.format,
+                        initial_dir.as_deref(),
+                    ));
+                    self.dialog_state = DialogState::OpenFile;
                 }
                 ComparisonUiAction::Refresh => {
                     self.sync_reference_frame(ctx);
@@ -2535,6 +2571,11 @@ impl VideoViewerApp {
                         self.settings.defaults.width = dlg.default_width;
                         self.settings.defaults.height = dlg.default_height;
                         self.settings.defaults.color_matrix = dlg.color_matrix.clone();
+                        self.settings.general.max_recent_files = dlg.max_recent_files.max(1);
+                        // Apply the new cap retroactively to the existing list
+                        // so a shrink takes effect immediately.
+                        let cap = self.settings.general.max_recent_files;
+                        self.settings.recent_files.truncate(cap);
                         self.settings.save();
                         if dlg.dark_theme {
                             ctx.set_visuals(egui::Visuals::dark());

@@ -22,11 +22,29 @@ pub struct DefaultSettings {
     pub format: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeneralSettings {
+    /// How many entries to keep in File → Recent Files. Configurable via
+    /// Edit → Preferences. Cap of 20 by default; bumping this rewrites
+    /// the existing list on the next save.
+    pub max_recent_files: usize,
+}
+
+impl Default for GeneralSettings {
+    fn default() -> Self {
+        Self {
+            max_recent_files: 20,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
     pub cache: CacheSettings,
     pub display: DisplaySettings,
     pub defaults: DefaultSettings,
+    #[serde(default)]
+    pub general: GeneralSettings,
     #[serde(default)]
     pub recent_files: Vec<String>,
 }
@@ -93,6 +111,7 @@ impl Settings {
     pub fn add_recent_file(&mut self, path: &str) {
         self.recent_files.retain(|p| p != path);
         self.recent_files.insert(0, path.to_string());
-        self.recent_files.truncate(10);
+        let cap = self.general.max_recent_files.max(1);
+        self.recent_files.truncate(cap);
     }
 }

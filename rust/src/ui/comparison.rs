@@ -9,6 +9,10 @@ const MAX_VIEW_ZOOM: f32 = 32.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComparisonUiAction {
     OpenReference,
+    /// Open a fresh "current" file via the regular File → Open dialog.
+    /// Lets users replace the current slot from inside Video Diff without
+    /// closing the comparison view.
+    OpenCurrent,
     Refresh,
     Close,
     /// Swap the Reference and Current slots (file paths, readers, decoded
@@ -299,9 +303,23 @@ impl ComparisonView {
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Reference:");
+            if ui
+                .small_button("\u{1F4C2}")
+                .on_hover_text("Open reference file…")
+                .clicked()
+            {
+                action = Some(ComparisonUiAction::OpenReference);
+            }
             ui.monospace(reference_path.unwrap_or("--"));
             ui.separator();
             ui.label("Current:");
+            if ui
+                .small_button("\u{1F4C2}")
+                .on_hover_text("Open current file…")
+                .clicked()
+            {
+                action = Some(ComparisonUiAction::OpenCurrent);
+            }
             ui.monospace(current_path.unwrap_or("--"));
             ui.separator();
             let grid_text = if grid_size > 0 {

@@ -130,7 +130,22 @@ impl Sidebar {
         ui.set_min_width(220.0);
 
         // ── Pixel Inspector ──────────────────────────────────────────
-        ui.heading("Pixel Inspector");
+        // Header is a frameless button so the user can click the title (or
+        // the trailing › chevron) to collapse the section back into the
+        // edge strip. Same affordance as the strip in reverse.
+        let header = ui.add(
+            egui::Button::new(
+                egui::RichText::new("Pixel Inspector  \u{203A}").heading(),
+            )
+            .frame(false),
+        );
+        if header
+            .on_hover_text("Click to collapse")
+            .clicked()
+        {
+            self.show_pixel_inspector = false;
+            return false;
+        }
         ui.separator();
 
         // Use a fixed-height frame so the content below doesn't jump
