@@ -1142,16 +1142,20 @@ impl VideoViewerApp {
     /// No-op when no reference is loaded — the menu still wires it but there
     /// is nothing to exchange.
     fn swap_reference_and_current(&mut self, ctx: &egui::Context) {
-        if self.reference_reader.is_none() {
-            self.status_info = Some("Swap requires a reference file.".to_string());
+        // No-op only when both slots are empty — there's literally nothing
+        // to move. Otherwise swap unconditionally; if one side is None the
+        // file just migrates over and the other side becomes empty.
+        if self.reader.is_none() && self.reference_reader.is_none() {
+            self.status_info = Some("Nothing to swap.".to_string());
             return;
         }
+        let was_ref_empty = self.reference_reader.is_none();
 
         std::mem::swap(&mut self.current_file, &mut self.reference_file);
         std::mem::swap(&mut self.reader, &mut self.reference_reader);
         std::mem::swap(&mut self.current_raw, &mut self.reference_raw);
         std::mem::swap(&mut self.current_rgb, &mut self.reference_rgb);
-        // The comparison view's textures must follow the file paths.
+        // The comparison view's images must follow the file paths.
         std::mem::swap(
             &mut self.comparison.ref_image,
             &mut self.comparison.current_image,
@@ -1159,11 +1163,13 @@ impl VideoViewerApp {
         // Diff/metric data is now stale — drop it so the next refresh recomputes.
         self.comparison.metric_image = None;
         self.comparison.metric_map = None;
+        self.comparison.diff_stats = None;
         self.prev_rgb = None;
 
         // Clamp the cursor against the new current's length, then re-decode the
         // current frame and resync the new reference. refresh_comparison reuploads
-        // textures + diff map.
+        // textures + diff map. When the new current is empty (reference slot
+        // was empty pre-swap), goto_frame is a graceful no-op.
         if let Some(ref reader) = self.reader {
             let total = reader.total_frames();
             if total > 0 && self.current_frame_idx >= total {
@@ -1174,6 +1180,12 @@ impl VideoViewerApp {
         self.goto_frame(ctx, idx);
         self.sync_reference_frame(ctx);
         self.refresh_comparison(ctx);
+
+        if was_ref_empty {
+            self.status_info = Some(
+                "Moved current to reference; current slot is now empty — drop a file or use File → Open.".to_string(),
+            );
+        }
     }
 
     /// Open the unified Guess Size dialog in no-hint mode.
