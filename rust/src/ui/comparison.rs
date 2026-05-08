@@ -11,6 +11,10 @@ pub enum ComparisonUiAction {
     OpenReference,
     Refresh,
     Close,
+    /// Swap the Reference and Current slots (file paths, readers, decoded
+    /// frames, textures). Useful when the user loaded the wrong file as
+    /// reference / current and wants to flip them.
+    Swap,
 }
 
 /// Pane role inside the comparison view. Used to gate drop-target behaviour and
@@ -232,6 +236,13 @@ impl ComparisonView {
             ui.separator();
             if ui.button("Open reference...").clicked() {
                 action = Some(ComparisonUiAction::OpenReference);
+            }
+            if ui
+                .button("Swap ⇄")
+                .on_hover_text("Swap the Reference and Current slots")
+                .clicked()
+            {
+                action = Some(ComparisonUiAction::Swap);
             }
             if ui.button("Refresh").clicked() {
                 action = Some(ComparisonUiAction::Refresh);

@@ -1116,6 +1116,48 @@ impl VideoViewerApp {
         Ok(())
     }
 
+    /// Swap the Reference and Current slots in-place. Exchanges file paths,
+    /// readers, decoded raw / RGB buffers, comparison textures, and clamps
+    /// `current_frame_idx` against the new current's frame count. Triggers a
+    /// fresh decode + comparison refresh so all panes reflect the swap.
+    ///
+    /// No-op when no reference is loaded — the menu still wires it but there
+    /// is nothing to exchange.
+    fn swap_reference_and_current(&mut self, ctx: &egui::Context) {
+        if self.reference_reader.is_none() {
+            self.status_info = Some("Swap requires a reference file.".to_string());
+            return;
+        }
+
+        std::mem::swap(&mut self.current_file, &mut self.reference_file);
+        std::mem::swap(&mut self.reader, &mut self.reference_reader);
+        std::mem::swap(&mut self.current_raw, &mut self.reference_raw);
+        std::mem::swap(&mut self.current_rgb, &mut self.reference_rgb);
+        // The comparison view's textures must follow the file paths.
+        std::mem::swap(
+            &mut self.comparison.ref_texture,
+            &mut self.comparison.current_texture,
+        );
+        // Diff/metric data is now stale — drop it so the next refresh recomputes.
+        self.comparison.metric_texture = None;
+        self.comparison.metric_map = None;
+        self.prev_rgb = None;
+
+        // Clamp the cursor against the new current's length, then re-decode the
+        // current frame and resync the new reference. refresh_comparison reuploads
+        // textures + diff map.
+        if let Some(ref reader) = self.reader {
+            let total = reader.total_frames();
+            if total > 0 && self.current_frame_idx >= total {
+                self.current_frame_idx = total - 1;
+            }
+        }
+        let idx = self.current_frame_idx;
+        self.goto_frame(ctx, idx);
+        self.sync_reference_frame(ctx);
+        self.refresh_comparison(ctx);
+    }
+
     /// Open the unified Guess Size dialog in no-hint mode.
     /// User may type a frame count inside to switch into hint mode.
     /// Used by both the View → Video Size menu and the status bar click.
@@ -2226,6 +2268,9 @@ impl eframe::App for VideoViewerApp {
                 }
                 ComparisonUiAction::Close => {
                     self.comparison.is_open = false;
+                }
+                ComparisonUiAction::Swap => {
+                    self.swap_reference_and_current(ctx);
                 }
             }
         }
