@@ -20,6 +20,15 @@ pub struct BlockStats {
     pub width: u32,
     /// Source image height in pixels.
     pub height: u32,
+    /// Whole-frame minimum luma (BT.709). 0 when image empty.
+    pub frame_min: f32,
+    /// Whole-frame maximum luma (BT.709). 0 when image empty.
+    pub frame_max: f32,
+    /// Whole-frame mean luma (BT.709). 0 when image empty.
+    pub frame_mean: f32,
+    /// Whole-frame luma variance, computed as E[Y²] − (E[Y])² over every
+    /// pixel (not the average of block variances). 0 when image empty.
+    pub frame_var: f32,
 }
 
 impl BlockStats {
@@ -32,6 +41,10 @@ impl BlockStats {
             vars: Vec::new(),
             width: 0,
             height: 0,
+            frame_min: 0.0,
+            frame_max: 0.0,
+            frame_mean: 0.0,
+            frame_var: 0.0,
         }
     }
 
@@ -75,6 +88,12 @@ pub fn compute_block_stats(
         return BlockStats::empty();
     }
 
+    // Whole-frame accumulators — computed in the same pass for free.
+    let mut frame_min = f64::INFINITY;
+    let mut frame_max = f64::NEG_INFINITY;
+    let mut frame_sum = 0.0_f64;
+    let mut frame_sum_sq = 0.0_f64;
+
     for y in 0..height {
         let by = y / bs;
         let row_off = (y as usize) * stride;
@@ -86,6 +105,10 @@ pub fn compute_block_stats(
             sum_y[bidx] += yv;
             sum_y2[bidx] += yv * yv;
             counts[bidx] += 1;
+            if yv < frame_min { frame_min = yv; }
+            if yv > frame_max { frame_max = yv; }
+            frame_sum += yv;
+            frame_sum_sq += yv * yv;
         }
     }
 
@@ -110,6 +133,16 @@ pub fn compute_block_stats(
         })
         .collect();
 
+    let n_pixels = (width as u64) * (height as u64);
+    let (frame_mean, frame_var, frame_min_out, frame_max_out) = if n_pixels == 0 {
+        (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32)
+    } else {
+        let n = n_pixels as f64;
+        let m = frame_sum / n;
+        let v = ((frame_sum_sq / n) - m * m).max(0.0);
+        (m as f32, v as f32, frame_min as f32, frame_max as f32)
+    };
+
     BlockStats {
         block_size: bs,
         cols,
@@ -118,6 +151,10 @@ pub fn compute_block_stats(
         vars,
         width,
         height,
+        frame_min: frame_min_out,
+        frame_max: frame_max_out,
+        frame_mean,
+        frame_var,
     }
 }
 
@@ -141,6 +178,41 @@ mod tests {
         assert_eq!(s.cols, 0);
         assert_eq!(s.rows, 0);
         assert!(s.means.is_empty());
+        // Frame-wide stats are zeros for an empty image.
+        assert_eq!(s.frame_min, 0.0);
+        assert_eq!(s.frame_max, 0.0);
+        assert_eq!(s.frame_mean, 0.0);
+        assert_eq!(s.frame_var, 0.0);
+    }
+
+    #[test]
+    fn frame_stats_match_uniform_image() {
+        let rgb = uniform(8, 8, 100, 100, 100);
+        let s = compute_block_stats(&rgb, 8, 8, 8);
+        // Achromatic 100 → BT.709 luma == 100.
+        assert!((s.frame_min - 100.0).abs() < 0.5);
+        assert!((s.frame_max - 100.0).abs() < 0.5);
+        assert!((s.frame_mean - 100.0).abs() < 0.5);
+        assert!(s.frame_var.abs() < 1e-3);
+    }
+
+    #[test]
+    fn frame_var_matches_two_value_split() {
+        // Half pixels at Y=0, half at Y=255 → variance = (255/2)² = 16256.25.
+        let mut rgb = vec![0u8; 16 * 8 * 3];
+        for y in 0..8 {
+            for x in 0..8 {
+                let p = (y * 16 + 8 + x) * 3;
+                rgb[p] = 255;
+                rgb[p + 1] = 255;
+                rgb[p + 2] = 255;
+            }
+        }
+        let s = compute_block_stats(&rgb, 16, 8, 8);
+        assert!((s.frame_min - 0.0).abs() < 0.5);
+        assert!((s.frame_max - 255.0).abs() < 0.5);
+        assert!((s.frame_mean - 127.5).abs() < 0.5);
+        assert!((s.frame_var - 16256.25).abs() < 5.0, "frame_var={}", s.frame_var);
     }
 
     #[test]

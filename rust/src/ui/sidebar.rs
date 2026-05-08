@@ -714,7 +714,7 @@ impl Sidebar {
         let gap = 8.0_f32;
         let pane_w = ((avail.x - gap) * 0.5 - 4.0).max(120.0);
         let pane_h_raw = (pane_w / aspect).max(80.0);
-        let pane_h = pane_h_raw.min(avail.y - 60.0);
+        let pane_h = pane_h_raw.min(avail.y - 100.0);
         let pane_w = (pane_h * aspect).min(pane_w);
         let display_size = egui::vec2(pane_w, pane_h);
 
@@ -729,22 +729,180 @@ impl Sidebar {
             egui::TextureOptions::NEAREST,
         );
 
+        let var_summary = aggregate_block_stats(&stats.vars);
+
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 ui.label(egui::RichText::new("Mean (Y)").strong());
-                ui.image((mean_handle.id(), display_size));
+                Self::draw_block_pane(
+                    ui,
+                    mean_handle.id(),
+                    display_size,
+                    stats.cols,
+                    stats.rows,
+                    &stats.means,
+                    "block_mean_pane",
+                    |v| format!("{:.0}", v),
+                    |v| {
+                        // Pick a contrasting text colour against greyscale fill.
+                        if v.clamp(0.0, 255.0) > 140.0 {
+                            egui::Color32::BLACK
+                        } else {
+                            egui::Color32::WHITE
+                        }
+                    },
+                );
+                // Whole-frame luma stats: min, max, average, variance.
+                // (Not the average-of-block-means; computed pixel-wise.)
+                ui.label(egui::RichText::new(format!(
+                    "frame  min {:.1}  max {:.1}  avg {:.1}  var {:.1}",
+                    stats.frame_min, stats.frame_max,
+                    stats.frame_mean, stats.frame_var
+                )).monospace().small());
             });
             ui.add_space(gap);
             ui.vertical(|ui| {
                 ui.label(egui::RichText::new("Variance (Y)").strong());
-                ui.image((var_handle.id(), display_size));
+                Self::draw_block_pane(
+                    ui,
+                    var_handle.id(),
+                    display_size,
+                    stats.cols,
+                    stats.rows,
+                    &stats.vars,
+                    "block_var_pane",
+                    |v| {
+                        // Variance can grow large; truncate to fit a small cell.
+                        if v >= 9999.5 {
+                            format!("{:.0}k", v / 1000.0)
+                        } else {
+                            format!("{:.0}", v)
+                        }
+                    },
+                    |v| {
+                        // Heatmap goes blue→green→yellow; black text reads on
+                        // the brighter (green/yellow) end.
+                        let t = (v / max_var).clamp(0.0, 1.0);
+                        if t > 0.45 {
+                            egui::Color32::BLACK
+                        } else {
+                            egui::Color32::WHITE
+                        }
+                    },
+                );
+                ui.label(egui::RichText::new(format!(
+                    "min {:.1}  max {:.1}  avg {:.1}",
+                    var_summary.min, var_summary.max, var_summary.avg
+                )).monospace().small());
             });
         });
         ui.add_space(4.0);
         ui.weak(format!(
-            "{} × {} blocks of {}px each. Mean: greyscale, brighter = brighter block. Variance: dark-blue → green → yellow as variance grows; max var = {:.0}.",
+            "{} × {} blocks of {}px each. Hover any block to see its value; numeric overlays appear when each block is large enough to fit text. Variance heatmap range: 0 → {:.0}.",
             stats.cols, stats.rows, stats.block_size, max_var,
         ));
+    }
+
+    /// Render one of the two block heatmap panes: the texture, an optional
+    /// per-block numeric overlay (when each block is wide enough), and a
+    /// hover tooltip showing the value at the cursor.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_block_pane<L, C>(
+        ui: &mut egui::Ui,
+        texture_id: egui::TextureId,
+        display_size: egui::Vec2,
+        cols: u32,
+        rows: u32,
+        values: &[f32],
+        id_salt: &str,
+        label_for: L,
+        text_color_for: C,
+    ) where
+        L: Fn(f32) -> String,
+        C: Fn(f32) -> egui::Color32,
+    {
+        let _ = id_salt; // reserved for future use (e.g. independent tooltips)
+        let (rect, response) = ui.allocate_exact_size(display_size, egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        // Solid background so empty cells (none here) and out-of-image area
+        // show as the panel's neutral colour.
+        painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+        painter.image(
+            texture_id,
+            rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        let cell_w = rect.width() / cols as f32;
+        let cell_h = rect.height() / rows as f32;
+        // Show numeric overlay only when each cell can fit roughly two digits
+        // — anything tighter is unreadable.
+        let overlay_threshold = 22.0_f32;
+        if cell_w >= overlay_threshold && cell_h >= overlay_threshold {
+            let font_size = (cell_h.min(cell_w) * 0.45).clamp(8.0, 16.0);
+            let font = egui::FontId::monospace(font_size);
+            for r in 0..rows {
+                for c in 0..cols {
+                    let idx = (r * cols + c) as usize;
+                    let v = values.get(idx).copied().unwrap_or(0.0);
+                    let cx = rect.min.x + (c as f32 + 0.5) * cell_w;
+                    let cy = rect.min.y + (r as f32 + 0.5) * cell_h;
+                    painter.text(
+                        egui::pos2(cx, cy),
+                        egui::Align2::CENTER_CENTER,
+                        label_for(v),
+                        font.clone(),
+                        text_color_for(v),
+                    );
+                }
+            }
+        }
+
+        // Hover tooltip: map cursor → block index → value.
+        if let Some(pos) = response.hover_pos() {
+            let rx = ((pos.x - rect.min.x) / cell_w).floor() as i32;
+            let ry = ((pos.y - rect.min.y) / cell_h).floor() as i32;
+            if rx >= 0 && ry >= 0 && (rx as u32) < cols && (ry as u32) < rows {
+                let idx = (ry as u32 * cols + rx as u32) as usize;
+                if let Some(&v) = values.get(idx) {
+                    response.on_hover_text(format!(
+                        "block ({}, {})  value: {}",
+                        rx, ry,
+                        label_for(v),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Min / max / mean summary for a block-statistic vector.
+struct BlockSummary {
+    min: f32,
+    max: f32,
+    avg: f32,
+}
+
+fn aggregate_block_stats(values: &[f32]) -> BlockSummary {
+    if values.is_empty() {
+        return BlockSummary { min: 0.0, max: 0.0, avg: 0.0 };
+    }
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut sum = 0.0_f64;
+    for &v in values {
+        if v < min { min = v; }
+        if v > max { max = v; }
+        sum += v as f64;
+    }
+    BlockSummary {
+        min,
+        max,
+        avg: (sum / values.len() as f64) as f32,
     }
 }
 
