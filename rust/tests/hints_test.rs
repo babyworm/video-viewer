@@ -278,3 +278,121 @@ fn test_guess_no_hint_odd_size_yields_no_yuv_candidates() {
     let cands = guess_all_resolutions_no_hint(7);
     assert!(cands.is_empty(), "expected empty for prime-sized tiny file: {:?}", cands);
 }
+
+// --- Raw V4L2 FourCC support in filename hints (new in this change) ---
+
+#[test]
+fn test_4cc_yv12_in_filename() {
+    let hints = parse_filename_hints("video_YV12_1920x1080.yuv");
+    assert_eq!(hints.width, Some(1920));
+    assert_eq!(hints.height, Some(1080));
+    assert_eq!(hints.format, Some("YV12".to_string()));
+}
+
+#[test]
+fn test_4cc_nv12_uppercase() {
+    let hints = parse_filename_hints("clip_NV12_1080p.raw");
+    assert_eq!(hints.format, Some("NV12".to_string()));
+}
+
+#[test]
+fn test_4cc_yuyv_mixed_with_resolution() {
+    let hints = parse_filename_hints("foreman_720p_YUYV.yuv");
+    assert_eq!(hints.width, Some(1280));
+    assert_eq!(hints.height, Some(720));
+    assert_eq!(hints.format, Some("YUYV".to_string()));
+}
+
+#[test]
+fn test_4cc_p010() {
+    let hints = parse_filename_hints("test_P010_1920x1080_10bit.yuv");
+    assert_eq!(hints.format, Some("P010".to_string()));
+    assert_eq!(hints.bit_depth, Some(10));
+}
+
+#[test]
+fn test_4cc_bayer_rggb10_packed() {
+    let hints = parse_filename_hints("sensor_pRAA_1920x1080_10bit.raw");
+    assert_eq!(hints.format, Some("pRAA".to_string()));
+}
+
+#[test]
+fn test_4cc_grey_y10bpack() {
+    let hints = parse_filename_hints("thermal_Y10B_640x512.yuv");
+    // "Y10B" is both a valid fourcc and has a friendly alias pointing to the long name.
+    // Either is acceptable downstream.
+    let fmt = hints.format.as_deref().unwrap();
+    assert!(
+        fmt == "Y10B" || fmt == "Greyscale (10-bit BE packed)",
+        "unexpected format for Y10B 4CC: {fmt}"
+    );
+}
+
+#[test]
+fn test_4cc_case_insensitive_mixed() {
+    // Even if someone writes nv12 in lowercase, the friendly alias still catches it.
+    // Uppercase 4CC should also work.
+    let hints1 = parse_filename_hints("file_nv12.yuv");
+    let hints2 = parse_filename_hints("file_NV12.yuv");
+    assert_eq!(hints1.format, Some("NV12".to_string()));
+    assert_eq!(hints2.format, Some("NV12".to_string()));
+}
+
+#[test]
+fn test_4cc_unknown_fourcc_is_ignored() {
+    // Random 4-letter uppercase string that is not a registered format
+    let hints = parse_filename_hints("mystery_ABCD_1920x1080.yuv");
+    assert!(hints.format.is_none(), "unknown 4CC-like token must not set format");
+}
+
+// --- resolve_raw_params: with FourCC vs without (guessing) ---
+
+#[test]
+fn test_resolve_with_fourcc_prefers_fourcc_over_default() {
+    // Filename carries a 4CC (YUYV). Even if default is I420 and file size matches something else,
+    // the 4CC in the name must win for the format.
+    let size = 1920u64 * 1080 * 2; // matches 1080p YUYV (2 bytes per pixel)
+    let r = resolve_raw_params("capture_YUYV_1920x1080.yuv", Some(size), 640, 480, "I420");
+    assert_eq!(r.width, 1920);
+    assert_eq!(r.height, 1080);
+    assert_eq!(r.format, "YUYV"); // 4CC wins
+    assert!(r.info.is_none());
+}
+
+#[test]
+fn test_resolve_without_fourcc_or_alias_uses_famous_format_first_i420() {
+    // No format/4CC/alias in filename, no WxH.
+    // File size exactly matches one 1080p I420 frame.
+    // Should guess the famous format first (I420 is first in GUESS_FORMATS).
+    let size = 1920u64 * 1080 * 3 / 2; // exactly 1 frame of 1080p I420
+    let r = resolve_raw_params("unknown_raw_video.yuv", Some(size), 100, 100, "I420");
+    assert_eq!(r.width, 1920);
+    assert_eq!(r.height, 1080);
+    assert_eq!(r.format, "I420"); // famous format first
+    assert!(r.info.is_some()); // file-size guess message
+}
+
+#[test]
+fn test_resolve_without_fourcc_size_guess_from_disk_prefers_i420() {
+    // No name hints at all (no WxH, no format token).
+    // File size matches 10 frames of VGA I420.
+    // resolve must use file-size guessing and pick I420 (famous) first.
+    let size = 640u64 * 480 * 3 / 2 * 10;
+    let r = resolve_raw_params("raw_capture.yuv", Some(size), 1920, 1080, "NV12");
+    assert_eq!(r.width, 640);
+    assert_eq!(r.height, 480);
+    assert_eq!(r.format, "I420"); // I420 is first in the guess list, even if caller default was NV12
+    assert!(r.info.is_some());
+}
+
+#[test]
+fn test_resolve_with_fourcc_and_file_size_guess() {
+    // 4CC present (NV12), no WxH in name, but file size allows resolution guessing.
+    // 4CC must be used for format; size comes from disk guess.
+    let size = 1920u64 * 1080 * 3 / 2 * 5; // 5 frames of 1080p NV12/I420 (same size)
+    let r = resolve_raw_params("security_cam_NV12.yuv", Some(size), 100, 100, "I420");
+    assert_eq!(r.width, 1920);
+    assert_eq!(r.height, 1080);
+    assert_eq!(r.format, "NV12"); // 4CC from filename wins
+    assert!(r.info.is_some());
+}

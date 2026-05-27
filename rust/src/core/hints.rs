@@ -469,12 +469,36 @@ pub fn parse_filename_hints(filename: &str) -> FilenameHints {
     }
 
     // --- Format ---
-    let tokens = split_tokens(name_no_ext);
+    // We use both lowercased tokens (for friendly aliases) and original-case tokens
+    // (important for FourCCs that use mixed case like "pRAA").
+    let lower_tokens = split_tokens(name_no_ext);
+    let orig_tokens = split_tokens(basename_no_ext); // original case, no ext
     let aliases = format_aliases();
-    for token in &tokens {
+
+    let mut format_set = false;
+    for token in lower_tokens.iter().chain(orig_tokens.iter()) {
+        if format_set {
+            break;
+        }
         if let Some(&fmt) = aliases.get(*token) {
             hints.format = Some(fmt.to_string());
-            break;
+            format_set = true;
+            continue;
+        }
+        // NEW: Support raw V4L2 FourCC codes in filenames (e.g. YV12, NV12, YUYV, P010, RGGB, pRAA, ...)
+        // We deliberately use get_format_by_fourcc (exact fourcc match) to avoid matching
+        // human-readable names (e.g. "Greyscale (10-bit BE packed)").
+        let fourcc_candidates = [
+            token.to_string(),
+            token.to_uppercase(),
+            token.to_lowercase(),
+        ];
+        for cand in &fourcc_candidates {
+            if let Some(fmt) = crate::core::formats::get_format_by_fourcc(cand) {
+                hints.format = Some(fmt.fourcc.clone());
+                format_set = true;
+                break;
+            }
         }
     }
 
