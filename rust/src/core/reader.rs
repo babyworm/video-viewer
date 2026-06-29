@@ -6,7 +6,7 @@ use std::fs::File;
 use crate::core::cache::FrameCache;
 use crate::core::formats::{VideoFormat, FormatType, get_format_by_name};
 use crate::core::hints::parse_filename_hints;
-use crate::core::ppm::parse_ppm_header;
+use crate::core::ppm::decode_ppm_to_rgb;
 use crate::core::y4m::{parse_y4m_header, build_frame_offsets};
 
 /// Image file extensions decodable by the `image` crate.
@@ -57,6 +57,8 @@ pub struct VideoReader {
     is_y4m: bool,
     /// File paths for image sequences (PNG, etc.). Empty for non-sequence files.
     image_paths: Vec<PathBuf>,
+    /// File paths for one-frame raw sequences. Empty for non-sequence files.
+    raw_paths: Vec<PathBuf>,
     /// Interlace mode from Y4M header ("progressive", "tff", "bff", or "").
     interlace: String,
     /// For image sequences: the frame index of the originally opened file.
@@ -86,11 +88,12 @@ impl VideoReader {
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
-        let is_image = is_image_ext(&ext);
+        let is_image = is_image_ext(&ext) || ext == "ppm";
 
         let mut frame_offsets: Vec<usize> = Vec::new();
         let mut y4m_fps: Option<f64> = None;
         let mut image_paths: Vec<PathBuf> = Vec::new();
+        let mut raw_paths: Vec<PathBuf> = Vec::new();
         let mut interlace = String::new();
         let mut is_y4m = false;
         let mut initial_frame: usize = 0;
@@ -102,16 +105,16 @@ impl VideoReader {
 
         if is_image {
             // --------------------------------------------------------------
-            // 2i. Image path (PNG, BMP, JPG, etc.) — decode via image crate,
+            // 2i. Still-image path (PNG, PPM, etc.) — decode to RGB24,
             //     detect numbered sequences. Skip mmap — image crate reads
-            //     the file directly.
+            //     most image files directly.
             // --------------------------------------------------------------
             let p = Path::new(path);
-            let (seq, selected_idx) = detect_image_sequence(p);
+            let (seq, selected_idx) = detect_numbered_sequence(p);
 
             // Decode the selected image for dimensions (not always seq[0],
             // since the user may have opened a middle frame).
-            let (rgb_data, img_w, img_h) = decode_image_to_rgb(&seq[selected_idx])?;
+            let (rgb_data, img_w, img_h) = decode_still_to_rgb(&seq[selected_idx])?;
             width = img_w;
             height = img_h;
             format = get_format_by_name("RGB24")
@@ -151,20 +154,22 @@ impl VideoReader {
 
         let raw = raw_data.as_slice();
         is_y4m = ext == "y4m" || raw.starts_with(b"YUV4MPEG2");
-        let is_ppm = ext == "ppm" || raw.starts_with(b"P6");
+        let is_ppm = ext == "ppm" || raw.starts_with(b"P3") || raw.starts_with(b"P6");
+        let mut decoded_ppm = None;
 
         if is_ppm {
             // --------------------------------------------------------------
-            // 3p. PPM path — parse header, treat as single-frame RGB24.
+            // 3p. PPM path — decode P3/P6 as single-frame RGB24.
             // --------------------------------------------------------------
-            let header = parse_ppm_header(raw)?;
+            let (header, rgb_data) = decode_ppm_to_rgb(raw)?;
             width = header.width;
             height = header.height;
             format = get_format_by_name("RGB24")
                 .ok_or_else(|| "RGB24 format not found".to_string())?;
             frame_size = format.frame_size(width, height);
-            frame_offsets.push(header.data_offset);
+            frame_offsets.push(0);
             total_frames = 1;
+            decoded_ppm = Some(rgb_data);
         } else if is_y4m {
             // --------------------------------------------------------------
             // 3a. Y4M path — parse header, build offset table.
@@ -219,10 +224,26 @@ impl VideoReader {
             if frame_size == 0 {
                 return Err(format!("frame_size is 0 for format '{}'", format.name));
             }
-            total_frames = raw.len() / frame_size;
+
+            let complete_frames = raw.len() / frame_size;
+            if complete_frames == 0 {
+                return Err(format!(
+                    "Raw file contains no complete frame: file size {} < frame size {}",
+                    raw.len(),
+                    frame_size
+                ));
+            }
+            let (seq, selected_idx) = detect_numbered_sequence(Path::new(path));
+            if seq.len() > 1 && complete_frames == 1 {
+                initial_frame = selected_idx;
+                raw_paths = seq;
+                total_frames = raw_paths.len();
+            } else {
+                total_frames = complete_frames;
+            }
         }
 
-        data = raw_data;
+        data = decoded_ppm.map(FileData::Heap).unwrap_or(raw_data);
         } // end of else (non-image)
 
         let mut reader = VideoReader {
@@ -238,12 +259,13 @@ impl VideoReader {
             color_matrix: color_matrix.to_string(),
             is_y4m,
             image_paths,
+            raw_paths,
             interlace,
             initial_frame,
         };
 
-        // Pre-cache the initially decoded frame for image sequences.
-        if !reader.image_paths.is_empty() {
+        // Pre-cache the initially loaded frame for numbered file sequences.
+        if !reader.image_paths.is_empty() || !reader.raw_paths.is_empty() {
             let decoded = reader.data.as_slice();
             if decoded.len() >= reader.frame_size {
                 reader.cache.put(reader.initial_frame, decoded[..reader.frame_size].to_vec());
@@ -287,7 +309,7 @@ impl VideoReader {
         // Image sequence: decode from individual file.
         if !self.image_paths.is_empty() {
             let path = &self.image_paths[idx];
-            let (rgb_data, dec_w, dec_h) = decode_image_to_rgb(path)?;
+            let (rgb_data, dec_w, dec_h) = decode_still_to_rgb(path)?;
             if dec_w != self.width || dec_h != self.height {
                 return Err(format!(
                     "Frame {idx} has dimensions {dec_w}x{dec_h}, expected {}x{}",
@@ -296,6 +318,24 @@ impl VideoReader {
             }
             self.cache.put(idx, rgb_data.clone());
             return Ok(rgb_data);
+        }
+
+        // One-frame raw sequence: read the selected frame file directly.
+        if !self.raw_paths.is_empty() {
+            let path = &self.raw_paths[idx];
+            let raw = std::fs::read(path)
+                .map_err(|e| format!("Cannot read '{}': {}", path.display(), e))?;
+            if raw.len() < self.frame_size {
+                return Err(format!(
+                    "Frame {idx}: file '{}' is too short: {} < {}",
+                    path.display(),
+                    raw.len(),
+                    self.frame_size
+                ));
+            }
+            let frame_data = raw[..self.frame_size].to_vec();
+            self.cache.put(idx, frame_data.clone());
+            return Ok(frame_data);
         }
 
         // Determine byte offset.
@@ -467,6 +507,20 @@ impl VideoReader {
             // ----------------------------------------------------------
             FormatType::Grey if self.format.bit_depth > 8 => {
                 Ok(colorspace::grey_highbit_to_rgb(raw, w, h, self.format.bit_depth))
+            }
+
+            // ----------------------------------------------------------
+            // Bayer — demosaic to RGB24.
+            // ----------------------------------------------------------
+            FormatType::Bayer if self.format.bit_depth == 8 => {
+                crate::conversion::converter::bayer_to_rgb24(
+                    raw, self.width, self.height, self.format,
+                )
+            }
+            FormatType::Bayer => {
+                crate::conversion::converter::bayer_highbit_to_rgb24(
+                    raw, self.width, self.height, self.format,
+                )
             }
 
             // ----------------------------------------------------------
@@ -734,13 +788,29 @@ fn decode_image_to_rgb(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
     Ok((rgb.into_raw(), w, h))
 }
 
-/// Detect numbered image sequence from a single file path.
+fn decode_still_to_rgb(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if ext == "ppm" {
+        let data = std::fs::read(path)
+            .map_err(|e| format!("Cannot read '{}': {}", path.display(), e))?;
+        let (header, rgb) = decode_ppm_to_rgb(&data)
+            .map_err(|e| format!("Cannot decode '{}': {e}", path.display()))?;
+        Ok((rgb, header.width, header.height))
+    } else {
+        decode_image_to_rgb(path)
+    }
+}
+
+/// Detect numbered sequence from a single file path.
 ///
-/// Given `frame_0042.png`, finds all `frame_NNNN.png` in the same directory
-/// and returns `(sorted_paths, selected_index)` where `selected_index` is
-/// the position of `path` in the sorted list. Returns a single-element vec
-/// with index 0 if no sequence pattern is found.
-fn detect_image_sequence(path: &Path) -> (Vec<PathBuf>, usize) {
+/// Given `frame_0042.png` or `raw_RG12_000_00.ppm`, finds matching numbered
+/// files in the same directory and returns `(sorted_paths, selected_index)`.
+/// Returns a single-element vec with index 0 if no sequence pattern is found.
+fn detect_numbered_sequence(path: &Path) -> (Vec<PathBuf>, usize) {
     let single = || (vec![path.to_path_buf()], 0usize);
 
     let dir = match path.parent() {
@@ -756,18 +826,13 @@ fn detect_image_sequence(path: &Path) -> (Vec<PathBuf>, usize) {
         None => return single(),
     };
 
-    // Find trailing digits in the stem (e.g. "frame_0042" → prefix="frame_", digits=4)
-    let digit_count = stem.chars().rev().take_while(|c| c.is_ascii_digit()).count();
-    if digit_count == 0 || digit_count == stem.len() {
-        // No digits, or stem is entirely digits (e.g. "0042.png") — skip sequence detection
-        // to avoid matching unrelated numbered files in the same directory.
-        return single();
-    }
-
-    let prefix = &stem[..stem.len() - digit_count];
+    let pattern = match sequence_pattern(stem) {
+        Some(pattern) => pattern,
+        None => return single(),
+    };
 
     // Collect matching files in the directory
-    let mut numbered: Vec<(u64, PathBuf)> = Vec::new();
+    let mut numbered: Vec<(Vec<u64>, PathBuf)> = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
@@ -794,20 +859,12 @@ fn detect_image_sequence(path: &Path) -> (Vec<PathBuf>, usize) {
                 None => continue,
             };
 
-            if !entry_stem.starts_with(prefix) {
-                continue;
-            }
-            let suffix = &entry_stem[prefix.len()..];
-            if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
-                continue;
-            }
-
-            if let Ok(num) = suffix.parse::<u64>() {
-                numbered.push((num, entry_path));
+            if let Some(key) = sequence_key(&entry_stem, &pattern) {
+                numbered.push((key, entry_path));
             }
         }
 
-    numbered.sort_by_key(|(num, _)| *num);
+    numbered.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     if numbered.is_empty() {
         single()
     } else {
@@ -818,6 +875,70 @@ fn detect_image_sequence(path: &Path) -> (Vec<PathBuf>, usize) {
         }).unwrap_or(0);
         (paths, selected)
     }
+}
+
+enum SequencePattern {
+    UnderscoreSuffix { prefix: String, parts: usize },
+    TrailingDigits { prefix: String },
+}
+
+fn sequence_pattern(stem: &str) -> Option<SequencePattern> {
+    if stem.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if let Some(pattern) = underscore_suffix_pattern(stem) {
+        return Some(pattern);
+    }
+
+    let digit_count = stem.chars().rev().take_while(|c| c.is_ascii_digit()).count();
+    if digit_count == 0 || digit_count == stem.len() {
+        return None;
+    }
+    Some(SequencePattern::TrailingDigits {
+        prefix: stem[..stem.len() - digit_count].to_string(),
+    })
+}
+
+fn underscore_suffix_pattern(stem: &str) -> Option<SequencePattern> {
+    let parts: Vec<&str> = stem.split('_').collect();
+    let suffix_parts = parts
+        .iter()
+        .rev()
+        .take_while(|part| is_number_part(part))
+        .count();
+    if suffix_parts == 0 || suffix_parts == parts.len() {
+        return None;
+    }
+    Some(SequencePattern::UnderscoreSuffix {
+        prefix: parts[..parts.len() - suffix_parts].join("_"),
+        parts: suffix_parts,
+    })
+}
+
+fn sequence_key(stem: &str, pattern: &SequencePattern) -> Option<Vec<u64>> {
+    match pattern {
+        SequencePattern::UnderscoreSuffix { prefix, parts } => {
+            let split: Vec<&str> = stem.split('_').collect();
+            if split.len() <= *parts || split[..split.len() - parts].join("_") != *prefix {
+                return None;
+            }
+            split[split.len() - parts..]
+                .iter()
+                .map(|part| part.parse::<u64>().ok())
+                .collect()
+        }
+        SequencePattern::TrailingDigits { prefix } => {
+            let suffix = stem.strip_prefix(prefix)?;
+            if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            Some(vec![suffix.parse::<u64>().ok()?])
+        }
+    }
+}
+
+fn is_number_part(part: &&str) -> bool {
+    !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())
 }
 
 // ---------------------------------------------------------------------------

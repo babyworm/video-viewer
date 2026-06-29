@@ -17,6 +17,37 @@ use crate::ui::toolbar::{Toolbar, ToolbarAction, colorize_channel};
 /// Tagged scene detection output: (job_id, Ok(changes) | Err(message)).
 type SceneDetectOutput = Arc<std::sync::Mutex<Option<(usize, Result<Vec<usize>, String>)>>>;
 
+const ZOOM_PRESETS: &[(f32, &str)] = &[
+    (0.5, "50%"),
+    (1.0, "100%"),
+    (2.0, "200%"),
+    (4.0, "400%"),
+    (8.0, "800%"),
+];
+
+fn zoom_label(zoom: f32) -> String {
+    format!("{:.0}%", zoom * 100.0)
+}
+
+fn parse_zoom_input(input: &str) -> Option<f32> {
+    let value = input.trim().to_lowercase();
+    if value.is_empty() {
+        return None;
+    }
+
+    let parsed = if let Some(percent) = value.strip_suffix('%') {
+        percent.trim().parse::<f32>().ok()? / 100.0
+    } else if let Some(times) = value.strip_suffix('x') {
+        times.trim().parse::<f32>().ok()?
+    } else if let Some(ratio) = value.strip_suffix(":1") {
+        ratio.trim().parse::<f32>().ok()?
+    } else {
+        value.parse::<f32>().ok()? / 100.0
+    };
+
+    parsed.is_finite().then_some(parsed.clamp(0.1, 50.0))
+}
+
 fn matching_reference_frame_idx(
     current_frame_idx: usize,
     reference_total_frames: usize,
@@ -30,7 +61,21 @@ fn matching_reference_frame_idx(
 
 #[cfg(test)]
 mod tests {
-    use super::matching_reference_frame_idx;
+    use super::{matching_reference_frame_idx, parse_zoom_input, zoom_label};
+
+    #[test]
+    fn zoom_label_formats_percent() {
+        assert_eq!(zoom_label(1.0), "100%");
+        assert_eq!(zoom_label(4.0), "400%");
+    }
+
+    #[test]
+    fn parse_zoom_input_accepts_percent_and_ratio_forms() {
+        assert_eq!(parse_zoom_input("100"), Some(1.0));
+        assert_eq!(parse_zoom_input("200%"), Some(2.0));
+        assert_eq!(parse_zoom_input("4x"), Some(4.0));
+        assert_eq!(parse_zoom_input("2:1"), Some(2.0));
+    }
 
     #[test]
     fn comparison_reference_frame_tracks_current_frame() {
@@ -111,6 +156,8 @@ pub struct VideoViewerApp {
     batch_convert_dialog: Option<dialogs::BatchConvertDialog>,
     show_shortcuts: bool,
     show_about: bool,
+    show_zoom_dialog: bool,
+    zoom_input: String,
     /// Timestamps of actual YUV frame changes for playback FPS calculation.
     playback_frame_times: VecDeque<Instant>,
     playback_fps: f64,
@@ -227,6 +274,8 @@ impl VideoViewerApp {
             batch_convert_dialog: None,
             show_shortcuts: false,
             show_about: false,
+            show_zoom_dialog: false,
+            zoom_input: "100%".to_string(),
             playback_frame_times: VecDeque::new(),
             playback_fps: 0.0,
             auto_fit: true,
@@ -826,13 +875,39 @@ impl VideoViewerApp {
             AnalysisTab::Block => {
                 let (block_size, metric) = {
                     let s = self.sidebar.analysis.lock();
-                    (s.block_size.max(4), s.block_metric)
+                    (s.block_size.max(crate::analysis::block_stats::MIN_BLOCK_SIZE), s.block_metric)
                 };
                 let stats = crate::analysis::block_stats::compute_block_stats(
                     rgb, w, h, block_size, metric,
                 );
                 let mut shared = self.sidebar.analysis.lock();
                 shared.block_stats = Some(stats);
+                shared.generation += 1;
+            }
+            AnalysisTab::Motion => {
+                let (block_size, metric, method, thresholds) = {
+                    let s = self.sidebar.analysis.lock();
+                    (
+                        s.block_size.max(crate::analysis::block_stats::MIN_BLOCK_SIZE),
+                        s.block_metric,
+                        s.motion_method,
+                        s.motion_thresholds,
+                    )
+                };
+                // Motion compares against the previous sequential frame. When
+                // there is no valid previous frame (first frame, or after a
+                // non-sequential jump) we store an empty result so the tab can
+                // explain why instead of showing stale data.
+                let stats = match &self.prev_rgb {
+                    Some(prev) if prev.len() == rgb.len() => {
+                        crate::analysis::motion::compute_motion_stats(
+                            prev, rgb, w, h, block_size, metric, method, thresholds,
+                        )
+                    }
+                    _ => crate::analysis::motion::MotionStats::empty(),
+                };
+                let mut shared = self.sidebar.analysis.lock();
+                shared.motion_stats = Some(stats);
                 shared.generation += 1;
             }
             AnalysisTab::IspSideband => {
@@ -1201,6 +1276,59 @@ impl VideoViewerApp {
         }
         self.guess_size_dialog = Some(dialogs::GuessSizeDialog::new_no_hint(file_size));
         self.dialog_state = DialogState::GuessSize;
+    }
+
+    fn set_zoom(&mut self, zoom: f32) {
+        self.canvas.zoom = zoom.clamp(0.1, 50.0);
+        self.auto_fit = false;
+        self.zoom_input = zoom_label(self.canvas.zoom);
+    }
+
+    fn show_zoom_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_zoom_dialog {
+            return;
+        }
+
+        let mut open = true;
+        let mut close = false;
+        let mut apply_input = false;
+        egui::Window::new("Zoom")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    for &(zoom, label) in ZOOM_PRESETS {
+                        if ui.button(label).clicked() {
+                            self.set_zoom(zoom);
+                            close = true;
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Zoom:");
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.zoom_input)
+                            .desired_width(72.0),
+                    );
+                    if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        apply_input = true;
+                    }
+                    if ui.button("Apply").clicked() {
+                        apply_input = true;
+                    }
+                });
+                if apply_input {
+                    if let Some(zoom) = parse_zoom_input(&self.zoom_input) {
+                        self.set_zoom(zoom);
+                        close = true;
+                    } else {
+                        ui.colored_label(egui::Color32::RED, "Invalid zoom");
+                    }
+                }
+            });
+
+        self.show_zoom_dialog = open && !close;
     }
 
     pub fn unload_sideband(&mut self) {
@@ -2062,9 +2190,17 @@ impl eframe::App for VideoViewerApp {
                     ).on_hover_text("Click to change video parameters").clicked() {
                         status_params_clicked = true;
                     }
+                    ui.label("|");
+                    let zoom_text = zoom_label(self.canvas.zoom_level());
+                    if ui.add(
+                        egui::Button::new(egui::RichText::new(zoom_text).monospace())
+                            .frame(false)
+                    ).on_hover_text("Zoom").clicked() {
+                        self.zoom_input = zoom_label(self.canvas.zoom_level());
+                        self.show_zoom_dialog = true;
+                    }
                     ui.label(format!(
-                        "|  {:.0}%  |  Frame {}/{}  |  {:.1} fps",
-                        self.canvas.zoom_level() * 100.0,
+                        "|  Frame {}/{}  |  {:.1} fps",
                         self.current_frame_idx,
                         r.total_frames().saturating_sub(1),
                         self.playback_fps,
@@ -2090,6 +2226,7 @@ impl eframe::App for VideoViewerApp {
         if status_params_clicked {
             self.open_guess_size_dialog();
         }
+        self.show_zoom_dialog(ctx);
 
         // --- Navigation bar (declared second → sits at bottom edge) ---
         let total = self.total_frames();

@@ -1,5 +1,6 @@
 //! Tests for 10-bit (and higher) video format support.
 
+use std::fs::File;
 use std::io::Write;
 use tempfile::NamedTempFile;
 use video_viewer::core::colorspace::*;
@@ -63,6 +64,22 @@ fn make_grey10_frame(w: usize, h: usize, val: u16) -> Vec<u8> {
     let mut data = Vec::new();
     for _ in 0..(w * h) {
         data.extend_from_slice(&val.to_le_bytes());
+    }
+    data
+}
+
+/// Build an unpacked Bayer RG12 frame (LSB-aligned in u16 LE).
+fn make_bayer12_frame(w: usize, h: usize) -> Vec<u8> {
+    let mut data = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let val = match (y % 2, x % 2) {
+                (0, 0) => 4095, // R
+                (0, 1) | (1, 0) => 2048, // G
+                _ => 1024, // B
+            };
+            data.extend_from_slice(&(val as u16).to_le_bytes());
+        }
     }
     data
 }
@@ -326,6 +343,30 @@ fn test_reader_grey10_convert() {
     for i in 0..(w * h) as usize {
         assert_eq!(rgb[i * 3], 128, "grey pixel {i}");
     }
+}
+
+#[test]
+fn test_reader_infers_and_converts_rg12_bayer_raw() {
+    let w = 16u32;
+    let h = 16u32;
+    let frame = make_bayer12_frame(w as usize, h as usize);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Test_raw_16X16_RG12_000.raw");
+    let mut file = File::create(&path).unwrap();
+    file.write_all(&frame).unwrap();
+    file.flush().unwrap();
+
+    let mut reader = VideoReader::open(path.to_str().unwrap(), 0, 0, "", "BT.601")
+        .expect("open RG12 raw should infer width, height, and format");
+
+    assert_eq!(reader.width(), w);
+    assert_eq!(reader.height(), h);
+    assert_eq!(reader.total_frames(), 1);
+    let raw = reader.seek_frame(0).expect("seek RG12 frame");
+    let rgb = reader.convert_to_rgb(&raw).expect("RG12 Bayer convert_to_rgb");
+    assert_eq!(rgb.len(), (w * h * 3) as usize);
+    assert!(rgb[0] > rgb[1], "top-left RGGB pixel should preserve strong red sample");
+    assert!(rgb[1] > rgb[2], "top-left RGGB pixel should interpolate green above blue");
 }
 
 // ============================================================

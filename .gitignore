@@ -2,6 +2,9 @@
 /rust/target/
 *.rs.bk
 
+# Build artifacts (release binaries produced by scripts/build_windows_release.sh)
+/dist/
+
 # IDE
 .vscode/
 .idea/

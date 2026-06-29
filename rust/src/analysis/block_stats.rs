@@ -10,6 +10,10 @@
 //! Both metrics are 8-bit-range scalars so the heatmap colourisation in the
 //! Block tab can use the same min/max bounds either way.
 
+/// Smallest block size offered by the Block and Motion tabs (in pixels). Both
+/// tab selectors start at this value, so the per-frame floor lives in one place.
+pub const MIN_BLOCK_SIZE: u32 = 8;
+
 /// Which scalar to compute per pixel before aggregating block statistics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockMetric {
@@ -108,8 +112,10 @@ fn rgb_to_ms(r: u8, g: u8, b: u8) -> f64 {
     (6.0 * y + cb + cr) / 8.0
 }
 
+/// Shared per-pixel scalar used by both the Block tab and the Motion tab so
+/// the Y / MS metric definition lives in exactly one place.
 #[inline]
-fn pixel_value(metric: BlockMetric, r: u8, g: u8, b: u8) -> f64 {
+pub(crate) fn pixel_value(metric: BlockMetric, r: u8, g: u8, b: u8) -> f64 {
     match metric {
         BlockMetric::Y => rgb_to_luma(r, g, b),
         BlockMetric::Ms => rgb_to_ms(r, g, b),
@@ -156,7 +162,9 @@ pub fn compute_block_stats(
         let row_off = (y as usize) * stride;
         for x in 0..width {
             let bx = x / bs;
-            let bidx = (by * cols + bx) as usize;
+            // Index in usize to match n_blocks (avoids u32 overflow at extreme
+            // resolutions); mirrors analysis::motion::compute_motion_stats.
+            let bidx = (by as usize) * (cols as usize) + bx as usize;
             let pi = row_off + (x as usize) * 3;
             let yv = pixel_value(metric, rgb[pi], rgb[pi + 1], rgb[pi + 2]);
             sum_y[bidx] += yv;

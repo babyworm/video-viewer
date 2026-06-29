@@ -125,6 +125,64 @@ fn test_reader_opens_ppm_file() {
     }
 }
 
+#[test]
+fn test_reader_opens_ascii_p3_ppm_file() {
+    use video_viewer::core::reader::VideoReader;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test_p3.ppm");
+
+    std::fs::write(
+        &path,
+        b"P3\n# red green blue white\n2 2\n15\n15 0 0   0 15 0\n0 0 15   15 15 15\n",
+    )
+    .unwrap();
+
+    let mut reader = VideoReader::open(path.to_str().unwrap(), 0, 0, "", "BT.601")
+        .expect("should open P3 PPM file");
+    assert_eq!(reader.width(), 2);
+    assert_eq!(reader.height(), 2);
+    assert_eq!(reader.total_frames(), 1);
+
+    let raw = reader.seek_frame(0).expect("should seek P3 frame");
+    let frame = reader.convert_to_rgb(&raw).expect("should convert P3 frame");
+    assert_eq!(
+        frame,
+        vec![
+            255, 0, 0,
+            0, 255, 0,
+            0, 0, 255,
+            255, 255, 255,
+        ]
+    );
+}
+
+#[test]
+fn test_reader_opens_multi_number_ppm_sequence() {
+    use video_viewer::core::reader::VideoReader;
+
+    let dir = tempfile::tempdir().unwrap();
+    for (idx, red) in [("000_00", 10u8), ("001_01", 20), ("002_02", 30)] {
+        let path = dir.path().join(format!("Test_raw_3840X2160_RG12_{idx}.ppm"));
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(b"P6\n1 1\n255\n").unwrap();
+        f.write_all(&[red, 0, 0]).unwrap();
+    }
+
+    let path = dir.path().join("Test_raw_3840X2160_RG12_001_01.ppm");
+    let mut reader = VideoReader::open(path.to_str().unwrap(), 0, 0, "", "BT.601")
+        .expect("should open PPM sequence");
+    assert_eq!(reader.width(), 1);
+    assert_eq!(reader.height(), 1);
+    assert_eq!(reader.total_frames(), 3);
+    assert_eq!(reader.initial_frame(), 1);
+
+    let f0 = reader.seek_frame(0).expect("should read first PPM frame");
+    let f2 = reader.seek_frame(2).expect("should read last PPM frame");
+    assert_eq!(f0, vec![10, 0, 0]);
+    assert_eq!(f2, vec![30, 0, 0]);
+}
+
 // ============================================================
 // PPM Export via Converter
 // ============================================================

@@ -317,6 +317,14 @@ fn test_4cc_bayer_rggb10_packed() {
 }
 
 #[test]
+fn test_4cc_bayer_rg12_with_uppercase_x_resolution() {
+    let hints = parse_filename_hints("Test_raw_3840X2160_RG12_000.raw");
+    assert_eq!(hints.width, Some(3840));
+    assert_eq!(hints.height, Some(2160));
+    assert_eq!(hints.format, Some("RG12".to_string()));
+}
+
+#[test]
 fn test_4cc_grey_y10bpack() {
     let hints = parse_filename_hints("thermal_Y10B_640x512.yuv");
     // "Y10B" is both a valid fourcc and has a friendly alias pointing to the long name.

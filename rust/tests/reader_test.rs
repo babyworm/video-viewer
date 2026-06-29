@@ -86,6 +86,47 @@ fn test_reader_seek_frame() {
 }
 
 #[test]
+fn test_reader_opens_one_frame_raw_sequence() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut expected = Vec::new();
+    for (idx, y_val) in [("000", 80u8), ("001", 90), ("002", 100)] {
+        let mut frame = vec![y_val; 16 * 16];
+        frame.extend_from_slice(&[128u8; 8 * 8]);
+        frame.extend_from_slice(&[128u8; 8 * 8]);
+        std::fs::write(dir.path().join(format!("Test_raw_16X16_I420_{idx}.raw")), &frame)
+            .unwrap();
+        expected.push(frame);
+    }
+
+    let path = dir.path().join("Test_raw_16X16_I420_001.raw");
+    let mut reader = VideoReader::open(path.to_str().unwrap(), 0, 0, "", "BT.601")
+        .expect("open should infer raw sequence");
+
+    assert_eq!(reader.width(), 16);
+    assert_eq!(reader.height(), 16);
+    assert_eq!(reader.total_frames(), 3);
+    assert_eq!(reader.initial_frame(), 1);
+    assert_eq!(reader.seek_frame(0).unwrap(), expected[0]);
+    assert_eq!(reader.seek_frame(2).unwrap(), expected[2]);
+}
+
+#[test]
+fn test_reader_rejects_raw_file_without_complete_frame() {
+    let (file, _) = make_raw_i420(1);
+    let path = file.path().to_str().unwrap();
+
+    let err = match VideoReader::open(path, 3840, 2160, "I420", "BT.601") {
+        Ok(_) => panic!("raw file shorter than one frame should fail to open"),
+        Err(e) => e,
+    };
+
+    assert!(
+        err.contains("complete frame"),
+        "unexpected error for short raw file: {err}"
+    );
+}
+
+#[test]
 fn test_reader_out_of_bounds() {
     let (file, _) = make_raw_i420(3);
     let path = file.path().to_str().unwrap();

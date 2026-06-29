@@ -31,7 +31,7 @@
   - `src/ui/` - UI components
     - `canvas.rs` - ImageCanvas (rendering, zoom, grid overlay)
     - `toolbar.rs` - Toolbar (component selection, grid controls, colorize_channel)
-    - `sidebar.rs` - Sidebar (analysis tabs: histogram, waveform, vectorscope, metrics)
+    - `sidebar.rs` - Sidebar (analysis tabs: histogram, waveform, vectorscope, metrics, block, motion)
     - `navigation.rs` - NavigationBar (frame slider, playback controls)
     - `dialogs.rs` - Open, Save, Parameters, Export, Convert, Settings dialogs
     - `comparison.rs` - ComparisonView (three-pane video diff, spatial metric labels, synchronized zoom/pan)
@@ -42,6 +42,8 @@
     - `waveform.rs` - Waveform display
     - `vectorscope.rs` - BT.709 YCbCr vectorscope
     - `metrics.rs` - PSNR, SSIM, frame difference, MS-PSNR, MS-SSIM, VMAF-NEG proxy, spatial metric maps
+    - `block_stats.rs` - Per-block luma/MS mean & variance grid (Block tab); shared `pixel_value` metric
+    - `motion.rs` - Per-block inter-frame motion classification vs previous frame (Motion tab): 4-level class (none/slight/much/full), two methods (PixelDiff MAD, StatsDiff |Δmean|+|Δstd|), adjustable thresholds, block sizes down to 8px
     - `scene.rs` - Scene change detection
     - `isp_sideband.rs` - SidebandPanel UI (load/unload, overlay mode, opacity)
   - `src/conversion/` - Format conversion
@@ -85,6 +87,8 @@
 | `tests/waveform_test.rs` | Waveform luma/R/G/B, edge cases (6 tests) |
 | `tests/vectorscope_test.rs` | Vectorscope neutral/red/blue, subsampling (5 tests) |
 | `tests/metrics_test.rs` | PSNR, SSIM, frame difference, MS metrics, spatial metric maps, empty images (12 tests) |
+| `tests/block_stats_test.rs` | Per-block luma/MS mean & variance grid, edge/partial blocks (12 tests) |
+| `tests/motion_test.rs` | Per-block motion classification: pixel-diff vs avg·std, 4-class bands, localized motion, 8px grid, edge cases (12 tests) |
 | `tests/scene_test.rs` | Scene detection algorithms, thresholds, save/load (12 tests) |
 | `tests/sideband_test.rs` | Sideband binary parsing, extended header, signed fields, display (20 tests) |
 | `tests/ppm_test.rs` | PPM parsing, writing, reading, and conversion (10 tests) |

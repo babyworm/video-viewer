@@ -759,7 +759,7 @@ fn rgb24_to_rgb_variant(rgb: &[u8], w: u32, h: u32, fmt: &VideoFormat) -> Result
 }
 
 /// Bayer 8-bit → RGB24 via simple bilinear demosaic.
-fn bayer_to_rgb24(frame: &[u8], w: u32, h: u32, fmt: &VideoFormat) -> Result<Vec<u8>, String> {
+pub(crate) fn bayer_to_rgb24(frame: &[u8], w: u32, h: u32, fmt: &VideoFormat) -> Result<Vec<u8>, String> {
     let w = w as usize;
     let h = h as usize;
     let mut rgb = vec![0u8; w * h * 3];
@@ -859,7 +859,7 @@ fn avg_or_center(data: &[u8], w: usize, x: usize, y: usize, sum: u32, count: u32
 
 /// High bit-depth Bayer (10/12/16-bit, 2 bytes LE per pixel) → RGB24.
 /// Truncates to 8-bit, then runs nearest-neighbor demosaic.
-fn bayer_highbit_to_rgb24(frame: &[u8], w: u32, h: u32, fmt: &VideoFormat) -> Result<Vec<u8>, String> {
+pub(crate) fn bayer_highbit_to_rgb24(frame: &[u8], w: u32, h: u32, fmt: &VideoFormat) -> Result<Vec<u8>, String> {
     let pixels = (w as usize) * (h as usize);
     let shift = fmt.bit_depth.saturating_sub(8);
     // Check for MIPI CSI-2 packed (10-bit packed = 5 bytes per 4 pixels)

@@ -14,6 +14,8 @@ pub enum AnalysisTab {
     Metrics,
     /// Per-block luma statistics (mean & variance side-by-side).
     Block,
+    /// Per-block inter-frame motion classification (vs previous frame).
+    Motion,
     IspSideband,
 }
 
@@ -30,10 +32,16 @@ pub struct AnalysisShared {
     pub frame_diff: Option<f64>,
     /// Per-block luma stats for the Block tab.
     pub block_stats: Option<crate::analysis::block_stats::BlockStats>,
-    /// User-selected block size for the Block tab. Default 32.
+    /// User-selected block size for the Block & Motion tabs. Default 32.
     pub block_size: u32,
-    /// Which scalar metric the Block tab aggregates (Y or MS).
+    /// Which scalar metric the Block & Motion tabs aggregate (Y or MS).
     pub block_metric: crate::analysis::block_stats::BlockMetric,
+    /// Per-block motion stats (current vs previous frame) for the Motion tab.
+    pub motion_stats: Option<crate::analysis::motion::MotionStats>,
+    /// Scoring method for the Motion tab (pixel diff vs avg/std comparison).
+    pub motion_method: crate::analysis::motion::MotionMethod,
+    /// Adjustable class thresholds for the Motion tab.
+    pub motion_thresholds: crate::analysis::motion::MotionThresholds,
     /// Set to true by the viewport callback when the user closes the window.
     pub close_requested: bool,
     /// Set to true when the user switches tabs, so the main loop recomputes.
@@ -67,6 +75,9 @@ impl AnalysisShared {
             block_stats: None,
             block_size: 32,
             block_metric: crate::analysis::block_stats::BlockMetric::Y,
+            motion_stats: None,
+            motion_method: crate::analysis::motion::MotionMethod::PixelDiff,
+            motion_thresholds: crate::analysis::motion::MotionThresholds::default(),
             close_requested: false,
             tab_changed: false,
             generation: 0,
@@ -328,7 +339,8 @@ impl Sidebar {
             egui::ViewportId::from_hash_of("analysis_viewport"),
             egui::ViewportBuilder::default()
                 .with_title("Analysis")
-                .with_inner_size([450.0, 400.0]),
+                .with_inner_size([460.0, 440.0])
+                .with_min_inner_size([420.0, 360.0]),
             move |ctx, class| {
                 // If the viewport is being closed by the OS, signal it.
                 if matches!(class, egui::ViewportClass::Deferred) {
@@ -355,6 +367,9 @@ impl Sidebar {
                         block_stats,
                         mut block_size,
                         mut block_metric,
+                        motion_stats,
+                        mut motion_method,
+                        mut motion_thresholds,
                     ) = {
                         let data = shared.lock();
                         let wf = if data.active_tab == AnalysisTab::Waveform
@@ -369,6 +384,11 @@ impl Sidebar {
                         } else {
                             None
                         };
+                        let ms = if data.active_tab == AnalysisTab::Motion {
+                            data.motion_stats.clone()
+                        } else {
+                            None
+                        };
                         (
                             data.active_tab,
                             data.histogram_data.clone(),
@@ -380,22 +400,30 @@ impl Sidebar {
                             bs,
                             data.block_size,
                             data.block_metric,
+                            ms,
+                            data.motion_method,
+                            data.motion_thresholds,
                         )
                     };
                     let prev_block_size = block_size;
                     let prev_block_metric = block_metric;
+                    let prev_motion_method = motion_method;
+                    let prev_motion_thresholds = motion_thresholds;
 
                     // Tab bar + controls — writes back to shared state only on change.
                     let mut tab = active_tab;
                     let mut reset_view = false;
                     let mut zoom_in = false;
                     let mut zoom_out = false;
-                    ui.horizontal(|ui| {
+                    // Wrapped so the now-seven tabs plus zoom controls flow onto a
+                    // second row instead of overflowing the ~460px-wide window.
+                    ui.horizontal_wrapped(|ui| {
                         ui.selectable_value(&mut tab, AnalysisTab::Histogram, "Histogram");
                         ui.selectable_value(&mut tab, AnalysisTab::Waveform, "Waveform");
                         ui.selectable_value(&mut tab, AnalysisTab::Vectorscope, "Vectorscope");
                         ui.selectable_value(&mut tab, AnalysisTab::Metrics, "Metrics");
                         ui.selectable_value(&mut tab, AnalysisTab::Block, "Block");
+                        ui.selectable_value(&mut tab, AnalysisTab::Motion, "Motion");
                         ui.selectable_value(&mut tab, AnalysisTab::IspSideband, "ISP Sideband");
                         ui.separator();
                         if ui.small_button("+").on_hover_text("Zoom in").clicked() {
@@ -450,6 +478,40 @@ impl Sidebar {
                                 s.block_metric = block_metric;
                                 // Same path as a tab change: tells the main
                                 // loop to recompute block_stats next frame.
+                                s.tab_changed = true;
+                                drop(s);
+                                ctx.request_repaint_of(egui::ViewportId::ROOT);
+                            }
+                        }
+                        AnalysisTab::Motion => {
+                            // The Motion tab packs the most controls of any tab
+                            // (tab bar, two control rows, three sliders, heatmap,
+                            // legend, summary); a scroll area keeps it usable when
+                            // the window is short.
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    Self::render_motion(
+                                        ui,
+                                        &motion_stats,
+                                        &mut block_size,
+                                        &mut block_metric,
+                                        &mut motion_method,
+                                        &mut motion_thresholds,
+                                    );
+                                });
+                            if block_size != prev_block_size
+                                || block_metric != prev_block_metric
+                                || motion_method != prev_motion_method
+                                || motion_thresholds != prev_motion_thresholds
+                            {
+                                let mut s = shared.lock();
+                                s.block_size = block_size;
+                                s.block_metric = block_metric;
+                                s.motion_method = motion_method;
+                                s.motion_thresholds = motion_thresholds;
+                                // Same path as a tab change: tells the main loop
+                                // to recompute motion_stats next frame.
                                 s.tab_changed = true;
                                 drop(s);
                                 ctx.request_repaint_of(egui::ViewportId::ROOT);
@@ -688,7 +750,7 @@ impl Sidebar {
             ui.selectable_value(block_metric, BlockMetric::Ms, "MS");
             ui.separator();
             ui.label("Block size:");
-            for &size in &[16u32, 32, 64, 128] {
+            for &size in &[8u32, 16, 32, 64, 128] {
                 ui.selectable_value(block_size, size, format!("{}×{}", size, size));
             }
         });
@@ -822,6 +884,209 @@ impl Sidebar {
         ui.weak(format!(
             "{} × {} blocks of {}px each. Hover any block to see its value; numeric overlays appear when each block is large enough to fit text. Variance heatmap range: 0 → {:.0}.",
             stats.cols, stats.rows, stats.block_size, max_var,
+        ));
+    }
+
+    /// Heatmap fill colour for a motion class. Uses blue→amber→red rather than
+    /// green→amber→red so the ordering survives red-green colour-blindness
+    /// (the most common form): blue is unambiguous against amber/red. The
+    /// legend's text labels and per-block score numbers provide a further
+    /// non-colour cue.
+    fn motion_class_color(c: crate::analysis::motion::MotionClass) -> egui::Color32 {
+        use crate::analysis::motion::MotionClass;
+        match c {
+            MotionClass::None => egui::Color32::from_rgb(38, 42, 52),
+            MotionClass::Slight => egui::Color32::from_rgb(60, 120, 210),
+            MotionClass::Much => egui::Color32::from_rgb(235, 160, 45),
+            MotionClass::Full => egui::Color32::from_rgb(214, 56, 56),
+        }
+    }
+
+    /// Text colour that reads on top of [`motion_class_color`] for the given
+    /// class: black on the bright amber `Much` fill, white on the rest.
+    fn motion_text_color(c: crate::analysis::motion::MotionClass) -> egui::Color32 {
+        use crate::analysis::motion::MotionClass;
+        match c {
+            MotionClass::Much => egui::Color32::BLACK,
+            _ => egui::Color32::WHITE,
+        }
+    }
+
+    /// Render the Motion tab: a per-block motion-class heatmap comparing the
+    /// current frame against the previous one, with selectable scoring method
+    /// (pixel diff vs avg/std) and adjustable class thresholds.
+    fn render_motion(
+        ui: &mut egui::Ui,
+        motion_stats: &Option<crate::analysis::motion::MotionStats>,
+        block_size: &mut u32,
+        block_metric: &mut crate::analysis::block_stats::BlockMetric,
+        motion_method: &mut crate::analysis::motion::MotionMethod,
+        thresholds: &mut crate::analysis::motion::MotionThresholds,
+    ) {
+        use crate::analysis::block_stats::BlockMetric;
+        use crate::analysis::motion::{MotionClass, MotionMethod, MotionThresholds};
+
+        ui.horizontal(|ui| {
+            // Metric/Block size are shared with the Block tab; keep the labels
+            // and "N×N" rendering identical so the shared setting is obvious.
+            ui.label("Metric:");
+            ui.selectable_value(block_metric, BlockMetric::Y, BlockMetric::Y.label());
+            ui.selectable_value(block_metric, BlockMetric::Ms, BlockMetric::Ms.label());
+            ui.separator();
+            ui.label("Block size:");
+            for &size in &[8u32, 16, 32, 64, 128] {
+                ui.selectable_value(block_size, size, format!("{}×{}", size, size));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Method:");
+            ui.selectable_value(motion_method, MotionMethod::PixelDiff, MotionMethod::PixelDiff.label())
+                .on_hover_text(
+                    "Mean absolute per-pixel difference (MAD) inside each block. \
+                     Flags any pixel movement, even when the block's average and \
+                     spread are unchanged.",
+                );
+            ui.selectable_value(motion_method, MotionMethod::StatsDiff, MotionMethod::StatsDiff.label())
+                .on_hover_text(
+                    "Compares each block's mean and std-dev between frames: \
+                     |Δmean| + |Δstd|. Blind to spatial rearrangement that keeps \
+                     the same average and spread.",
+                );
+            ui.separator();
+            // Named "Reset thresholds" (not just "Reset") to avoid confusion
+            // with the tab-bar's view "Reset" button.
+            if ui.button("Reset thresholds").on_hover_text("Restore default thresholds").clicked() {
+                *thresholds = MotionThresholds::default();
+            }
+        });
+        // Ranges span both methods: PixelDiff (MAD) is bounded 0..255, while
+        // StatsDiff (|Δmean| + |Δstd|) can reach ~382, so `full` goes to 400.
+        ui.add(
+            egui::Slider::new(&mut thresholds.slight, 0.0..=50.0)
+                .text("slight ≥")
+                .fixed_decimals(1),
+        );
+        ui.add(
+            egui::Slider::new(&mut thresholds.much, 0.0..=200.0)
+                .text("much ≥")
+                .fixed_decimals(1),
+        );
+        ui.add(
+            egui::Slider::new(&mut thresholds.full, 0.0..=400.0)
+                .text("full ≥")
+                .fixed_decimals(1),
+        );
+        // Keep the bands ordered so the legend stays meaningful.
+        thresholds.much = thresholds.much.max(thresholds.slight);
+        thresholds.full = thresholds.full.max(thresholds.much);
+
+        ui.separator();
+
+        let Some(stats) = motion_stats.as_ref() else {
+            ui.centered_and_justified(|ui| {
+                ui.label("Computing motion…");
+            });
+            return;
+        };
+        if stats.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    "Motion compares each frame with the previous one.\n\
+                     It populates during playback or when you step forward (→).\n\
+                     Scrubbing the slider or stepping back (←) clears it — \
+                     step forward again to refresh.",
+                );
+            });
+            return;
+        }
+
+        // Build the class-coloured heatmap (cols × rows, nearest-sampled).
+        let w = stats.cols as usize;
+        let h = stats.rows as usize;
+        let pixels: Vec<egui::Color32> = stats
+            .classes
+            .iter()
+            .map(|&c| Self::motion_class_color(c))
+            .collect();
+        let motion_image = egui::ColorImage {
+            size: [w, h],
+            pixels,
+        };
+
+        let aspect = stats.width as f32 / stats.height.max(1) as f32;
+        let avail = ui.available_size();
+        let pane_w_cap = (avail.x - 8.0).max(160.0);
+        let pane_h_raw = (pane_w_cap / aspect).max(120.0);
+        let pane_h = pane_h_raw.min((avail.y - 160.0).max(120.0));
+        let pane_w = (pane_h * aspect).min(pane_w_cap);
+        let display_size = egui::vec2(pane_w, pane_h);
+
+        let handle = ui.ctx().load_texture(
+            "motion_map",
+            motion_image,
+            egui::TextureOptions::NEAREST,
+        );
+
+        // Describe the heatmap with the thresholds the classes were ACTUALLY
+        // computed with (stats.thresholds), not the live slider values — those
+        // only take effect after the next recompute, so using them here would
+        // momentarily disagree with the colours on screen.
+        let t = stats.thresholds;
+        Self::draw_block_pane(
+            ui,
+            handle.id(),
+            display_size,
+            stats.cols,
+            stats.rows,
+            &stats.scores,
+            "motion_pane",
+            |v| format!("{:.0}", v),
+            move |v| Self::motion_text_color(MotionClass::from_score(v, t)),
+        );
+
+        ui.add_space(6.0);
+        let total = (stats.cols * stats.rows).max(1);
+        // Band range string per class, derived from the displayed thresholds so
+        // colour, name, range, and count all read on a single legend row.
+        let band_for = |c: MotionClass| -> String {
+            match c {
+                MotionClass::None => format!("< {:.0}", t.slight),
+                MotionClass::Slight => format!("{:.0} – {:.0}", t.slight, t.much),
+                MotionClass::Much => format!("{:.0} – {:.0}", t.much, t.full),
+                MotionClass::Full => format!("≥ {:.0}", t.full),
+            }
+        };
+        egui::Grid::new("motion_legend")
+            .spacing(egui::vec2(10.0, 3.0))
+            .show(ui, |ui| {
+                for c in MotionClass::all() {
+                    let count = stats.class_counts[c.index()];
+                    let pct = 100.0 * count as f32 / total as f32;
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 2.0, Self::motion_class_color(c));
+                    ui.label(c.label());
+                    ui.monospace(format!("{:>9}", band_for(c)));
+                    ui.monospace(format!("{:>5}  {:>5.1}%", count, pct));
+                    ui.end_row();
+                }
+            });
+
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(format!(
+                "frame motion  avg {:.1}   peak {:.1}   [{}]",
+                stats.frame_score,
+                stats.max_score,
+                stats.method.label()
+            ))
+            .monospace()
+            .small(),
+        );
+        ui.add_space(2.0);
+        ui.weak(format!(
+            "{} × {} blocks of {}px vs previous frame. Colour = motion class; numbers show each block's score.",
+            stats.cols, stats.rows, stats.block_size,
         ));
     }
 
