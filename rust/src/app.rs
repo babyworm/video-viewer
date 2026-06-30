@@ -915,6 +915,10 @@ impl VideoViewerApp {
             }
         }
 
+        // Record which frame this analysis corresponds to (shown in the window,
+        // and advances live during playback).
+        self.sidebar.analysis.lock().source_frame = self.current_frame_idx;
+
         // Request repaint of the analysis viewport so it picks up new data.
         ctx.request_repaint_of(egui::ViewportId::from_hash_of("analysis_viewport"));
     }
@@ -2404,6 +2408,12 @@ impl eframe::App for VideoViewerApp {
                 drop(shared);
                 self.update_analysis(ctx);
             }
+        }
+        // Mirror playback state into the analysis viewport every frame so it can
+        // self-repaint while playing (and stop when playback ends). Done here,
+        // unconditionally per root update, so a stop is always propagated.
+        if self.sidebar.show_analysis {
+            self.sidebar.analysis.lock().is_playing = self.is_playing;
         }
         // Analysis as a separate floating window.
         self.sidebar.show_analysis_window(ctx);

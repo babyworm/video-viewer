@@ -42,6 +42,14 @@ pub struct AnalysisShared {
     pub motion_method: crate::analysis::motion::MotionMethod,
     /// Adjustable class thresholds for the Motion tab.
     pub motion_thresholds: crate::analysis::motion::MotionThresholds,
+    /// Mirrors the main window's playback state. While true, the analysis
+    /// viewport keeps requesting its own repaint so it refreshes every frame
+    /// during playback (a parent-driven `request_repaint_of` alone can be
+    /// starved/coalesced while the root window animates continuously).
+    pub is_playing: bool,
+    /// Source frame index the currently-stored analysis data was computed from.
+    /// Shown in the window so the user can see it advance during playback.
+    pub source_frame: usize,
     /// Set to true by the viewport callback when the user closes the window.
     pub close_requested: bool,
     /// Set to true when the user switches tabs, so the main loop recomputes.
@@ -78,6 +86,8 @@ impl AnalysisShared {
             motion_stats: None,
             motion_method: crate::analysis::motion::MotionMethod::PixelDiff,
             motion_thresholds: crate::analysis::motion::MotionThresholds::default(),
+            is_playing: false,
+            source_frame: 0,
             close_requested: false,
             tab_changed: false,
             generation: 0,
@@ -335,7 +345,13 @@ impl Sidebar {
 
         let shared = Arc::clone(&self.analysis);
 
-        ctx.show_viewport_deferred(
+        // Immediate viewport (not deferred): it renders synchronously inside the
+        // root's update pass, every frame the root paints. A deferred viewport is
+        // a separate OS window whose redraw is starved while the root animates
+        // continuously during playback (confirmed: analysis data was recomputed
+        // every frame but the deferred window only repainted once playback
+        // stopped). Immediate keeps it in lockstep with the main window.
+        ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("analysis_viewport"),
             egui::ViewportBuilder::default()
                 .with_title("Analysis")
@@ -343,7 +359,10 @@ impl Sidebar {
                 .with_min_inner_size([420.0, 360.0]),
             move |ctx, class| {
                 // If the viewport is being closed by the OS, signal it.
-                if matches!(class, egui::ViewportClass::Deferred) {
+                if matches!(
+                    class,
+                    egui::ViewportClass::Deferred | egui::ViewportClass::Immediate
+                ) {
                     let close = ctx.input(|i| i.viewport().close_requested());
                     if close {
                         shared.lock().close_requested = true;
@@ -370,6 +389,8 @@ impl Sidebar {
                         motion_stats,
                         mut motion_method,
                         mut motion_thresholds,
+                        is_playing,
+                        source_frame,
                     ) = {
                         let data = shared.lock();
                         let wf = if data.active_tab == AnalysisTab::Waveform
@@ -403,6 +424,8 @@ impl Sidebar {
                             ms,
                             data.motion_method,
                             data.motion_thresholds,
+                            data.is_playing,
+                            data.source_frame,
                         )
                     };
                     let prev_block_size = block_size;
@@ -435,6 +458,12 @@ impl Sidebar {
                         if ui.small_button("Reset").on_hover_text("Reset view").clicked() {
                             reset_view = true;
                         }
+                        ui.separator();
+                        // Source frame this analysis was computed from. Advances
+                        // live during playback — a quick way to confirm the panel
+                        // is tracking the main window.
+                        ui.weak(format!("frame {}", source_frame))
+                            .on_hover_text("Frame index the current analysis was computed from");
                     });
                     if tab != active_tab {
                         let mut s = shared.lock();
@@ -521,6 +550,17 @@ impl Sidebar {
                             ui.label("ISP Sideband analysis is shown in the right sidebar panel.");
                             ui.label("Load a sideband.bin file from the sidebar to visualize CTU heatmaps.");
                         }
+                    }
+
+                    // While the main window is playing, keep this viewport
+                    // repainting on its own. The root drives playback and pushes
+                    // fresh data via `request_repaint_of`, but a cross-viewport
+                    // repaint request can be coalesced/starved while the root
+                    // animates continuously — so without this the analysis window
+                    // appears frozen during playback. Self-requesting a repaint
+                    // makes it read the latest shared data every frame.
+                    if is_playing {
+                        ctx.request_repaint();
                     }
                 });
             },
