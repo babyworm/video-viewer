@@ -50,6 +50,9 @@ pub struct AnalysisShared {
     /// Source frame index the currently-stored analysis data was computed from.
     /// Shown in the window so the user can see it advance during playback.
     pub source_frame: usize,
+    /// Show the value loupe (zoomed grid of cells with numeric values) when
+    /// hovering the Block / Motion heatmaps.
+    pub show_loupe: bool,
     /// Set to true by the viewport callback when the user closes the window.
     pub close_requested: bool,
     /// Set to true when the user switches tabs, so the main loop recomputes.
@@ -88,6 +91,7 @@ impl AnalysisShared {
             motion_thresholds: crate::analysis::motion::MotionThresholds::default(),
             is_playing: false,
             source_frame: 0,
+            show_loupe: false,
             close_requested: false,
             tab_changed: false,
             generation: 0,
@@ -391,6 +395,7 @@ impl Sidebar {
                         mut motion_thresholds,
                         is_playing,
                         source_frame,
+                        mut show_loupe,
                     ) = {
                         let data = shared.lock();
                         let wf = if data.active_tab == AnalysisTab::Waveform
@@ -426,12 +431,14 @@ impl Sidebar {
                             data.motion_thresholds,
                             data.is_playing,
                             data.source_frame,
+                            data.show_loupe,
                         )
                     };
                     let prev_block_size = block_size;
                     let prev_block_metric = block_metric;
                     let prev_motion_method = motion_method;
                     let prev_motion_thresholds = motion_thresholds;
+                    let prev_show_loupe = show_loupe;
 
                     // Tab bar + controls — writes back to shared state only on change.
                     let mut tab = active_tab;
@@ -498,7 +505,11 @@ impl Sidebar {
                                 &block_stats,
                                 &mut block_size,
                                 &mut block_metric,
+                                &mut show_loupe,
                             );
+                            if show_loupe != prev_show_loupe {
+                                shared.lock().show_loupe = show_loupe;
+                            }
                             if block_size != prev_block_size
                                 || block_metric != prev_block_metric
                             {
@@ -527,8 +538,12 @@ impl Sidebar {
                                         &mut block_metric,
                                         &mut motion_method,
                                         &mut motion_thresholds,
+                                        &mut show_loupe,
                                     );
                                 });
+                            if show_loupe != prev_show_loupe {
+                                shared.lock().show_loupe = show_loupe;
+                            }
                             if block_size != prev_block_size
                                 || block_metric != prev_block_metric
                                 || motion_method != prev_motion_method
@@ -782,6 +797,7 @@ impl Sidebar {
         block_stats: &Option<crate::analysis::block_stats::BlockStats>,
         block_size: &mut u32,
         block_metric: &mut crate::analysis::block_stats::BlockMetric,
+        show_loupe: &mut bool,
     ) {
         use crate::analysis::block_stats::BlockMetric;
         ui.horizontal(|ui| {
@@ -793,6 +809,9 @@ impl Sidebar {
             for &size in &[8u32, 16, 32, 64, 128] {
                 ui.selectable_value(block_size, size, format!("{}×{}", size, size));
             }
+            ui.separator();
+            ui.checkbox(show_loupe, "🔍 Loupe")
+                .on_hover_text("Hover a heatmap to zoom the surrounding cells and read exact values");
         });
         ui.separator();
 
@@ -808,29 +827,24 @@ impl Sidebar {
         }
 
         let max_var = stats.max_var().max(1.0);
-        let mean_image = block_grid_to_color_image(
-            stats.cols,
-            stats.rows,
-            &stats.means,
-            |v| {
-                let g = v.clamp(0.0, 255.0) as u8;
-                egui::Color32::from_rgb(g, g, g)
-            },
-        );
-        let var_image = block_grid_to_color_image(
-            stats.cols,
-            stats.rows,
-            &stats.vars,
-            |v| {
-                // Normalize to [0,1] then map to a viridis-like ramp:
-                // 0 → dark blue, 0.5 → green, 1 → yellow.
-                let t = (v / max_var).clamp(0.0, 1.0);
-                let r = (t * 255.0) as u8;
-                let g = ((1.0 - (t - 0.5).abs() * 2.0).max(0.0) * 220.0) as u8;
-                let b = ((1.0 - t) * 200.0) as u8;
-                egui::Color32::from_rgb(r, g, b)
-            },
-        );
+        // Cell colour maps — defined once and shared by both the heatmap texture
+        // and the value loupe (Copy closures capturing only `max_var`).
+        let mean_color = |v: f32| {
+            let g = v.clamp(0.0, 255.0) as u8;
+            egui::Color32::from_rgb(g, g, g)
+        };
+        let var_color = move |v: f32| {
+            // Normalize to [0,1] then map to a viridis-like ramp:
+            // 0 → dark blue, 0.5 → green, 1 → yellow.
+            let t = (v / max_var).clamp(0.0, 1.0);
+            let r = (t * 255.0) as u8;
+            let g = ((1.0 - (t - 0.5).abs() * 2.0).max(0.0) * 220.0) as u8;
+            let b = ((1.0 - t) * 200.0) as u8;
+            egui::Color32::from_rgb(r, g, b)
+        };
+        let mean_image =
+            block_grid_to_color_image(stats.cols, stats.rows, &stats.means, mean_color);
+        let var_image = block_grid_to_color_image(stats.cols, stats.rows, &stats.vars, var_color);
 
         let aspect = stats.width as f32 / stats.height.max(1) as f32;
         let avail = ui.available_size();
@@ -875,6 +889,8 @@ impl Sidebar {
                             egui::Color32::WHITE
                         }
                     },
+                    *show_loupe,
+                    mean_color,
                 );
                 // Whole-frame luma stats: min, max, average, variance.
                 // (Not the average-of-block-means; computed pixel-wise.)
@@ -913,6 +929,8 @@ impl Sidebar {
                             egui::Color32::WHITE
                         }
                     },
+                    *show_loupe,
+                    var_color,
                 );
                 ui.label(egui::RichText::new(format!(
                     "min {:.1}  max {:.1}  avg {:.1}",
@@ -922,7 +940,7 @@ impl Sidebar {
         });
         ui.add_space(4.0);
         ui.weak(format!(
-            "{} × {} blocks of {}px each. Hover any block to see its value; numeric overlays appear when each block is large enough to fit text. Variance heatmap range: 0 → {:.0}.",
+            "{} × {} blocks of {}px each. Scroll to zoom at the cursor · drag to pan · double-click to reset. Hover a block for its value; enable 🔍 Loupe to read exact values on fine grids. Variance heatmap range: 0 → {:.0}.",
             stats.cols, stats.rows, stats.block_size, max_var,
         ));
     }
@@ -962,6 +980,7 @@ impl Sidebar {
         block_metric: &mut crate::analysis::block_stats::BlockMetric,
         motion_method: &mut crate::analysis::motion::MotionMethod,
         thresholds: &mut crate::analysis::motion::MotionThresholds,
+        show_loupe: &mut bool,
     ) {
         use crate::analysis::block_stats::BlockMetric;
         use crate::analysis::motion::{MotionClass, MotionMethod, MotionThresholds};
@@ -977,6 +996,9 @@ impl Sidebar {
             for &size in &[8u32, 16, 32, 64, 128] {
                 ui.selectable_value(block_size, size, format!("{}×{}", size, size));
             }
+            ui.separator();
+            ui.checkbox(show_loupe, "🔍 Loupe")
+                .on_hover_text("Hover the map to zoom the surrounding cells and read exact scores");
         });
         ui.horizontal(|ui| {
             ui.label("Method:");
@@ -1082,6 +1104,8 @@ impl Sidebar {
             "motion_pane",
             |v| format!("{:.0}", v),
             move |v| Self::motion_text_color(MotionClass::from_score(v, t)),
+            *show_loupe,
+            move |v| Self::motion_class_color(MotionClass::from_score(v, t)),
         );
 
         ui.add_space(6.0);
@@ -1125,7 +1149,7 @@ impl Sidebar {
         );
         ui.add_space(2.0);
         ui.weak(format!(
-            "{} × {} blocks of {}px vs previous frame. Colour = motion class; numbers show each block's score.",
+            "{} × {} blocks of {}px vs previous frame. Colour = motion class; numbers show each block's score. Scroll to zoom · drag to pan · double-click to reset · 🔍 Loupe for exact values.",
             stats.cols, stats.rows, stats.block_size,
         ));
     }
@@ -1134,7 +1158,7 @@ impl Sidebar {
     /// per-block numeric overlay (when each block is wide enough), and a
     /// hover tooltip showing the value at the cursor.
     #[allow(clippy::too_many_arguments)]
-    fn draw_block_pane<L, C>(
+    fn draw_block_pane<L, C, K>(
         ui: &mut egui::Ui,
         texture_id: egui::TextureId,
         display_size: egui::Vec2,
@@ -1144,19 +1168,68 @@ impl Sidebar {
         id_salt: &str,
         label_for: L,
         text_color_for: C,
+        show_loupe: bool,
+        cell_color: K,
     ) where
         L: Fn(f32) -> String,
         C: Fn(f32) -> egui::Color32,
+        K: Fn(f32) -> egui::Color32,
     {
-        let _ = id_salt; // reserved for future use (e.g. independent tooltips)
-        let (rect, response) = ui.allocate_exact_size(display_size, egui::Sense::hover());
+        let (rect, response) =
+            ui.allocate_exact_size(display_size, egui::Sense::click_and_drag());
+
+        // Per-pane zoom/pan, persisted in egui memory keyed by the pane id so
+        // each heatmap (mean / variance / motion) zooms independently.
+        let view_id = ui.id().with(("pane_view", id_salt));
+        let mut view = ui
+            .ctx()
+            .data_mut(|d| d.get_temp::<PaneView>(view_id))
+            .unwrap_or_default();
+
+        // Double-click resets; drag pans; wheel zooms anchored at the cursor.
+        if response.double_clicked() {
+            view = PaneView::default();
+        }
+        if response.dragged() {
+            view.pan += response.drag_delta();
+        }
+        if response.hovered() {
+            // Consume the vertical scroll so an enclosing ScrollArea (Motion tab)
+            // doesn't also scroll while the wheel is zooming the heatmap.
+            let scroll = ui.input_mut(|i| {
+                let d = i.smooth_scroll_delta.y;
+                i.smooth_scroll_delta = egui::Vec2::ZERO;
+                d
+            });
+            if scroll != 0.0 {
+                if let Some(cursor) = response.hover_pos() {
+                    let old = view.zoom;
+                    let factor = 1.0 + (scroll * 0.002).clamp(-0.25, 0.25);
+                    let new = (old * factor).clamp(1.0, 24.0);
+                    if (new - old).abs() > f32::EPSILON {
+                        view.pan = Self::zoom_anchor_pan(view.pan, old, new, cursor - rect.min);
+                        view.zoom = new;
+                    }
+                }
+            }
+        }
+
+        // Clamp zoom, and pan so the zoomed image always covers the pane.
+        view.zoom = view.zoom.clamp(1.0, 24.0);
+        let img_w = rect.width() * view.zoom;
+        let img_h = rect.height() * view.zoom;
+        view.pan.x = view.pan.x.clamp(rect.width() - img_w, 0.0);
+        view.pan.y = view.pan.y.clamp(rect.height() - img_h, 0.0);
+        ui.ctx().data_mut(|d| d.insert_temp(view_id, view));
+
+        let image_rect = egui::Rect::from_min_size(rect.min + view.pan, egui::vec2(img_w, img_h));
+
         let painter = ui.painter_at(rect);
-        // Solid background so empty cells (none here) and out-of-image area
-        // show as the panel's neutral colour.
+        // Solid background so out-of-image area shows the panel's neutral colour.
         painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
         painter.image(
             texture_id,
-            rect,
+            image_rect,
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE,
         );
@@ -1164,20 +1237,25 @@ impl Sidebar {
         if cols == 0 || rows == 0 {
             return;
         }
-        let cell_w = rect.width() / cols as f32;
-        let cell_h = rect.height() / rows as f32;
-        // Show numeric overlay only when each cell can fit roughly two digits
-        // — anything tighter is unreadable.
+        let cell_w = image_rect.width() / cols as f32;
+        let cell_h = image_rect.height() / rows as f32;
+        // Numeric overlay for the visible cells, when each is big enough to read.
         let overlay_threshold = 22.0_f32;
         if cell_w >= overlay_threshold && cell_h >= overlay_threshold {
             let font_size = (cell_h.min(cell_w) * 0.45).clamp(8.0, 16.0);
             let font = egui::FontId::monospace(font_size);
-            for r in 0..rows {
-                for c in 0..cols {
+            // Only iterate cells intersecting the visible pane rect (matters when
+            // zoomed in: the full grid may be far larger than the viewport).
+            let c0 = ((rect.min.x - image_rect.min.x) / cell_w).floor().clamp(0.0, cols as f32) as u32;
+            let c1 = ((rect.max.x - image_rect.min.x) / cell_w).ceil().clamp(0.0, cols as f32) as u32;
+            let r0 = ((rect.min.y - image_rect.min.y) / cell_h).floor().clamp(0.0, rows as f32) as u32;
+            let r1 = ((rect.max.y - image_rect.min.y) / cell_h).ceil().clamp(0.0, rows as f32) as u32;
+            for r in r0..r1 {
+                for c in c0..c1 {
                     let idx = (r * cols + c) as usize;
                     let v = values.get(idx).copied().unwrap_or(0.0);
-                    let cx = rect.min.x + (c as f32 + 0.5) * cell_w;
-                    let cy = rect.min.y + (r as f32 + 0.5) * cell_h;
+                    let cx = image_rect.min.x + (c as f32 + 0.5) * cell_w;
+                    let cy = image_rect.min.y + (r as f32 + 0.5) * cell_h;
                     painter.text(
                         egui::pos2(cx, cy),
                         egui::Align2::CENTER_CENTER,
@@ -1189,20 +1267,167 @@ impl Sidebar {
             }
         }
 
-        // Hover tooltip: map cursor → block index → value.
+        // Hover: value loupe or single-cell tooltip. Map cursor → cell through
+        // the (possibly zoomed/panned) image rect.
         if let Some(pos) = response.hover_pos() {
-            let rx = ((pos.x - rect.min.x) / cell_w).floor() as i32;
-            let ry = ((pos.y - rect.min.y) / cell_h).floor() as i32;
+            let rx = ((pos.x - image_rect.min.x) / cell_w).floor() as i32;
+            let ry = ((pos.y - image_rect.min.y) / cell_h).floor() as i32;
             if rx >= 0 && ry >= 0 && (rx as u32) < cols && (ry as u32) < rows {
-                let idx = (ry as u32 * cols + rx as u32) as usize;
-                if let Some(&v) = values.get(idx) {
-                    response.on_hover_text(format!(
-                        "block ({}, {})  value: {}",
-                        rx, ry,
-                        label_for(v),
-                    ));
+                if show_loupe {
+                    Self::draw_value_loupe(
+                        ui, id_salt, pos, cols, rows, values, rx, ry,
+                        &label_for, &text_color_for, &cell_color,
+                    );
+                } else {
+                    let idx = (ry as u32 * cols + rx as u32) as usize;
+                    if let Some(&v) = values.get(idx) {
+                        response.on_hover_text(format!(
+                            "block ({}, {})  value: {}",
+                            rx, ry,
+                            label_for(v),
+                        ));
+                    }
                 }
             }
+        }
+    }
+
+    /// New pan offset that keeps the point at `anchor` (relative to the pane's
+    /// top-left) fixed while the zoom changes `old_zoom → new_zoom`. Derived so
+    /// that `(anchor − pan) / zoom` — the image coordinate under the anchor — is
+    /// invariant across the zoom change.
+    fn zoom_anchor_pan(
+        pan: egui::Vec2,
+        old_zoom: f32,
+        new_zoom: f32,
+        anchor: egui::Vec2,
+    ) -> egui::Vec2 {
+        let ratio = new_zoom / old_zoom;
+        anchor * (1.0 - ratio) + pan * ratio
+    }
+
+    /// Look up a value at grid `(col, row)`, returning `None` when out of range.
+    fn loupe_value_at(values: &[f32], cols: u32, rows: u32, col: i32, row: i32) -> Option<f32> {
+        if col < 0 || row < 0 || col as u32 >= cols || row as u32 >= rows {
+            return None;
+        }
+        values.get((row as u32 * cols + col as u32) as usize).copied()
+    }
+
+    /// Floating value loupe: a zoomed `(2K+1)×(2K+1)` grid of the cells around
+    /// `(cx, cy)`, each drawn with its heatmap colour and numeric value, so the
+    /// user can read exact values even where the in-pane overlay is too small.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_value_loupe<L, C, K>(
+        ui: &egui::Ui,
+        id_salt: &str,
+        cursor: egui::Pos2,
+        cols: u32,
+        rows: u32,
+        values: &[f32],
+        center_col: i32,
+        center_row: i32,
+        label_for: &L,
+        text_color_for: &C,
+        cell_color: &K,
+    ) where
+        L: Fn(f32) -> String,
+        C: Fn(f32) -> egui::Color32,
+        K: Fn(f32) -> egui::Color32,
+    {
+        const HALF: i32 = 2; // 5×5 window
+        const CELL: f32 = 30.0;
+        let span = (2 * HALF + 1) as f32;
+        let size = span * CELL;
+
+        // Place to the upper-right of the cursor, clamped to the window.
+        let screen = ui.ctx().screen_rect();
+        let mut origin = egui::pos2(cursor.x + 24.0, cursor.y - size - 12.0);
+        origin.x = origin.x.clamp(screen.left() + 4.0, screen.right() - size - 4.0);
+        origin.y = origin.y.clamp(screen.top() + 4.0, screen.bottom() - size - 4.0);
+        let loupe_rect = egui::Rect::from_min_size(origin, egui::vec2(size, size));
+
+        // Draw on a foreground layer so it overlaps neighbouring panes.
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            ui.id().with(("value_loupe", id_salt)),
+        ));
+        painter.rect_filled(loupe_rect.expand(2.0), 3.0, egui::Color32::from_black_alpha(230));
+        painter.rect_stroke(
+            loupe_rect.expand(2.0),
+            3.0,
+            egui::Stroke::new(1.0, egui::Color32::GRAY),
+            egui::StrokeKind::Outside,
+        );
+
+        let font = egui::FontId::monospace((CELL * 0.34).clamp(8.0, 12.0));
+        let empty_fill = egui::Color32::from_rgb(20, 22, 28);
+        for dr in -HALF..=HALF {
+            for dc in -HALF..=HALF {
+                let col = center_col + dc;
+                let row = center_row + dr;
+                let cell_min = egui::pos2(
+                    origin.x + (dc + HALF) as f32 * CELL,
+                    origin.y + (dr + HALF) as f32 * CELL,
+                );
+                let cell_rect = egui::Rect::from_min_size(cell_min, egui::vec2(CELL, CELL));
+                match Self::loupe_value_at(values, cols, rows, col, row) {
+                    Some(v) => {
+                        painter.rect_filled(cell_rect.shrink(0.5), 0.0, cell_color(v));
+                        painter.text(
+                            cell_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            label_for(v),
+                            font.clone(),
+                            text_color_for(v),
+                        );
+                    }
+                    None => {
+                        painter.rect_filled(cell_rect.shrink(0.5), 0.0, empty_fill);
+                    }
+                }
+            }
+        }
+
+        // Highlight the centre (hovered) cell.
+        let center_rect = egui::Rect::from_min_size(
+            egui::pos2(origin.x + HALF as f32 * CELL, origin.y + HALF as f32 * CELL),
+            egui::vec2(CELL, CELL),
+        );
+        painter.rect_stroke(
+            center_rect,
+            0.0,
+            egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 220, 40)),
+            egui::StrokeKind::Inside,
+        );
+
+        // Caption: centre cell coordinates + exact value.
+        if let Some(v) = Self::loupe_value_at(values, cols, rows, center_col, center_row) {
+            painter.text(
+                egui::pos2(loupe_rect.left(), loupe_rect.bottom() + 3.0),
+                egui::Align2::LEFT_TOP,
+                format!("({}, {}) = {}", center_col, center_row, label_for(v)),
+                egui::FontId::monospace(11.0),
+                egui::Color32::from_rgb(230, 230, 230),
+            );
+        }
+    }
+}
+
+/// Per-pane zoom / pan state for a heatmap pane, stored in egui temp memory.
+/// `zoom` is ≥ 1.0 (1.0 = fit); `pan` is a screen-space offset of the image's
+/// top-left relative to the pane's top-left (≤ 0 on each axis when zoomed).
+#[derive(Clone, Copy)]
+struct PaneView {
+    zoom: f32,
+    pan: egui::Vec2,
+}
+
+impl Default for PaneView {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            pan: egui::Vec2::ZERO,
         }
     }
 }
@@ -1255,5 +1480,41 @@ where
     egui::ColorImage {
         size: [w, h],
         pixels,
+    }
+}
+
+#[cfg(test)]
+mod loupe_tests {
+    use super::Sidebar;
+
+    #[test]
+    fn loupe_value_at_in_range_and_out_of_range() {
+        // 3×2 grid, row-major: row0 = [0,1,2], row1 = [3,4,5]
+        let v = [0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let (cols, rows) = (3u32, 2u32);
+        // In range
+        assert_eq!(Sidebar::loupe_value_at(&v, cols, rows, 0, 0), Some(0.0));
+        assert_eq!(Sidebar::loupe_value_at(&v, cols, rows, 2, 0), Some(2.0));
+        assert_eq!(Sidebar::loupe_value_at(&v, cols, rows, 1, 1), Some(4.0));
+        assert_eq!(Sidebar::loupe_value_at(&v, cols, rows, 2, 1), Some(5.0));
+        // Out of range → None (negatives and past the edges)
+        assert_eq!(Sidebar::loupe_value_at(&v, cols, rows, -1, 0), None);
+        assert_eq!(Sidebar::loupe_value_at(&v, cols, rows, 0, -1), None);
+        assert_eq!(Sidebar::loupe_value_at(&v, cols, rows, 3, 0), None);
+        assert_eq!(Sidebar::loupe_value_at(&v, cols, rows, 0, 2), None);
+    }
+
+    #[test]
+    fn zoom_anchor_pan_keeps_the_anchor_point_fixed() {
+        // The image coordinate under the anchor — (anchor − pan) / zoom — must be
+        // unchanged after zooming, so the cursor stays over the same cell.
+        let pan0 = egui::Vec2::new(-5.0, 3.0);
+        let (z0, z1) = (1.5_f32, 4.0_f32);
+        let anchor = egui::Vec2::new(20.0, 10.0);
+        let pan1 = Sidebar::zoom_anchor_pan(pan0, z0, z1, anchor);
+        let uv0 = (anchor - pan0) / z0;
+        let uv1 = (anchor - pan1) / z1;
+        assert!((uv0.x - uv1.x).abs() < 1e-4, "x {} vs {}", uv0.x, uv1.x);
+        assert!((uv0.y - uv1.y).abs() < 1e-4, "y {} vs {}", uv0.y, uv1.y);
     }
 }
