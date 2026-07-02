@@ -120,6 +120,22 @@ impl BitstreamPanel {
             bs.height,
         ));
 
+        // M-A §D: capture level + decoder contract badge (empty → "n/a").
+        let level = &bs.catb.meta.capture_level;
+        let level = if level.is_empty() { "n/a" } else { level.as_str() };
+        let contract = &bs.catb.meta.contract;
+        let contract = if contract.is_empty() {
+            "n/a"
+        } else {
+            contract.as_str()
+        };
+        ui.weak(format!("level: {level} · contract: {contract}"))
+            .on_hover_text(
+                "Telemetry capture level recorded by the decoder \
+                 (block/syntax/cabac/full; n/a = not recorded) and the \
+                 decoder-contract version.",
+            );
+
         // R4 frame-offset spinner (shared state with the window strip).
         let mut offset = ctx.offset;
         ui.horizontal(|ui| {

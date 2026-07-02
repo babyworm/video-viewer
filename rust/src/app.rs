@@ -1592,13 +1592,17 @@ impl VideoViewerApp {
                         .parent()
                         .and_then(|p| p.to_str())
                         .map(str::to_string);
+                    // No effective command here (this branch), so there is
+                    // no template to seed the level combo from.
                     let mut dlg =
-                        dialogs::DecoderRunDialog::new(initial_dir.as_deref());
+                        dialogs::DecoderRunDialog::new(initial_dir.as_deref(), None);
                     dlg.path = path;
                     self.decoder_run_dialog = Some(dlg);
                     self.dialog_state = DialogState::DecoderRun;
                 } else {
-                    self.start_decoder_run(ctx, &path);
+                    // Dropped file: default level (Standard/syntax lives in
+                    // the template itself; no rewrite needed).
+                    self.start_decoder_run(ctx, &path, None);
                 }
             }
             DroppedKind::Other => {
@@ -1631,9 +1635,18 @@ impl VideoViewerApp {
     /// the files the command produces). The command is the configured
     /// Settings template or, when empty, the auto-detected codec-analyzer
     /// (0.16.0). Any in-flight run is cancelled first (job-id gate + kill).
-    fn start_decoder_run(&mut self, ctx: &egui::Context, input: &str) {
+    ///
+    /// `level` (M-A §D): rewrite the template's `--telemetry-level` token to
+    /// the chosen capture level; templates without the token run untouched
+    /// (token-only rule — no blind insertion into arbitrary shell commands).
+    fn start_decoder_run(
+        &mut self,
+        ctx: &egui::Context,
+        input: &str,
+        level: Option<crate::core::decoder_run::TelemetryLevel>,
+    ) {
         use crate::core::decoder_run;
-        let Some((template, detected)) = self.effective_decoder_command() else {
+        let Some((mut template, detected)) = self.effective_decoder_command() else {
             // The dialog gates on this, but keep a belt-and-braces message.
             self.status_error = Some(
                 "No decoder found — set the decoder command in Settings first"
@@ -1641,6 +1654,11 @@ impl VideoViewerApp {
             );
             return;
         };
+        if let Some(level) = level {
+            if let Some(t) = decoder_run::set_telemetry_level(&template, level) {
+                template = t;
+            }
+        }
         let input_path = std::path::PathBuf::from(input);
         if !input_path.is_file() {
             self.status_error = Some(format!("Bitstream not found: {input}"));
@@ -2651,11 +2669,17 @@ impl eframe::App for VideoViewerApp {
                         .clicked()
                     {
                         ui.close_menu();
+                        // Seed the level combo from the effective template's
+                        // current --telemetry-level value (M-A §D).
+                        let template = self
+                            .effective_decoder_command()
+                            .map(|(cmd, _)| cmd);
                         let initial_dir = self.current_file.as_ref()
                             .and_then(|f| std::path::Path::new(f).parent())
                             .and_then(|p| p.to_str());
-                        self.decoder_run_dialog =
-                            Some(dialogs::DecoderRunDialog::new(initial_dir));
+                        self.decoder_run_dialog = Some(
+                            dialogs::DecoderRunDialog::new(initial_dir, template.as_deref()),
+                        );
                         self.dialog_state = DialogState::DecoderRun;
                     }
                     if ui.button("Load Bitstream Telemetry (.catb)…").clicked() {
@@ -3794,9 +3818,17 @@ impl VideoViewerApp {
                 let command_set = effective.is_some();
                 let detected_source =
                     effective.as_ref().and_then(|(_, src)| src.as_deref());
-                if let Some(result) = dlg.show(ctx, command_set, detected_source) {
+                // M-A §D: the level combo only rewrites templates that carry
+                // a --telemetry-level token.
+                let has_level_token = effective.as_ref().is_some_and(|(cmd, _)| {
+                    crate::core::decoder_run::has_telemetry_level_token(cmd)
+                });
+                if let Some(result) =
+                    dlg.show(ctx, command_set, detected_source, has_level_token)
+                {
+                    let level = dlg.telemetry_level;
                     if let Some(path) = result {
-                        self.start_decoder_run(ctx, &path);
+                        self.start_decoder_run(ctx, &path, Some(level));
                     }
                     self.dialog_state = DialogState::None;
                     self.decoder_run_dialog = None;

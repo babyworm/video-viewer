@@ -1085,7 +1085,7 @@ impl SettingsDialog {
                 if !showed_detected {
                     ui.weak(
                         "Example: python -m codec_analyzer decoder-run {input} \
-                         --decoder-workdir {workdir} --telemetry-level block --yuv-output {yuv}",
+                         --decoder-workdir {workdir} --telemetry-level syntax --yuv-output {yuv}",
                     );
                 }
 
@@ -1779,19 +1779,31 @@ impl CatbFileDialog {
 /// button is disabled and the dialog explains how to enable the feature.
 pub struct DecoderRunDialog {
     pub path: String,
+    /// Telemetry capture level for this run (M-A §D). Applied by rewriting
+    /// the template's `--telemetry-level` token; when the template carries
+    /// no token the combo is disabled and the template runs untouched.
+    pub telemetry_level: crate::core::decoder_run::TelemetryLevel,
     file_browser: Option<FileBrowser>,
     initial_dir: PathBuf,
 }
 
 impl DecoderRunDialog {
-    pub fn new(initial_dir: Option<&str>) -> Self {
+    /// `command_template` is the effective decoder command (Settings or
+    /// auto-detected): the combo is seeded from its current
+    /// `--telemetry-level` value so opening the dialog and pressing Run does
+    /// not silently override the level configured in the template (M-A §D).
+    pub fn new(initial_dir: Option<&str>, command_template: Option<&str>) -> Self {
         let initial_dir = initial_dir
             .map(PathBuf::from)
             .filter(|p| p.is_dir())
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("/"));
+        let telemetry_level = command_template
+            .and_then(crate::core::decoder_run::get_telemetry_level)
+            .unwrap_or(crate::core::decoder_run::TelemetryLevel::Syntax);
         Self {
             path: String::new(),
+            telemetry_level,
             file_browser: None,
             initial_dir,
         }
@@ -1800,12 +1812,15 @@ impl DecoderRunDialog {
     /// Returns Some(Some(path)) on Run, Some(None) on cancel, None while open.
     /// `command_set` gates the Run button (decoder template configured or
     /// auto-detected); `detected_source` is the auto-detection provenance to
-    /// display when no explicit command is configured (0.16.0).
+    /// display when no explicit command is configured (0.16.0);
+    /// `has_level_token` enables the telemetry-level combo (the effective
+    /// template contains a rewritable `--telemetry-level` token).
     pub fn show(
         &mut self,
         ctx: &egui::Context,
         command_set: bool,
         detected_source: Option<&str>,
+        has_level_token: bool,
     ) -> Option<Option<String>> {
         let mut result = None;
         let mut open = true;
@@ -1845,6 +1860,34 @@ impl DecoderRunDialog {
                     "Runs the external decoder command from Settings, then loads \
                      the produced telemetry.catb (and decoded.yuv when no video is open).",
                 );
+
+                // M-A §D: telemetry capture level (Fast/Standard/Deep).
+                ui.horizontal(|ui| {
+                    use crate::core::decoder_run::TELEMETRY_LEVELS;
+                    ui.label("Telemetry level:");
+                    ui.add_enabled_ui(has_level_token, |ui| {
+                        egui::ComboBox::from_id_salt("decoder_run_level")
+                            .selected_text(self.telemetry_level.label())
+                            .show_ui(ui, |ui| {
+                                for level in TELEMETRY_LEVELS {
+                                    ui.selectable_value(
+                                        &mut self.telemetry_level,
+                                        level,
+                                        level.label(),
+                                    )
+                                    .on_hover_text(level.description());
+                                }
+                            })
+                            .response
+                            .on_hover_text(self.telemetry_level.description())
+                            .on_disabled_hover_text(
+                                "The decoder command has no --telemetry-level \
+                                 token to rewrite — the template runs as-is. \
+                                 Add \"--telemetry-level syntax\" to it in \
+                                 Settings to enable this selector.",
+                            );
+                    });
+                });
 
                 // Inline file browser
                 if let Some(ref mut fb) = self.file_browser {

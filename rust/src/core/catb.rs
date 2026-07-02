@@ -86,6 +86,82 @@ pub struct CatbMeta {
     pub parameter_sets: serde_json::Value,
     /// Whether the `frames_meta` parallel array is present.
     pub has_frames_meta: bool,
+    /// Structured `parameter_sets` (M-A Structure tab). Lenient: entries
+    /// that are not objects are skipped; missing key → empty.
+    pub parameter_set_infos: Vec<ParameterSetInfo>,
+    /// Structured `frames_meta`, parallel to FRAME records (§4). Lenient:
+    /// missing/mistyped elements decay to empty defaults, never an error.
+    pub frames_meta: Vec<CatbFrameMeta>,
+}
+
+/// One `meta.parameter_sets` entry: `{kind, id, nal_index, fields{...}}`
+/// (fields observed in the fixtures: VPS/SPS/PPS with plain scalar values).
+#[derive(Debug, Clone, Default)]
+pub struct ParameterSetInfo {
+    /// "VPS" / "SPS" / "PPS" (AV1: sequence header kind string).
+    pub kind: String,
+    pub id: i64,
+    pub nal_index: Option<i64>,
+    /// Sorted (name, rendered value) pairs of the decoder-defined `fields`
+    /// object (serde_json objects iterate key-sorted).
+    pub fields: Vec<(String, String)>,
+}
+
+/// One `frames_meta[i].slice_headers[]` row. Observed fixture keys:
+/// `nal_index`, `nal_unit_name`, `payload_bits`, `parsed_bits`, `data_bits`,
+/// `slice_pic_parameter_set_id`, `slice_type`, `slice_type_label`,
+/// `ref_list0` / `ref_list1` (only when present), `syntax` (rows with
+/// name/value/coding/bit_offset/bits).
+#[derive(Debug, Clone, Default)]
+pub struct SliceHeaderInfo {
+    /// `nal_unit_name`, e.g. "IDR_N_LP", "TRAIL_R". Empty if absent.
+    pub nal_unit_name: String,
+    /// `slice_type_label`, e.g. "I"/"P"/"B". Empty if absent.
+    pub slice_type_label: String,
+    pub nal_index: Option<i64>,
+    /// Sorted (name, rendered value) pairs of every scalar top-level key
+    /// (arrays/objects like ref lists and syntax are surfaced separately).
+    pub fields: Vec<(String, String)>,
+    /// Decoded slice-header syntax rows as (name, value) in stored order.
+    pub syntax: Vec<(String, String)>,
+    pub ref_list0: Vec<RefListEntry>,
+    pub ref_list1: Vec<RefListEntry>,
+}
+
+/// One reference-list entry: `{poc, long_term, label}` (observed keys).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RefListEntry {
+    pub poc: i64,
+    pub long_term: bool,
+    /// e.g. "L0[0] POC 0". Empty if absent.
+    pub label: String,
+}
+
+/// One `frames_meta[i].dpb[]` row — DPB state after the picture. Observed
+/// keys: `poc`, `slot`, `used_for_reference`, `long_term`, `output_mark`,
+/// `label`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DpbRow {
+    pub poc: i64,
+    pub slot: Option<i64>,
+    /// `used_for_reference`; false = held for output only ("hold").
+    pub used_for_reference: bool,
+    pub long_term: bool,
+    pub output_mark: bool,
+    /// e.g. "slot[0] POC 0". Empty if absent.
+    pub label: String,
+}
+
+/// Structured `frames_meta[i]` element (parallel to FRAME record `i`).
+#[derive(Debug, Clone, Default)]
+pub struct CatbFrameMeta {
+    pub slice_headers: Vec<SliceHeaderInfo>,
+    pub dpb: Vec<DpbRow>,
+    /// Per-block missing-exactness label string, parallel to the frame's
+    /// BLOCK records ("" = nothing missing).
+    pub exactness_missing: Vec<String>,
+    /// Per-block dropped telemetry row count, parallel to BLOCK records.
+    pub block_dropped_rows: Vec<i64>,
 }
 
 /// One FRAME record (80 bytes), with string ids resolved and −1 sentinels
@@ -515,17 +591,190 @@ fn parse_meta(bytes: &[u8]) -> Result<CatbMeta, String> {
             .unwrap_or("")
             .to_string()
     };
+    let parameter_sets = v
+        .get("parameter_sets")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let parameter_set_infos = parse_parameter_sets(&parameter_sets);
+    let frames_meta_raw = v.get("frames_meta");
+    let has_frames_meta = frames_meta_raw.map(|x| x.is_array()).unwrap_or(false);
+    let frames_meta = frames_meta_raw
+        .and_then(|x| x.as_array())
+        .map(|arr| arr.iter().map(parse_frame_meta).collect())
+        .unwrap_or_default();
     Ok(CatbMeta {
         schema_version: v.get("schema_version").and_then(|x| x.as_i64()),
         codec: str_of(&decoder, "codec"),
         contract: str_of(&decoder, "contract"),
         capture_level: str_of(&decoder, "capture_level"),
-        parameter_sets: v
-            .get("parameter_sets")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null),
-        has_frames_meta: v.get("frames_meta").map(|x| x.is_array()).unwrap_or(false),
+        parameter_sets,
+        has_frames_meta,
+        parameter_set_infos,
+        frames_meta,
     })
+}
+
+/// Render a scalar JSON value for the (name, value) field grids. Non-scalar
+/// values yield `None` (they are surfaced through dedicated structures).
+fn scalar_text(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Null => Some("null".to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Sorted (name, value) pairs of an object's scalar members. serde_json
+/// objects iterate key-sorted (BTreeMap), so the result is name-ordered.
+fn scalar_fields(obj: &serde_json::Value) -> Vec<(String, String)> {
+    obj.as_object()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| scalar_text(v).map(|t| (k.clone(), t)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Lenient `meta.parameter_sets` → structured list (non-objects skipped).
+fn parse_parameter_sets(sets: &serde_json::Value) -> Vec<ParameterSetInfo> {
+    let Some(arr) = sets.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter(|s| s.is_object())
+        .map(|s| ParameterSetInfo {
+            kind: s
+                .get("kind")
+                .and_then(|k| k.as_str())
+                .unwrap_or("")
+                .to_string(),
+            id: s.get("id").and_then(|i| i.as_i64()).unwrap_or(0),
+            nal_index: s.get("nal_index").and_then(|i| i.as_i64()),
+            fields: s
+                .get("fields")
+                .map(scalar_fields)
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Lenient reference-list array (`ref_list0` / `ref_list1`) parser.
+fn parse_ref_list(v: Option<&serde_json::Value>) -> Vec<RefListEntry> {
+    v.and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|e| RefListEntry {
+                    poc: e.get("poc").and_then(|p| p.as_i64()).unwrap_or(0),
+                    long_term: e
+                        .get("long_term")
+                        .and_then(|l| l.as_bool())
+                        .unwrap_or(false),
+                    label: e
+                        .get("label")
+                        .and_then(|l| l.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Lenient `frames_meta[i]` element parser (any missing/mistyped member
+/// decays to its empty default).
+fn parse_frame_meta(v: &serde_json::Value) -> CatbFrameMeta {
+    let slice_headers = v
+        .get("slice_headers")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|sh| SliceHeaderInfo {
+                    nal_unit_name: sh
+                        .get("nal_unit_name")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    slice_type_label: sh
+                        .get("slice_type_label")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    nal_index: sh.get("nal_index").and_then(|i| i.as_i64()),
+                    fields: scalar_fields(sh),
+                    syntax: sh
+                        .get("syntax")
+                        .and_then(|x| x.as_array())
+                        .map(|rows| {
+                            rows.iter()
+                                .filter_map(|r| {
+                                    let name = r.get("name")?.as_str()?.to_string();
+                                    let value = r
+                                        .get("value")
+                                        .and_then(scalar_text)
+                                        .unwrap_or_default();
+                                    Some((name, value))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    ref_list0: parse_ref_list(sh.get("ref_list0")),
+                    ref_list1: parse_ref_list(sh.get("ref_list1")),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let dpb = v
+        .get("dpb")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|r| DpbRow {
+                    poc: r.get("poc").and_then(|p| p.as_i64()).unwrap_or(0),
+                    slot: r.get("slot").and_then(|s| s.as_i64()),
+                    used_for_reference: r
+                        .get("used_for_reference")
+                        .and_then(|b| b.as_bool())
+                        .unwrap_or(false),
+                    long_term: r
+                        .get("long_term")
+                        .and_then(|b| b.as_bool())
+                        .unwrap_or(false),
+                    output_mark: r
+                        .get("output_mark")
+                        .and_then(|b| b.as_bool())
+                        .unwrap_or(false),
+                    label: r
+                        .get("label")
+                        .and_then(|l| l.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let exactness_missing = v
+        .get("exactness_missing")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|e| e.as_str().unwrap_or("").to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let block_dropped_rows = v
+        .get("block_dropped_rows")
+        .and_then(|x| x.as_array())
+        .map(|arr| arr.iter().map(|e| e.as_i64().unwrap_or(0)).collect())
+        .unwrap_or_default();
+    CatbFrameMeta {
+        slice_headers,
+        dpb,
+        exactness_missing,
+        block_dropped_rows,
+    }
 }
 
 /// Parse one 80-byte FRAME record at `off` (§5).

@@ -19,8 +19,9 @@ use parking_lot::Mutex;
 
 use crate::analysis::bitstream_panel::format_bits;
 use crate::analysis::bitstream_stats::{
-    hit_test_min_area, lod_cell_size, rasterize_blocks, use_lod, viewer_to_catb_display,
-    BitstreamFile, BitstreamGrid, FrameTypeClass, IntraDir, ModeClass,
+    build_filmstrip_refs, hit_test_min_area, lod_cell_size, rasterize_blocks, ref_count_tier,
+    use_lod, viewer_to_catb_display, BitstreamFile, BitstreamGrid, FilmstripRefs, FrameTypeClass,
+    IntraDir, ModeClass,
 };
 use crate::analysis::correlation::{
     aggregate_bitstream_to_g, align, class_table, classes_at_g, csv_dump, opportunity_grid,
@@ -570,6 +571,9 @@ enum BsTab {
     Viewer,
     Correlation,
     FrameGraph,
+    /// M-A: parameter sets / slice headers / DPB / exactness (VQA Syntax
+    /// panel + Unit Info DPB tab analogue).
+    Structure,
 }
 
 /// Selection: catb display frame + index into that frame's block list.
@@ -681,14 +685,22 @@ pub struct BitstreamWindow {
     /// `frame_summary` (String clone) per cell per repaint is O(total)
     /// allocations at 30 fps.
     filmstrip_cache: Option<FilmstripCache>,
+    /// M-A §C: filmstrip reference arrows + frequency dots toggle
+    /// (session-only; default on — one arc set + tiny dots per repaint).
+    show_refs: bool,
+    /// M-A §B: Structure tab parameter-set field name filter.
+    structure_filter: String,
 }
 
-/// Cached per-viewer-frame filmstrip classes (see field docs above).
+/// Cached per-viewer-frame filmstrip classes + reference graph (M-A §C).
+/// Keyed on (file, offset, total): `build_filmstrip_refs` scans every
+/// frame's slice_headers once per key change, never per repaint.
 struct FilmstripCache {
     file_ptr: usize,
     offset: i32,
     total: usize,
     classes: Vec<Option<FrameTypeClass>>,
+    refs: FilmstripRefs,
 }
 
 /// Opportunity grid derived from the current frame's aligned pair (M3).
@@ -776,6 +788,8 @@ impl BitstreamWindow {
             opp_focus: None,
             pending_center: None,
             filmstrip_cache: None,
+            show_refs: true,
+            structure_filter: String::new(),
         }
     }
 
@@ -894,6 +908,7 @@ impl BitstreamWindow {
                     BsTab::Viewer => self.ui_viewer_tab(ctx, &snap),
                     BsTab::Correlation => self.ui_correlation_tab(ctx, &snap),
                     BsTab::FrameGraph => self.ui_frame_graph_tab(ctx, &snap),
+                    BsTab::Structure => self.ui_structure_tab(ctx, &snap),
                 }
 
                 // Tell the root whether it must keep computing analysis
@@ -1145,6 +1160,7 @@ impl BitstreamWindow {
                 ui.selectable_value(&mut self.tab, BsTab::Viewer, "Viewer");
                 ui.selectable_value(&mut self.tab, BsTab::Correlation, "Correlation");
                 ui.selectable_value(&mut self.tab, BsTab::FrameGraph, "Frame Graph");
+                ui.selectable_value(&mut self.tab, BsTab::Structure, "Structure");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.monospace(self.sync_readout(snap));
                 });
@@ -1298,7 +1314,7 @@ impl BitstreamWindow {
 
     fn ui_viewer_tab(&mut self, ctx: &egui::Context, snap: &Snapshot) {
         self.ui_toolbar(ctx);
-        self.ui_transport_and_status(ctx, snap);
+        self.ui_transport_and_status(ctx, snap, true);
         self.ui_filmstrip(ctx, snap);
         self.ui_inspector(ctx, snap);
 
@@ -1929,6 +1945,13 @@ impl BitstreamWindow {
                 ui.label(
                     egui::RichText::new(format!("Block ({}, {})", b.x, b.y)).strong(),
                 );
+                // M-A §B-4: per-block exactness from frames_meta (parallel
+                // to the frame's BLOCK records). None when the .catb has no
+                // frames_meta.
+                let exactness: Option<String> = file
+                    .decode_idx(sel.display_idx)
+                    .and_then(|dec| file.catb.meta.frames_meta.get(dec))
+                    .and_then(|m| m.exactness_missing.get(sel.block_idx).cloned());
                 egui::Grid::new("bs_inspector_grid")
                     .spacing(egui::vec2(10.0, 3.0))
                     .show(ui, |ui| {
@@ -1988,6 +2011,18 @@ impl BitstreamWindow {
                             ui.monospace(format!("{poc}"));
                             ui.end_row();
                         }
+                        if let Some(em) = &exactness {
+                            ui.label("exact");
+                            if em.is_empty() {
+                                ui.monospace("✓");
+                            } else {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(240, 200, 40),
+                                    format!("missing: {em}"),
+                                );
+                            }
+                            ui.end_row();
+                        }
                     });
 
                 // REF records: per-PU reference rows (§10 of the format).
@@ -2042,8 +2077,11 @@ impl BitstreamWindow {
     // -- filmstrip (§4) --------------------------------------------------------
 
     fn ui_filmstrip(&mut self, ctx: &egui::Context, snap: &Snapshot) {
+        // M-A §C: reference arcs need headroom above the cells.
+        let refs_on = self.show_refs && snap.file.is_some();
+        let arc_band = if refs_on { 16.0_f32 } else { 0.0 };
         egui::TopBottomPanel::bottom("bs_filmstrip")
-            .exact_height(30.0)
+            .exact_height(30.0 + arc_band)
             .show(ctx, |ui| {
                 let total = snap.viewer_total;
                 if total == 0 {
@@ -2053,7 +2091,7 @@ impl BitstreamWindow {
                 let avail_w = ui.available_width();
                 let cell_w = (avail_w / total as f32).max(3.0);
                 let strip_w = cell_w * total as f32;
-                let h = 24.0_f32;
+                let h = 24.0_f32 + arc_band;
                 egui::ScrollArea::horizontal()
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
@@ -2087,14 +2125,24 @@ impl BitstreamWindow {
                                     })
                                 })
                                 .collect();
+                            // M-A §C: one full slice_headers scan per key.
+                            let refs = snap
+                                .file
+                                .as_ref()
+                                .map(|f| build_filmstrip_refs(f, snap.offset, total))
+                                .unwrap_or_default();
                             self.filmstrip_cache = Some(FilmstripCache {
                                 file_ptr,
                                 offset: snap.offset,
                                 total,
                                 classes,
+                                refs,
                             });
                         }
-                        let classes = &self.filmstrip_cache.as_ref().expect("just built").classes;
+                        let cache = self.filmstrip_cache.as_ref().expect("just built");
+                        let classes = &cache.classes;
+                        let cells_top = rect.min.y + arc_band;
+                        let cell_h = 24.0 - 4.0;
                         // Only paint the cells inside the visible scroll clip.
                         let clip = painter.clip_rect();
                         let first = (((clip.min.x - rect.min.x) / cell_w).floor().max(0.0)) as usize;
@@ -2103,8 +2151,8 @@ impl BitstreamWindow {
                         for i in first..last {
                             let x0 = rect.min.x + i as f32 * cell_w;
                             let cell = egui::Rect::from_min_size(
-                                egui::pos2(x0, rect.min.y + 2.0),
-                                egui::vec2((cell_w - 1.0).max(1.0), h - 4.0),
+                                egui::pos2(x0, cells_top + 2.0),
+                                egui::vec2((cell_w - 1.0).max(1.0), cell_h),
                             );
                             let class = classes.get(i).copied().flatten();
                             painter.rect_filled(cell, 1.0, filmstrip_color(class));
@@ -2115,6 +2163,84 @@ impl BitstreamWindow {
                                     egui::Stroke::new(2.0, egui::Color32::WHITE),
                                     egui::StrokeKind::Outside,
                                 );
+                            }
+                            if refs_on {
+                                // Reference-frequency dot (red, 3 size tiers).
+                                let tier = ref_count_tier(
+                                    cache.refs.counts.get(i).copied().unwrap_or(0),
+                                );
+                                if tier > 0 {
+                                    let radius = match tier {
+                                        1 => 1.2,
+                                        2 => 2.0,
+                                        _ => 2.8,
+                                    };
+                                    painter.circle_filled(
+                                        egui::pos2(cell.center().x, cell.max.y - 3.0),
+                                        radius,
+                                        egui::Color32::from_rgb(235, 55, 55),
+                                    );
+                                }
+                                // Exactness problem: thin yellow top marker.
+                                if cache.refs.exactness.get(i).copied().unwrap_or(false) {
+                                    painter.line_segment(
+                                        [
+                                            egui::pos2(cell.min.x, cell.min.y + 1.0),
+                                            egui::pos2(cell.max.x, cell.min.y + 1.0),
+                                        ],
+                                        egui::Stroke::new(
+                                            2.0,
+                                            egui::Color32::from_rgb(240, 200, 40),
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        // M-A §C: reference arcs of the *current* frame only
+                        // (VQA Thumbnails view convention) — L0 orange /
+                        // L1 purple / long-term green, arcing through the
+                        // band above the cells.
+                        if refs_on {
+                            if let Some(edges) = cache.refs.edges.get(snap.viewer_frame) {
+                                let cell_center_x = |i: usize| {
+                                    rect.min.x + i as f32 * cell_w + cell_w * 0.5
+                                };
+                                let y0 = cells_top + 2.0;
+                                for e in edges {
+                                    let color = if e.long_term {
+                                        egui::Color32::from_rgb(60, 200, 80)
+                                    } else if e.list == 0 {
+                                        egui::Color32::from_rgb(255, 150, 20)
+                                    } else {
+                                        egui::Color32::from_rgb(170, 90, 230)
+                                    };
+                                    let from = egui::pos2(
+                                        cell_center_x(snap.viewer_frame),
+                                        y0,
+                                    );
+                                    let to = egui::pos2(cell_center_x(e.to), y0);
+                                    let ctrl = egui::pos2(
+                                        (from.x + to.x) * 0.5,
+                                        (rect.min.y + 2.0).max(y0 - arc_band + 2.0),
+                                    );
+                                    painter.add(
+                                        egui::epaint::QuadraticBezierShape::from_points_stroke(
+                                            [from, ctrl, to],
+                                            false,
+                                            egui::Color32::TRANSPARENT,
+                                            egui::Stroke::new(1.4, color),
+                                        ),
+                                    );
+                                    // Chevron head at the referenced frame.
+                                    painter.line_segment(
+                                        [to, to + egui::vec2(-3.0, -4.0)],
+                                        egui::Stroke::new(1.4, color),
+                                    );
+                                    painter.line_segment(
+                                        [to, to + egui::vec2(3.0, -4.0)],
+                                        egui::Stroke::new(1.4, color),
+                                    );
+                                }
                             }
                         }
                         // Click → seek via the root (one-way pull model, §4).
@@ -2151,7 +2277,14 @@ impl BitstreamWindow {
 
     // -- transport + status strip (§1, §7) --------------------------------------
 
-    fn ui_transport_and_status(&mut self, ctx: &egui::Context, snap: &Snapshot) {
+    /// `with_refs_toggle`: show the filmstrip "Refs" toggle — pass `true`
+    /// only from tabs that also call [`Self::ui_filmstrip`].
+    fn ui_transport_and_status(
+        &mut self,
+        ctx: &egui::Context,
+        snap: &Snapshot,
+        with_refs_toggle: bool,
+    ) {
         egui::TopBottomPanel::bottom("bs_transport").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let total = snap.viewer_total;
@@ -2195,6 +2328,24 @@ impl BitstreamWindow {
                 if offset != snap.offset {
                     self.shared.lock().offset_request = Some(offset);
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+
+                // M-A §C: filmstrip reference-arrows toggle (small, next to
+                // the strip it controls). Only offered on tabs that actually
+                // render the filmstrip — the Correlation tab has none.
+                if with_refs_toggle
+                    && snap.file.is_some()
+                    && ui
+                        .selectable_label(self.show_refs, "Refs")
+                        .on_hover_text(
+                            "Filmstrip reference view: current frame's \
+                             ref_list0 (orange) / ref_list1 (purple) arcs \
+                             (long-term green), reference-usage dots, and \
+                             exactness markers",
+                        )
+                        .clicked()
+                {
+                    self.show_refs = !self.show_refs;
                 }
 
                 // §7 status strip — fixed wording.
@@ -2413,7 +2564,7 @@ impl BitstreamWindow {
 
     #[allow(clippy::too_many_lines)]
     fn ui_correlation_tab(&mut self, ctx: &egui::Context, snap: &Snapshot) {
-        self.ui_transport_and_status(ctx, snap);
+        self.ui_transport_and_status(ctx, snap, false);
         // M3 timeline strip — added after the transport so it stacks above it.
         self.ui_corr_timeline(ctx, snap);
         self.refresh_corr_derived(snap);
@@ -2924,10 +3075,388 @@ impl BitstreamWindow {
         }
     }
 
+    // -- Structure tab (M-A) -----------------------------------------------
+    //
+    // VQAnalyzer parity: Syntax panel (VPS/SPS/PPS/Slice tabs) + Unit Info
+    // "DPB info" tab. Layout: one scrollable column of CollapsingHeader
+    // sections instead of a left-tree/right-detail split — the per-frame
+    // data volume is small (a handful of parameter sets, 1–few slices,
+    // ≤16 DPB rows), the CollapsingHeader idiom matches the app's sidebar
+    // conventions, and a split would add selection state for no benefit.
+    // Frame navigation reuses the transport + filmstrip (auto-refresh on
+    // frame moves falls out of reading `snap` each pass).
+
+    #[allow(clippy::too_many_lines)]
+    fn ui_structure_tab(&mut self, ctx: &egui::Context, snap: &Snapshot) {
+        self.ui_transport_and_status(ctx, snap, true);
+        self.ui_filmstrip(ctx, snap);
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let Some(file) = snap.file.as_ref() else {
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        "Load a .catb to browse parameter sets, slice headers \
+                         and the DPB.",
+                    );
+                });
+                return;
+            };
+            let meta = &file.catb.meta;
+            // Current viewer frame → decode-order catb frame.
+            let decode = viewer_to_catb_display(snap.viewer_frame, snap.offset)
+                .and_then(|d| file.decode_idx(d));
+            let fmeta = decode.and_then(|d| meta.frames_meta.get(d));
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                // §D: capture level / decoder contract badge.
+                let level = if meta.capture_level.is_empty() {
+                    "n/a"
+                } else {
+                    meta.capture_level.as_str()
+                };
+                let contract = if meta.contract.is_empty() {
+                    "n/a"
+                } else {
+                    meta.contract.as_str()
+                };
+                ui.weak(format!(
+                    "capture level: {level} · decoder contract: {contract}"
+                ));
+                ui.separator();
+
+                // -- 1. Parameter Sets (VPS/SPS/PPS) --
+                egui::CollapsingHeader::new(format!(
+                    "Parameter Sets ({})",
+                    meta.parameter_set_infos.len()
+                ))
+                .default_open(true)
+                .show(ui, |ui| {
+                    if meta.parameter_set_infos.is_empty() {
+                        ui.weak("No parameter sets in this .catb.");
+                        return;
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Filter:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.structure_filter)
+                                .desired_width(180.0)
+                                .hint_text("field name contains…"),
+                        );
+                        if !self.structure_filter.is_empty()
+                            && ui.small_button("×").clicked()
+                        {
+                            self.structure_filter.clear();
+                        }
+                    });
+                    let needle = self.structure_filter.to_ascii_lowercase();
+                    for (k, ps) in meta.parameter_set_infos.iter().enumerate() {
+                        let title = format!(
+                            "{} {}{}",
+                            if ps.kind.is_empty() { "?" } else { &ps.kind },
+                            ps.id,
+                            ps.nal_index
+                                .map(|n| format!(" · nal#{n}"))
+                                .unwrap_or_default(),
+                        );
+                        egui::CollapsingHeader::new(title)
+                            .id_salt(("bs_ps", k))
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                let rows: Vec<&(String, String)> = ps
+                                    .fields
+                                    .iter()
+                                    .filter(|(n, _)| {
+                                        needle.is_empty()
+                                            || n.to_ascii_lowercase().contains(&needle)
+                                    })
+                                    .collect();
+                                if rows.is_empty() {
+                                    ui.weak(if ps.fields.is_empty() {
+                                        "no fields"
+                                    } else {
+                                        "no fields match the filter"
+                                    });
+                                    return;
+                                }
+                                egui::Grid::new(("bs_ps_grid", k))
+                                    .striped(true)
+                                    .spacing(egui::vec2(12.0, 2.0))
+                                    .show(ui, |ui| {
+                                        for (n, v) in rows {
+                                            ui.label(n);
+                                            ui.monospace(v);
+                                            ui.end_row();
+                                        }
+                                    });
+                            });
+                    }
+                });
+
+                // -- 2. Slice Headers — current frame --
+                let sh_title = match (decode, fmeta) {
+                    (Some(d), Some(m)) => format!(
+                        "Slice Headers — decode#{d} ({} slice{})",
+                        m.slice_headers.len(),
+                        if m.slice_headers.len() == 1 { "" } else { "s" },
+                    ),
+                    _ => "Slice Headers — current frame".to_string(),
+                };
+                egui::CollapsingHeader::new(sh_title)
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let Some(m) = fmeta else {
+                            ui.weak(if meta.frames_meta.is_empty() {
+                                "No frames_meta in this .catb."
+                            } else {
+                                "No catb frame maps to this viewer frame — check the offset."
+                            });
+                            return;
+                        };
+                        if m.slice_headers.is_empty() {
+                            ui.weak("No slice headers recorded for this frame.");
+                            return;
+                        }
+                        for (si, sh) in m.slice_headers.iter().enumerate() {
+                            let title = format!(
+                                "Slice {si} — {}{}{}",
+                                if sh.slice_type_label.is_empty() {
+                                    "?"
+                                } else {
+                                    &sh.slice_type_label
+                                },
+                                if sh.nal_unit_name.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" · {}", sh.nal_unit_name)
+                                },
+                                sh.nal_index
+                                    .map(|n| format!(" · nal#{n}"))
+                                    .unwrap_or_default(),
+                            );
+                            egui::CollapsingHeader::new(title)
+                                .id_salt(("bs_slice", si))
+                                .default_open(si == 0)
+                                .show(ui, |ui| {
+                                    egui::Grid::new(("bs_slice_fields", si))
+                                        .striped(true)
+                                        .spacing(egui::vec2(12.0, 2.0))
+                                        .show(ui, |ui| {
+                                            for (n, v) in &sh.fields {
+                                                ui.label(n);
+                                                ui.monospace(v);
+                                                ui.end_row();
+                                            }
+                                        });
+                                    if !sh.syntax.is_empty() {
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            egui::RichText::new("decoded syntax")
+                                                .small()
+                                                .strong(),
+                                        );
+                                        egui::Grid::new(("bs_slice_syntax", si))
+                                            .striped(true)
+                                            .spacing(egui::vec2(12.0, 2.0))
+                                            .show(ui, |ui| {
+                                                for (n, v) in &sh.syntax {
+                                                    ui.label(n);
+                                                    ui.monospace(v);
+                                                    ui.end_row();
+                                                }
+                                            });
+                                    }
+                                    for (li, list) in
+                                        [(0, &sh.ref_list0), (1, &sh.ref_list1)]
+                                    {
+                                        if list.is_empty() {
+                                            continue;
+                                        }
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            egui::RichText::new(format!("ref_list{li}"))
+                                                .small()
+                                                .strong(),
+                                        );
+                                        egui::Grid::new(("bs_slice_refs", si, li))
+                                            .striped(true)
+                                            .spacing(egui::vec2(12.0, 2.0))
+                                            .show(ui, |ui| {
+                                                for head in ["idx", "POC", "LT", "label"]
+                                                {
+                                                    ui.label(
+                                                        egui::RichText::new(head)
+                                                            .small()
+                                                            .strong(),
+                                                    );
+                                                }
+                                                ui.end_row();
+                                                for (ri, e) in list.iter().enumerate() {
+                                                    ui.monospace(format!("{ri}"));
+                                                    ui.monospace(format!("{}", e.poc));
+                                                    ui.monospace(if e.long_term {
+                                                        "LT"
+                                                    } else {
+                                                        "-"
+                                                    });
+                                                    ui.monospace(&e.label);
+                                                    ui.end_row();
+                                                }
+                                            });
+                                    }
+                                });
+                        }
+                    });
+
+                // -- 3. DPB — current frame --
+                egui::CollapsingHeader::new("DPB — current frame")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let Some(m) = fmeta else {
+                            ui.weak("No DPB data for this frame.");
+                            return;
+                        };
+                        if m.dpb.is_empty() {
+                            ui.weak("Empty DPB.");
+                            return;
+                        }
+                        // Active refs: POCs the current frame's slice ref
+                        // lists actually use.
+                        let active: std::collections::HashSet<i64> = m
+                            .slice_headers
+                            .iter()
+                            .flat_map(|sh| {
+                                sh.ref_list0.iter().chain(sh.ref_list1.iter())
+                            })
+                            .map(|e| e.poc)
+                            .collect();
+                        let active_color = egui::Color32::from_rgb(255, 170, 40);
+                        egui::Grid::new("bs_dpb_grid")
+                            .striped(true)
+                            .spacing(egui::vec2(12.0, 2.0))
+                            .show(ui, |ui| {
+                                for head in ["slot", "POC", "flags", "label"] {
+                                    ui.label(
+                                        egui::RichText::new(head).small().strong(),
+                                    );
+                                }
+                                ui.end_row();
+                                for row in &m.dpb {
+                                    let is_active = active.contains(&row.poc);
+                                    let mut flags: Vec<&str> = Vec::new();
+                                    flags.push(if row.used_for_reference {
+                                        "ref"
+                                    } else {
+                                        "hold"
+                                    });
+                                    if row.long_term {
+                                        flags.push("LT");
+                                    }
+                                    if row.output_mark {
+                                        flags.push("out");
+                                    }
+                                    let cells = [
+                                        row.slot
+                                            .map(|s| s.to_string())
+                                            .unwrap_or_else(|| "-".to_string()),
+                                        row.poc.to_string(),
+                                        flags.join(" "),
+                                        row.label.clone(),
+                                    ];
+                                    for cell in cells {
+                                        if is_active {
+                                            ui.colored_label(
+                                                active_color,
+                                                egui::RichText::new(cell).monospace(),
+                                            );
+                                        } else {
+                                            ui.monospace(cell);
+                                        }
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                        ui.weak(
+                            "orange = used by the current frame's active slice \
+                             reference lists",
+                        );
+                    });
+
+                // -- 4. Exactness — current frame --
+                egui::CollapsingHeader::new("Exactness")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let Some(m) = fmeta else {
+                            ui.weak("No exactness data for this frame.");
+                            return;
+                        };
+                        if m.exactness_missing.is_empty()
+                            && m.block_dropped_rows.is_empty()
+                        {
+                            ui.weak("No exactness data in this .catb.");
+                            return;
+                        }
+                        let missing_blocks = m
+                            .exactness_missing
+                            .iter()
+                            .filter(|s| !s.is_empty())
+                            .count();
+                        let dropped: i64 = m.block_dropped_rows.iter().sum();
+                        if missing_blocks == 0 && dropped == 0 {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(90, 200, 100),
+                                format!(
+                                    "✓ all {} blocks exact · no dropped telemetry rows",
+                                    m.exactness_missing.len()
+                                ),
+                            );
+                        } else {
+                            if missing_blocks > 0 {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(240, 200, 40),
+                                    format!(
+                                        "⚠ {missing_blocks}/{} blocks with missing \
+                                         exactness keys",
+                                        m.exactness_missing.len()
+                                    ),
+                                );
+                                let mut keys: Vec<&str> = m
+                                    .exactness_missing
+                                    .iter()
+                                    .filter(|s| !s.is_empty())
+                                    .flat_map(|s| s.split(','))
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+                                keys.sort_unstable();
+                                keys.dedup();
+                                ui.weak(format!("missing keys: {}", keys.join(", ")));
+                            }
+                            if dropped > 0 {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(240, 200, 40),
+                                    format!(
+                                        "⚠ {dropped} telemetry rows dropped across {} \
+                                         blocks",
+                                        m.block_dropped_rows
+                                            .iter()
+                                            .filter(|&&n| n > 0)
+                                            .count()
+                                    ),
+                                );
+                            }
+                        }
+                        ui.weak(
+                            "Per-block detail: select a block on the Viewer tab — \
+                             the Inspector shows its missing keys.",
+                        );
+                    });
+            });
+        });
+    }
+
     // -- Frame Graph tab -------------------------------------------------------
 
     fn ui_frame_graph_tab(&mut self, ctx: &egui::Context, snap: &Snapshot) {
-        self.ui_transport_and_status(ctx, snap);
+        self.ui_transport_and_status(ctx, snap, true);
         self.ui_filmstrip(ctx, snap);
         egui::CentralPanel::default().show(ctx, |ui| {
             use egui_plot::{Legend, Line, Plot, PlotPoints, VLine};

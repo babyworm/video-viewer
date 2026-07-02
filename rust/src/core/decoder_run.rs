@@ -2,7 +2,7 @@
 //!
 //! The viewer never bundles or links a decoder. The user registers a shell
 //! command *template* in Settings (e.g. `python -m codec_analyzer decoder-run
-//! {input} --decoder-workdir {workdir} --telemetry-level block --yuv-output
+//! {input} --decoder-workdir {workdir} --telemetry-level syntax --yuv-output
 //! {yuv}`); this module expands the placeholders, runs the command through
 //! the platform shell in a background thread, and the app then consumes the
 //! produced files (`telemetry.catb`, or any `*.catb` the decoder wrote into
@@ -111,9 +111,141 @@ pub fn expand_command(template: &str, input: &Path, workdir: &Path) -> ExpandedC
 // Zero-config auto-detection of a codec-analyzer installation (0.16.0)
 // ---------------------------------------------------------------------------
 
-/// Shared argument tail of every auto-detected command template.
+/// Shared argument tail of every auto-detected command template. Default
+/// level is **syntax** (06 §레벨: Intra layer / M-B Stats depend on SYNTAX
+/// rows; `block` drops them).
 const DETECT_ARGS: &str = "decoder-run {input} --decoder-workdir {workdir} \
-                           --telemetry-level block --yuv-output {yuv}";
+                           --telemetry-level syntax --yuv-output {yuv}";
+
+// ---------------------------------------------------------------------------
+// Telemetry capture level (M-A, 06 계획 §레벨)
+// ---------------------------------------------------------------------------
+
+/// Decoder-run capture verbosity presented in the dialog combo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryLevel {
+    /// Fast: block rows only — drops syntax/CABAC/transform detail.
+    Block,
+    /// Standard (default): block + syntax rows — Intra layer, Stats.
+    Syntax,
+    /// Deep: everything, incl. CABAC/transform rows (M-B Transform tab).
+    Full,
+}
+
+pub const TELEMETRY_LEVELS: [TelemetryLevel; 3] = [
+    TelemetryLevel::Block,
+    TelemetryLevel::Syntax,
+    TelemetryLevel::Full,
+];
+
+impl TelemetryLevel {
+    /// The `--telemetry-level` argument value.
+    pub fn arg(&self) -> &'static str {
+        match self {
+            TelemetryLevel::Block => "block",
+            TelemetryLevel::Syntax => "syntax",
+            TelemetryLevel::Full => "full",
+        }
+    }
+
+    /// Combo label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            TelemetryLevel::Block => "Fast (block)",
+            TelemetryLevel::Syntax => "Standard (syntax)",
+            TelemetryLevel::Full => "Deep (full)",
+        }
+    }
+
+    /// Tooltip: which viewer features each level enables.
+    pub fn description(&self) -> &'static str {
+        match self {
+            TelemetryLevel::Block => {
+                "Fastest capture. QP/bpp/Mode/MV fills, DPB & slice headers. \
+                 No intra direction lines, no syntax statistics."
+            }
+            TelemetryLevel::Syntax => {
+                "Recommended. Adds decoded syntax rows: intra direction \
+                 lines and per-element statistics work."
+            }
+            TelemetryLevel::Full => {
+                "Everything, incl. CABAC bins and transform/coefficient \
+                 rows (largest .catb; enables future Transform/CABAC views)."
+            }
+        }
+    }
+}
+
+/// True when `template` carries a `--telemetry-level <value>` (or `=<value>`)
+/// token the level combo can rewrite.
+pub fn has_telemetry_level_token(template: &str) -> bool {
+    template.contains("--telemetry-level")
+}
+
+/// Parse the current value of the `--telemetry-level` token in `template`
+/// (both `--telemetry-level <word>` and `--telemetry-level=<word>` forms).
+///
+/// Returns `None` when the token is absent or its value is not a known
+/// level — callers then fall back to the Standard default. Used to seed the
+/// dialog combo so it reflects the Settings template instead of silently
+/// overriding it (§D).
+pub fn get_telemetry_level(template: &str) -> Option<TelemetryLevel> {
+    const TOKEN: &str = "--telemetry-level";
+    let start = template.find(TOKEN)?;
+    let rest = &template[start + TOKEN.len()..];
+    // Same separator rule as `set_telemetry_level`: one '=' or whitespace;
+    // anything else (e.g. --telemetry-level-x) is not our token.
+    let value = match rest.chars().next() {
+        Some('=') => &rest[1..],
+        Some(c) if c.is_whitespace() => rest.trim_start(),
+        _ => return None,
+    };
+    let value = value.split_whitespace().next()?;
+    TELEMETRY_LEVELS.iter().copied().find(|l| l.arg() == value)
+}
+
+/// Replace the value of the `--telemetry-level` token with `level`.
+///
+/// Handles both `--telemetry-level <word>` and `--telemetry-level=<word>`.
+/// Returns `None` when the template has no token — the caller must then run
+/// the template untouched (blind insertion into an arbitrary shell command is
+/// unsafe; the dialog disables the combo instead, §D).
+pub fn set_telemetry_level(template: &str, level: TelemetryLevel) -> Option<String> {
+    const TOKEN: &str = "--telemetry-level";
+    let start = template.find(TOKEN)?;
+    let after = start + TOKEN.len();
+    let rest = &template[after..];
+    // Separator: one '=' or a whitespace run; anything else (e.g. a longer
+    // flag such as --telemetry-level-x) is not our token.
+    let mut chars = rest.char_indices().peekable();
+    let sep_end = match chars.peek() {
+        Some((_, '=')) => 1,
+        Some((_, c)) if c.is_whitespace() => {
+            let mut end = 0;
+            for (i, c) in rest.char_indices() {
+                if c.is_whitespace() {
+                    end = i + c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            end
+        }
+        _ => return None,
+    };
+    let value_start = after + sep_end;
+    let value_rest = &template[value_start..];
+    let value_len = value_rest
+        .char_indices()
+        .find(|(_, c)| c.is_whitespace())
+        .map(|(i, _)| i)
+        .unwrap_or(value_rest.len());
+    let mut out = String::with_capacity(template.len() + 8);
+    out.push_str(&template[..value_start]);
+    out.push_str(level.arg());
+    out.push_str(&template[value_start + value_len..]);
+    Some(out)
+}
 
 /// Launcher script name inside an exe-adjacent `codec-analyzer/` bundle.
 #[cfg(windows)]
@@ -448,6 +580,80 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_level_token_replacement() {
+        // Space-separated token (the DETECT_ARGS shape).
+        assert_eq!(
+            set_telemetry_level(
+                "ca decoder-run {input} --telemetry-level syntax --yuv-output {yuv}",
+                TelemetryLevel::Full,
+            )
+            .as_deref(),
+            Some("ca decoder-run {input} --telemetry-level full --yuv-output {yuv}")
+        );
+        // Downgrade to block.
+        assert_eq!(
+            set_telemetry_level("x --telemetry-level full", TelemetryLevel::Block).as_deref(),
+            Some("x --telemetry-level block")
+        );
+        // `=` form.
+        assert_eq!(
+            set_telemetry_level("x --telemetry-level=block -o out", TelemetryLevel::Syntax)
+                .as_deref(),
+            Some("x --telemetry-level=syntax -o out")
+        );
+        // Multiple spaces before the value survive.
+        assert_eq!(
+            set_telemetry_level("x --telemetry-level   block", TelemetryLevel::Full).as_deref(),
+            Some("x --telemetry-level   full")
+        );
+        // No token → None (template must run untouched; §D token-only rule).
+        assert_eq!(
+            set_telemetry_level("dec {input} -o {yuv}", TelemetryLevel::Full),
+            None
+        );
+        assert!(!has_telemetry_level_token("dec {input}"));
+        assert!(has_telemetry_level_token("dec --telemetry-level syntax"));
+        // The auto-detected template always carries the token, at Standard.
+        assert!(has_telemetry_level_token(DETECT_ARGS));
+        assert!(DETECT_ARGS.contains("--telemetry-level syntax"));
+    }
+
+    #[test]
+    fn telemetry_level_token_parse() {
+        // Space-separated, `=`, and multi-space forms.
+        assert_eq!(
+            get_telemetry_level("ca decoder-run {input} --telemetry-level full -o {yuv}"),
+            Some(TelemetryLevel::Full)
+        );
+        assert_eq!(
+            get_telemetry_level("x --telemetry-level=block -o out"),
+            Some(TelemetryLevel::Block)
+        );
+        assert_eq!(
+            get_telemetry_level("x --telemetry-level   syntax"),
+            Some(TelemetryLevel::Syntax)
+        );
+        // No token, unknown value, longer flag, or dangling token → None.
+        assert_eq!(get_telemetry_level("dec {input} -o {yuv}"), None);
+        assert_eq!(get_telemetry_level("x --telemetry-level verbose"), None);
+        assert_eq!(get_telemetry_level("x --telemetry-level-x full"), None);
+        assert_eq!(get_telemetry_level("x --telemetry-level"), None);
+        // The auto-detected template parses to Standard.
+        assert_eq!(get_telemetry_level(DETECT_ARGS), Some(TelemetryLevel::Syntax));
+    }
+
+    #[test]
+    fn telemetry_level_args_and_labels() {
+        assert_eq!(TelemetryLevel::Block.arg(), "block");
+        assert_eq!(TelemetryLevel::Syntax.arg(), "syntax");
+        assert_eq!(TelemetryLevel::Full.arg(), "full");
+        for level in TELEMETRY_LEVELS {
+            assert!(!level.label().is_empty());
+            assert!(!level.description().is_empty());
+        }
+    }
+
+    #[test]
     fn last_stderr_line_skips_trailing_blanks() {
         assert_eq!(
             last_stderr_line("warn: x\nERROR: boom\n\n  \n"),
@@ -536,7 +742,7 @@ mod tests {
         assert!(source.contains(BUNDLED_LAUNCHER), "{source}");
         assert!(cmd.contains(BUNDLED_LAUNCHER), "{cmd}");
         assert!(cmd.contains("decoder-run {input} --decoder-workdir {workdir}"), "{cmd}");
-        assert!(cmd.contains("--telemetry-level block --yuv-output {yuv}"), "{cmd}");
+        assert!(cmd.contains("--telemetry-level syntax --yuv-output {yuv}"), "{cmd}");
         // Launcher path is quoted (spaces in install dirs survive the shell).
         #[cfg(unix)]
         assert!(cmd.starts_with('\''), "{cmd}");
@@ -552,7 +758,7 @@ mod tests {
         assert!(cmd.starts_with("CODEC_ANALYZER_FFMPEG='"), "{cmd}");
         assert!(cmd.contains(".local/bin/ffmpeg'"), "{cmd}");
         assert!(cmd.contains(".venv/bin/python' -m codec_analyzer decoder-run {input}"), "{cmd}");
-        assert!(cmd.ends_with("--telemetry-level block --yuv-output {yuv}"), "{cmd}");
+        assert!(cmd.ends_with("--telemetry-level syntax --yuv-output {yuv}"), "{cmd}");
     }
 
     #[cfg(unix)]
@@ -579,7 +785,7 @@ mod tests {
         assert_eq!(
             cmd,
             "codec-analyzer decoder-run {input} --decoder-workdir {workdir} \
-             --telemetry-level block --yuv-output {yuv}"
+             --telemetry-level syntax --yuv-output {yuv}"
         );
     }
 

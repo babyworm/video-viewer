@@ -236,6 +236,176 @@ pub fn viewer_to_catb_display(viewer_idx: usize, offset: i32) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------------------
+// M-A: filmstrip reference graph (arrows + reference-frequency dots)
+// ---------------------------------------------------------------------------
+
+/// One reference-arrow edge of a viewer frame (filmstrip, VQA Thumbnails
+/// view analogue): `to` is the referenced *viewer* frame index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefEdge {
+    pub to: usize,
+    /// 0 = ref_list0 (orange), 1 = ref_list1 (purple).
+    pub list: u8,
+    /// Long-term reference (green in the strip).
+    pub long_term: bool,
+}
+
+/// Per-viewer-frame reference data derived once per (file, offset, total).
+#[derive(Debug, Clone, Default)]
+pub struct FilmstripRefs {
+    /// `edges[v]` = the frames viewer frame `v` references (slice ref lists).
+    pub edges: Vec<Vec<RefEdge>>,
+    /// `counts[v]` = how many times viewer frame `v` appears in any other
+    /// frame's slice ref list (reference-usage frequency dot).
+    pub counts: Vec<u32>,
+    /// `exactness[v]` = the frame has exactness problems (any non-empty
+    /// `exactness_missing` entry or dropped telemetry rows).
+    pub exactness: Vec<bool>,
+}
+
+/// Nearest *preceding* (decode order) frame whose POC equals `poc`.
+///
+/// Reference pictures are always already-decoded frames, so only
+/// `i < from_decode` is searched. POC values can repeat across CVS segments
+/// (multi-IDR streams); restricting to the decode past both picks the
+/// current segment's frame and never maps a ref to a future/next-segment
+/// frame that could not possibly be in the DPB yet.
+pub fn nearest_poc_match(frame_pocs: &[i32], from_decode: usize, poc: i32) -> Option<usize> {
+    let end = from_decode.min(frame_pocs.len());
+    frame_pocs[..end].iter().rposition(|&p| p == poc)
+}
+
+/// Pure edge/count derivation over plain slices (unit-testable without a
+/// `.catb` file):
+/// - `frame_pocs[d]` — POC of decode frame `d`,
+/// - `slice_refs[d]` — flattened slice ref-list rows `(poc, list, long_term)`
+///   of decode frame `d`,
+/// - `display_map[disp] = decode idx` (output frames, display order),
+/// - viewer `v` ↔ catb display `v + offset`.
+///
+/// References whose POC has no decode-order match, or whose target falls
+/// outside the viewer range after offset mapping, are dropped (§C: 매핑 밖
+/// 참조는 생략).
+pub fn derive_ref_edges(
+    frame_pocs: &[i32],
+    slice_refs: &[Vec<(i32, u8, bool)>],
+    display_map: &[usize],
+    offset: i32,
+    viewer_total: usize,
+) -> (Vec<Vec<RefEdge>>, Vec<u32>) {
+    // decode idx → display idx (position in display_map).
+    let mut decode_to_display = vec![usize::MAX; frame_pocs.len()];
+    for (disp, &dec) in display_map.iter().enumerate() {
+        if let Some(slot) = decode_to_display.get_mut(dec) {
+            *slot = disp;
+        }
+    }
+    // display idx → viewer idx (inverse offset mapping).
+    let display_to_viewer = |disp: usize| -> Option<usize> {
+        let v = disp as i64 - offset as i64;
+        (v >= 0 && (v as usize) < viewer_total).then_some(v as usize)
+    };
+    let mut edges: Vec<Vec<RefEdge>> = vec![Vec::new(); viewer_total];
+    let mut counts = vec![0u32; viewer_total];
+    for (v, edge_list) in edges.iter_mut().enumerate() {
+        let Some(disp) = viewer_to_catb_display(v, offset) else {
+            continue;
+        };
+        let Some(&dec) = display_map.get(disp) else {
+            continue;
+        };
+        let Some(refs) = slice_refs.get(dec) else {
+            continue;
+        };
+        for &(poc, list, long_term) in refs {
+            let Some(target_dec) = nearest_poc_match(frame_pocs, dec, poc) else {
+                continue;
+            };
+            let target_disp = decode_to_display[target_dec];
+            if target_disp == usize::MAX {
+                continue; // non-output frame: not on the strip
+            }
+            let Some(to) = display_to_viewer(target_disp) else {
+                continue;
+            };
+            edge_list.push(RefEdge {
+                to,
+                list,
+                long_term,
+            });
+            counts[to] += 1;
+        }
+    }
+    (edges, counts)
+}
+
+/// Build the filmstrip reference data for a loaded `.catb` (one pass over
+/// `meta.frames_meta`; called once per (file, offset, total) cache key).
+pub fn build_filmstrip_refs(
+    file: &BitstreamFile,
+    offset: i32,
+    viewer_total: usize,
+) -> FilmstripRefs {
+    let frames = &file.catb.frames;
+    let frame_pocs: Vec<i32> = frames.iter().map(|f| f.poc).collect();
+    let meta = &file.catb.meta.frames_meta;
+    let slice_refs: Vec<Vec<(i32, u8, bool)>> = (0..frames.len())
+        .map(|d| {
+            meta.get(d)
+                .map(|m| {
+                    let mut rows = Vec::new();
+                    for sh in &m.slice_headers {
+                        for e in &sh.ref_list0 {
+                            rows.push((e.poc as i32, 0u8, e.long_term));
+                        }
+                        for e in &sh.ref_list1 {
+                            rows.push((e.poc as i32, 1u8, e.long_term));
+                        }
+                    }
+                    rows
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+    let (edges, counts) = derive_ref_edges(
+        &frame_pocs,
+        &slice_refs,
+        &file.display_map,
+        offset,
+        viewer_total,
+    );
+    let mut exactness = vec![false; viewer_total];
+    for (v, flag) in exactness.iter_mut().enumerate() {
+        let Some(disp) = viewer_to_catb_display(v, offset) else {
+            continue;
+        };
+        let Some(&dec) = file.display_map.get(disp) else {
+            continue;
+        };
+        if let Some(m) = meta.get(dec) {
+            *flag = m.exactness_missing.iter().any(|s| !s.is_empty())
+                || m.block_dropped_rows.iter().any(|&n| n > 0);
+        }
+    }
+    FilmstripRefs {
+        edges,
+        counts,
+        exactness,
+    }
+}
+
+/// Reference-frequency dot radius tier (§C: 3단계): 0 → none, 1 → small,
+/// 2–3 → medium, ≥4 → large.
+pub fn ref_count_tier(count: u32) -> u8 {
+    match count {
+        0 => 0,
+        1 => 1,
+        2..=3 => 2,
+        _ => 3,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // M1: frame-type classification (filmstrip colours)
 // ---------------------------------------------------------------------------
 
@@ -975,6 +1145,101 @@ mod raster_tests {
         assert_eq!(intra_subblock_pos(1, 1), None);
         assert_eq!(intra_subblock_pos(4, 2), None);
         assert_eq!(intra_subblock_pos(16, 4), None);
+    }
+
+    #[test]
+    fn nearest_poc_match_prefers_decode_distance() {
+        // Two CVS segments with repeating POCs: 0,3,1,2 | 0,1 (decode order).
+        let pocs = [0, 3, 1, 2, 0, 1];
+        // From decode#5 (2nd segment), POC 0 must resolve to decode#4, not #0.
+        assert_eq!(nearest_poc_match(&pocs, 5, 0), Some(4));
+        // From decode#1 (1st segment), POC 0 → decode#0.
+        assert_eq!(nearest_poc_match(&pocs, 1, 0), Some(0));
+        // An IDR has no decode-order past: nothing to reference.
+        assert_eq!(nearest_poc_match(&pocs, 0, 0), None);
+        // Unknown POC → None.
+        assert_eq!(nearest_poc_match(&pocs, 2, 9), None);
+    }
+
+    #[test]
+    fn nearest_poc_match_never_future() {
+        // multi-IDR: 0,1,2 | IDR,1,2 (decode order). From decode#2 (POC 2),
+        // ref POC 0 must resolve backwards to decode#0, never to the next
+        // segment's IDR at decode#3 (closer by distance, but not decoded yet).
+        let pocs = [0, 1, 2, 0, 1, 2];
+        assert_eq!(nearest_poc_match(&pocs, 2, 0), Some(0));
+        assert_eq!(nearest_poc_match(&pocs, 2, 1), Some(1));
+        // Second segment resolves within itself.
+        assert_eq!(nearest_poc_match(&pocs, 5, 0), Some(3));
+        // from_decode beyond the slice is clamped, not a panic.
+        assert_eq!(nearest_poc_match(&pocs, 99, 2), Some(5));
+    }
+
+    #[test]
+    fn ref_edges_bslice_pattern() {
+        // hevc_bslice-like: decode IDR(0) P(3) B(1) B(2); display = 0,2,3,1.
+        let pocs = [0, 3, 1, 2];
+        let slice_refs = vec![
+            vec![],                                   // IDR
+            vec![(0, 0, false)],                      // P: L0 → POC 0
+            vec![(0, 0, false), (3, 1, false)],       // B: L0 → 0, L1 → 3
+            vec![(0, 0, false), (3, 1, true)],        // B: L1 long-term
+        ];
+        let display_map = vec![0, 2, 3, 1]; // POC sort: 0,1,2,3
+        let (edges, counts) = derive_ref_edges(&pocs, &slice_refs, &display_map, 0, 4);
+        // Viewer 0 = decode 0 (IDR): no refs.
+        assert!(edges[0].is_empty());
+        // Viewer 3 = decode 1 (P, POC 3): one L0 edge → viewer 0.
+        assert_eq!(
+            edges[3],
+            vec![RefEdge { to: 0, list: 0, long_term: false }]
+        );
+        // Viewer 1 = decode 2 (B, POC 1): L0 → viewer 0, L1 → viewer 3.
+        assert_eq!(
+            edges[1],
+            vec![
+                RefEdge { to: 0, list: 0, long_term: false },
+                RefEdge { to: 3, list: 1, long_term: false },
+            ]
+        );
+        // Long-term flag survives (viewer 2 = decode 3).
+        assert_eq!(edges[2][1], RefEdge { to: 3, list: 1, long_term: true });
+        // Reference frequency: POC 0 used by 3 frames, POC 3 by 2.
+        assert_eq!(counts, vec![3, 0, 0, 2]);
+    }
+
+    #[test]
+    fn ref_edges_offset_and_range_clipping() {
+        let pocs = [0, 1, 2];
+        let slice_refs = vec![
+            vec![],
+            vec![(0, 0, false)],
+            vec![(1, 0, false), (0, 0, false)],
+        ];
+        let display_map = vec![0, 1, 2];
+        // Offset +1: viewer 0 → display 1 (decode 1). Its ref target POC 0 is
+        // display 0 → viewer −1: outside the strip → edge dropped.
+        let (edges, counts) = derive_ref_edges(&pocs, &slice_refs, &display_map, 1, 2);
+        assert!(edges[0].is_empty());
+        // Viewer 1 → decode 2: POC 1 → display 1 → viewer 0 kept; POC 0
+        // clipped away.
+        assert_eq!(edges[1], vec![RefEdge { to: 0, list: 0, long_term: false }]);
+        assert_eq!(counts, vec![1, 0]);
+        // Unknown ref POC never produces an edge.
+        let bad_refs = vec![vec![(7, 0, false)], vec![]];
+        let (e2, c2) = derive_ref_edges(&[0, 1], &bad_refs, &[0, 1], 0, 2);
+        assert!(e2[0].is_empty() && e2[1].is_empty());
+        assert_eq!(c2, vec![0, 0]);
+    }
+
+    #[test]
+    fn ref_count_tiers() {
+        assert_eq!(ref_count_tier(0), 0);
+        assert_eq!(ref_count_tier(1), 1);
+        assert_eq!(ref_count_tier(2), 2);
+        assert_eq!(ref_count_tier(3), 2);
+        assert_eq!(ref_count_tier(4), 3);
+        assert_eq!(ref_count_tier(100), 3);
     }
 
     #[test]
