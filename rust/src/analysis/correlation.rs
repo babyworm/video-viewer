@@ -72,15 +72,21 @@ pub enum YMetric {
     /// bias the correlation toward residual-carrying blocks (rationale in
     /// [`crate::analysis::bitstream_stats::BlockTxAgg`]).
     CoeffEnergy,
+    /// M-C: per-G-cell luma PSNR of the decoder-run `final_recon` stage
+    /// image vs the viewer's source frame (VQA Info-Overlay PSNR analogue).
+    /// Needs stage images and a resolution-matched source; cells are marked
+    /// invalid when the grid is absent (see [`BitstreamG::psnr`]).
+    ReconPsnr,
 }
 
 impl YMetric {
-    pub const ALL: [YMetric; 5] = [
+    pub const ALL: [YMetric; 6] = [
         YMetric::Qp,
         YMetric::Bpp,
         YMetric::MvMag,
         YMetric::IntraRatio,
         YMetric::CoeffEnergy,
+        YMetric::ReconPsnr,
     ];
 
     pub fn label(self) -> &'static str {
@@ -90,6 +96,7 @@ impl YMetric {
             YMetric::MvMag => "|MV|",
             YMetric::IntraRatio => "intra %",
             YMetric::CoeffEnergy => "coeff energy",
+            YMetric::ReconPsnr => "recon PSNR",
         }
     }
 }
@@ -140,6 +147,12 @@ pub struct BitstreamG {
     /// TX coefficient energy per covered pixel (M-B; sum → renormalize,
     /// same rule as `bpp`).
     pub coeff_energy: Vec<f32>,
+    /// M-C: per-cell luma PSNR of `final_recon` vs the viewer frame
+    /// ([`crate::analysis::stage::psnr_to_g`]) — image-derived, so it is
+    /// filled by the caller *after* [`aggregate_bitstream_to_g`], which
+    /// leaves it empty. Empty ⇒ every cell invalid for
+    /// [`YMetric::ReconPsnr`].
+    pub psnr: Vec<f32>,
     /// False when partially covered (coverage < 1) or a partial edge cell.
     pub valid: Vec<bool>,
 }
@@ -502,6 +515,7 @@ pub fn aggregate_bitstream_to_g(l1: &BitstreamGrid, width: u32, height: u32, g: 
         mv_mag: mv,
         intra_ratio: intra,
         coeff_energy: coeff,
+        psnr: Vec::new(),
         valid,
     }
 }
@@ -523,14 +537,18 @@ pub fn align(x: &GGrid, y: &BitstreamG, y_metric: YMetric) -> AlignedPair {
         YMetric::MvMag => &y.mv_mag,
         YMetric::IntraRatio => &y.intra_ratio,
         YMetric::CoeffEnergy => &y.coeff_energy,
+        // Image-derived, caller-filled — may legitimately be empty (no
+        // stage image): every cell is then invalid, not a panic.
+        YMetric::ReconPsnr => &y.psnr,
     };
     for r in 0..rows as usize {
         for c in 0..cols as usize {
             let xi = r * x.cols as usize + c;
             let yi = r * y.cols as usize + c;
+            let yv = y_vals.get(yi).copied().filter(|v| v.is_finite());
             a.push(x.values[xi]);
-            b.push(y_vals[yi]);
-            valid.push(x.valid[xi] && y.valid[yi]);
+            b.push(yv.unwrap_or(0.0));
+            valid.push(x.valid[xi] && y.valid[yi] && yv.is_some());
         }
     }
     AlignedPair {
@@ -1391,6 +1409,7 @@ mod tests {
             mv_mag: vec![0.0; 3],
             intra_ratio: vec![0.0; 3],
             coeff_energy: vec![9.0, 8.0, 7.0],
+            psnr: Vec::new(),
             valid: vec![true, true, true],
         };
         let p = align(&x, &y, YMetric::Qp);
@@ -1400,6 +1419,18 @@ mod tests {
         assert_eq!(p.valid, vec![true, false]);
         assert_eq!(p.n_valid(), 1);
         assert!((p.valid_fraction() - 0.5).abs() < 1e-6);
+
+        // M-C ReconPsnr: an empty psnr grid invalidates every cell instead
+        // of panicking (stage image missing).
+        let p = align(&x, &y, YMetric::ReconPsnr);
+        assert_eq!(p.valid, vec![false, false]);
+        assert_eq!(p.b, vec![0.0, 0.0]);
+        // A filled psnr grid flows through like any other Y metric.
+        let mut y2 = y.clone();
+        y2.psnr = vec![42.5, 38.0, 99.0];
+        let p = align(&x, &y2, YMetric::ReconPsnr);
+        assert_eq!(p.b, vec![42.5, 38.0]);
+        assert_eq!(p.valid, vec![true, false]);
     }
 
     #[test]
@@ -1449,6 +1480,7 @@ mod tests {
             mv_mag: vec![0.0, 12.0],
             intra_ratio: vec![1.0, 0.0],
             coeff_energy: vec![0.0, 0.0],
+            psnr: Vec::new(),
             valid: vec![true, true],
         };
         let t = class_table(&classes, &[true, true], 2, 1, &bs);

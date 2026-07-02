@@ -30,6 +30,10 @@ use crate::analysis::correlation::{
     CorrScanRequest, CorrScanResult, XMetric, YMetric, G_SIZES, PRESET_PAIRS,
 };
 use crate::analysis::motion::MotionClass;
+use crate::analysis::stage::{
+    compute_block_quality, psnr_to_g, stage_available, BlockQuality, QualityUnavailable,
+    StageCache, StageKind,
+};
 use crate::core::catb::{BsBlock, BsRef, TxRow};
 use crate::core::dropped::{classify_dropped_file, DroppedKind};
 use crate::ui::bitstream_overlay::{
@@ -58,10 +62,19 @@ pub enum FillMode {
     CoeffEnergy,
     /// M-B: nonzero-coefficient density per pixel.
     NonzeroCoeffs,
+    /// M-C: per-block luma PSNR — `final_recon` stage image vs the viewer's
+    /// source frame (VQA Info-Overlay PSNR analogue). Like Opportunity it
+    /// is not a [`FillSample`] colour: the values live in the per-frame
+    /// [`crate::analysis::stage::BlockQuality`] and render in a dedicated
+    /// pass.
+    BlockPsnr,
+    /// M-C: per-block luma SSIM, same data path as [`FillMode::BlockPsnr`].
+    /// Combo-only (no shortcut key — 1–9 are taken).
+    BlockSsim,
 }
 
-/// All fill modes in §8 shortcut order (keys 1–8).
-pub const FILL_MODES: [FillMode; 8] = [
+/// All fill modes in §8 shortcut order (keys 1–9; BlockSSIM is combo-only).
+pub const FILL_MODES: [FillMode; 10] = [
     FillMode::None,
     FillMode::Qp,
     FillMode::Bpp,
@@ -70,6 +83,8 @@ pub const FILL_MODES: [FillMode; 8] = [
     FillMode::Opportunity,
     FillMode::CoeffEnergy,
     FillMode::NonzeroCoeffs,
+    FillMode::BlockPsnr,
+    FillMode::BlockSsim,
 ];
 
 impl FillMode {
@@ -83,6 +98,8 @@ impl FillMode {
             FillMode::Opportunity => "Opportunity",
             FillMode::CoeffEnergy => "CoeffEnergy",
             FillMode::NonzeroCoeffs => "NonzeroCoeffs",
+            FillMode::BlockPsnr => "BlockPSNR",
+            FillMode::BlockSsim => "BlockSSIM",
         }
     }
 
@@ -95,8 +112,16 @@ impl FillMode {
             "Opportunity" => FillMode::Opportunity,
             "CoeffEnergy" => FillMode::CoeffEnergy,
             "NonzeroCoeffs" => FillMode::NonzeroCoeffs,
+            "BlockPSNR" => FillMode::BlockPsnr,
+            "BlockSSIM" => FillMode::BlockSsim,
             _ => FillMode::None,
         }
+    }
+
+    /// True for the M-C quality fills, which render from [`BlockQuality`]
+    /// in their own pass (like Opportunity renders from the aligned pair).
+    pub fn is_quality(&self) -> bool {
+        matches!(self, FillMode::BlockPsnr | FillMode::BlockSsim)
     }
 }
 
@@ -455,9 +480,14 @@ pub fn fill_color(
     let a255 = |t: f32| ((opacity * t).clamp(0.0, 1.0) * 255.0) as u8;
     let ramp = |v: f32, max: f32| if max > 0.0 { (v / max).clamp(0.0, 1.0) } else { 0.0 };
     match fill {
-        // Opportunity is a G-cell layer drawn from the aligned pair, not a
-        // per-block colour — see `opportunity_cell_color`.
-        FillMode::None | FillMode::Opportunity => None,
+        // Opportunity is a G-cell layer drawn from the aligned pair, and
+        // the M-C quality fills draw from BlockQuality — neither is a
+        // per-sample colour (see `opportunity_cell_color` /
+        // `quality_fill_color`).
+        FillMode::None
+        | FillMode::Opportunity
+        | FillMode::BlockPsnr
+        | FillMode::BlockSsim => None,
         FillMode::Qp => {
             let t = normalize(s.qp, stats.qp_min, stats.qp_max);
             Some(egui::Color32::from_rgba_unmultiplied(
@@ -519,9 +549,15 @@ pub fn fill_color(
 /// Short value text for tooltips / labels / loupe under a fill mode.
 pub fn fill_value_text(fill: FillMode, s: &FillSample) -> String {
     match fill {
-        // Opportunity z lives on G cells, not blocks — fall back to QP for
-        // block-level text (labels / loupe).
-        FillMode::None | FillMode::Qp | FillMode::Opportunity => format!("{:.0}", s.qp),
+        // Opportunity z lives on G cells and the quality values on
+        // BlockQuality, not blocks — fall back to QP for block-level text
+        // (labels / loupe; the quality label layer overrides this with
+        // `quality_value_text`).
+        FillMode::None
+        | FillMode::Qp
+        | FillMode::Opportunity
+        | FillMode::BlockPsnr
+        | FillMode::BlockSsim => format!("{:.0}", s.qp),
         FillMode::Bpp => format!("{:.2}", s.bpp),
         FillMode::Mode => s.mode.label().to_string(),
         FillMode::MvHeat => format!("{:.1}", s.mv),
@@ -551,6 +587,91 @@ pub fn opportunity_cell_color(z: f32, zmax: f32, opacity: f32) -> egui::Color32 
 /// Quarter-pel MV pair display, e.g. `(-3.25, 0.5)`.
 pub fn qpel(pair: (i32, i32)) -> String {
     format!("({}, {})", pair.0 as f32 / 4.0, pair.1 as f32 / 4.0)
+}
+
+// ---------------------------------------------------------------------------
+// M-C: Picture selector + block-quality fills
+// ---------------------------------------------------------------------------
+
+/// Which picture the Viewer-tab canvas shows as the background texture
+/// (VQA "Pic" selector analogue). Session-only, resets to Source on file
+/// change. Window-only by design: the main-canvas overlay mirror keeps the
+/// viewer's own frame — the root pipeline (pixel inspector, analysis tabs,
+/// comparison) reads `current_rgb`, and swapping its texture to a decoder
+/// stage would desynchronize every one of those readouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PictureSource {
+    /// The viewer's own video frame (default).
+    Source,
+    /// A decoder-run stage image (`final_recon` / `recon_unfiltered` /
+    /// `prediction` / `residual`).
+    Stage(StageKind),
+}
+
+impl PictureSource {
+    pub const ALL: [PictureSource; 5] = [
+        PictureSource::Source,
+        PictureSource::Stage(StageKind::FinalRecon),
+        PictureSource::Stage(StageKind::ReconUnfiltered),
+        PictureSource::Stage(StageKind::Prediction),
+        PictureSource::Stage(StageKind::Residual),
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PictureSource::Source => "Source",
+            PictureSource::Stage(k) => k.label(),
+        }
+    }
+}
+
+/// Fill colour for one block's quality value (worst = most opaque, so bad
+/// blocks pull the eye like the other "cost" ramps). Bit-exact blocks
+/// (`psnr = ∞`, the `e` blocks) render fully transparent — nothing to fix.
+pub fn quality_fill_color(
+    fill: FillMode,
+    v: f32,
+    q: &BlockQuality,
+    opacity: f32,
+) -> Option<egui::Color32> {
+    if !v.is_finite() {
+        return None;
+    }
+    let (lo, hi) = match fill {
+        FillMode::BlockPsnr => (q.psnr_min, q.psnr_max),
+        FillMode::BlockSsim => (q.ssim_min, q.ssim_max),
+        _ => return None,
+    };
+    // High PSNR/SSIM = good = faint; low = bad = strong red.
+    let t = 1.0 - normalize(v, lo, hi);
+    let a = ((opacity * (0.10 + 0.90 * t)).clamp(0.0, 1.0) * 255.0) as u8;
+    Some(egui::Color32::from_rgba_unmultiplied(230, 50, 50, a))
+}
+
+/// Block label / tooltip text for a quality value. Bit-exact PSNR renders
+/// as `e` (VQA convention).
+pub fn quality_value_text(fill: FillMode, v: f32) -> String {
+    match fill {
+        FillMode::BlockPsnr => {
+            if v.is_finite() {
+                format!("{v:.1}")
+            } else {
+                "e".to_string()
+            }
+        }
+        FillMode::BlockSsim => format!("{v:.3}"),
+        _ => String::new(),
+    }
+}
+
+/// BT.601 luma plane of an egui `ColorImage` — the same weights as
+/// [`crate::analysis::stage::luma_bt601`], so viewer-side and BMP-side
+/// planes are directly comparable.
+fn color_image_luma(img: &egui::ColorImage) -> Vec<f32> {
+    img.pixels
+        .iter()
+        .map(|p| 0.299 * p.r() as f32 + 0.587 * p.g() as f32 + 0.114 * p.b() as f32)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -719,6 +840,10 @@ struct FrameDerived {
     /// Per-block TX rows, parallel to `blocks` — lazily for the TU layer
     /// and the Inspector TU table (M-B).
     tx: Option<Vec<Vec<TxRow>>>,
+    /// M-C: per-block PSNR/SSIM of `final_recon` vs the viewer frame —
+    /// lazily when a quality fill is active, keyed on the viewer image
+    /// generation (the frame pixels can arrive after the block data).
+    quality: Option<(u64, Result<BlockQuality, QualityUnavailable>)>,
 }
 
 /// Snapshot of the shared state taken at the top of the child pass so the
@@ -727,6 +852,11 @@ struct FrameDerived {
 struct Snapshot {
     file: Option<Arc<BitstreamFile>>,
     image: Option<Arc<egui::ColorImage>>,
+    /// The current viewer frame pixels, always present when loaded (Arc
+    /// clone — cheap). `image` above is texture-upload-gated; the M-C
+    /// quality fills and the ReconPsnr Y metric need the pixels regardless
+    /// of whether the texture already moved.
+    frame_pixels: Option<Arc<egui::ColorImage>>,
     generation: u64,
     viewer_frame: usize,
     viewer_total: usize,
@@ -814,6 +944,21 @@ pub struct BitstreamWindow {
     stats_cache: Option<(usize, usize, FrameStatsData)>,
     /// M-B: Stats tab syntax-element name filter.
     stats_filter: String,
+    /// M-C: Viewer-tab background picture (VQA "Pic" selector). Session-
+    /// only, reset to Source on file change — see [`PictureSource`].
+    picture: PictureSource,
+    /// M-C: lazy stage-image loader (small LRU, file-identity keyed).
+    stage_cache: StageCache,
+    /// M-C: uploaded stage texture, keyed on (file, decode_idx, kind).
+    stage_texture: Option<StageTexture>,
+}
+
+/// The stage image currently uploaded as a child-viewport texture (M-C).
+struct StageTexture {
+    handle: egui::TextureHandle,
+    file_ptr: usize,
+    decode_idx: usize,
+    kind: StageKind,
 }
 
 /// Cached per-viewer-frame filmstrip classes + reference graph (M-A §C).
@@ -917,6 +1062,9 @@ impl BitstreamWindow {
             selected_tu: None,
             stats_cache: None,
             stats_filter: String::new(),
+            picture: PictureSource::Source,
+            stage_cache: StageCache::new(),
+            stage_texture: None,
         }
     }
 
@@ -943,6 +1091,10 @@ impl BitstreamWindow {
         self.corr_scan_derived = None;
         self.filmstrip_cache = None;
         self.stats_cache = None;
+        // M-C: the Picture selector is session-only and file-bound.
+        self.picture = PictureSource::Source;
+        self.stage_texture = None;
+        self.stage_cache = StageCache::new();
     }
 
     /// Render the window. Returns the current view settings when they
@@ -980,6 +1132,7 @@ impl BitstreamWindow {
                 } else {
                     None
                 },
+                frame_pixels: s.frame_image.clone(),
                 generation: s.generation,
                 viewer_frame: s.viewer_frame,
                 viewer_total: s.viewer_total,
@@ -1152,7 +1305,7 @@ impl BitstreamWindow {
             m: bool,
             c: bool,
             g: bool,
-            nums: [bool; 8],
+            nums: [bool; 9],
             v: bool,
             p: bool,
             t: bool,
@@ -1184,6 +1337,7 @@ impl BitstreamWindow {
                     plain && i.key_pressed(egui::Key::Num6),
                     plain && i.key_pressed(egui::Key::Num7),
                     plain && i.key_pressed(egui::Key::Num8),
+                    plain && i.key_pressed(egui::Key::Num9),
                 ],
                 v: plain && i.key_pressed(egui::Key::V),
                 p: plain && i.key_pressed(egui::Key::P),
@@ -1309,9 +1463,53 @@ impl BitstreamWindow {
 
     // -- toolbar (§2) --------------------------------------------------------
 
-    fn ui_toolbar(&mut self, ctx: &egui::Context) {
+    fn ui_toolbar(&mut self, ctx: &egui::Context, snap: &Snapshot) {
+        // M-C Picture combo enable state: a stage is offered only when the
+        // current frame records a resolvable image (path probe, no pixel
+        // I/O — see `stage_available`).
+        let decode_idx = snap.file.as_ref().and_then(|f| {
+            viewer_to_catb_display(snap.viewer_frame, snap.offset)
+                .and_then(|d| f.decode_idx(d))
+        });
         egui::TopBottomPanel::top("bs_toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
+                // M-C: background picture selector (VQA "Pic").
+                ui.label("Pic:");
+                egui::ComboBox::from_id_salt("bs_picture")
+                    .selected_text(self.picture.label())
+                    .show_ui(ui, |ui| {
+                        for p in PictureSource::ALL {
+                            let available = match p {
+                                PictureSource::Source => true,
+                                PictureSource::Stage(kind) => {
+                                    matches!((snap.file.as_ref(), decode_idx),
+                                        (Some(f), Some(di)) if stage_available(f, di, kind))
+                                }
+                            };
+                            let resp = ui.add_enabled(
+                                available,
+                                egui::SelectableLabel::new(self.picture == p, p.label()),
+                            );
+                            if available {
+                                if resp.clicked() {
+                                    self.picture = p;
+                                }
+                            } else {
+                                resp.on_disabled_hover_text(
+                                    "Stage image not found next to the .catb — \
+                                     re-run decoder-run to regenerate stage BMPs",
+                                );
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Which picture the canvas shows under the overlays: the \
+                         viewer's source video or a decoder-run stage image \
+                         (window-only; the main canvas keeps the source)",
+                    );
+                ui.separator();
+
                 // Preset combo — shows "Custom" when the config was edited.
                 let preset_label = matching_preset(&self.view)
                     .map(|p| p.label())
@@ -1463,7 +1661,7 @@ impl BitstreamWindow {
     // -- viewer tab ----------------------------------------------------------
 
     fn ui_viewer_tab(&mut self, ctx: &egui::Context, snap: &Snapshot) {
-        self.ui_toolbar(ctx);
+        self.ui_toolbar(ctx, snap);
         self.ui_transport_and_status(ctx, snap, true);
         self.ui_filmstrip(ctx, snap);
         self.ui_inspector(ctx, snap);
@@ -1472,6 +1670,8 @@ impl BitstreamWindow {
         // texture itself is uploaded tab-independently in `show()`.
         self.refresh_derived(snap);
         self.ensure_layer_data(snap);
+        // M-C: per-block PSNR/SSIM when a quality fill is selected.
+        self.ensure_quality(snap);
         // Opportunity fill consumes the correlation derivation (M3).
         if self.view.fill == FillMode::Opportunity {
             self.refresh_corr_derived(snap);
@@ -1525,7 +1725,62 @@ impl BitstreamWindow {
             refs: None,
             intra: None,
             tx: None,
+            quality: None,
         });
+    }
+
+    /// M-C: lazily compute per-block PSNR/SSIM (`final_recon` vs the viewer
+    /// frame) when a quality fill is active. Keyed on the viewer image
+    /// generation inside the per-frame `derived` cache: a recomputation
+    /// happens only when the pixels move, not per repaint.
+    fn ensure_quality(&mut self, snap: &Snapshot) {
+        if !self.view.fill.is_quality() {
+            return;
+        }
+        let Some(file) = snap.file.as_ref() else { return };
+        let Some(d) = self.derived.as_mut() else { return };
+        if d.quality.as_ref().is_some_and(|(g, _)| *g == snap.generation) {
+            return;
+        }
+        let result = Self::compute_quality(file, d, snap, &mut self.stage_cache);
+        d.quality = Some((snap.generation, result));
+    }
+
+    /// The actual quality derivation — every M-C precondition surfaces as a
+    /// [`QualityUnavailable`] reason for the legend slot.
+    fn compute_quality(
+        file: &Arc<BitstreamFile>,
+        d: &FrameDerived,
+        snap: &Snapshot,
+        stage_cache: &mut StageCache,
+    ) -> Result<BlockQuality, QualityUnavailable> {
+        let img = snap
+            .frame_pixels
+            .as_ref()
+            .ok_or(QualityUnavailable::NoViewerFrame)?;
+        let decode_idx = file
+            .decode_idx(d.display_idx)
+            .ok_or(QualityUnavailable::NoStageImage)?;
+        let recon = stage_cache
+            .get(file, decode_idx, StageKind::FinalRecon)
+            .ok_or(QualityUnavailable::NoStageImage)?;
+        let (vw, vh) = (img.size[0] as u32, img.size[1] as u32);
+        if (recon.width, recon.height) != (vw, vh) {
+            return Err(QualityUnavailable::ResolutionMismatch {
+                stream: (recon.width, recon.height),
+                viewer: (vw, vh),
+            });
+        }
+        let viewer_luma = color_image_luma(img);
+        let recon_luma =
+            crate::analysis::stage::luma_bt601(&recon.rgb, (vw as usize) * (vh as usize));
+        Ok(compute_block_quality(
+            &d.blocks,
+            &viewer_luma,
+            &recon_luma,
+            vw,
+            vh,
+        ))
     }
 
     /// Lazily build the M4/M-B layer data (REF rows / intra dirs / TX rows)
@@ -1641,12 +1896,77 @@ impl BitstreamWindow {
             + self.pan;
         let image_rect = egui::Rect::from_min_size(origin, egui::vec2(img_w, img_h));
 
-        if let Some(tex) = &self.texture {
+        // M-C: background picture — the selected decoder-run stage image,
+        // or the viewer's source frame (default). The stage BMP is stream-
+        // resolution; stretching it into `image_rect` applies exactly the
+        // stream→viewer scale the overlays use (zx/zy below).
+        let mut stage_missing = false;
+        let bg_tex: Option<egui::TextureId> = match self.picture {
+            PictureSource::Source => self.texture.as_ref().map(|t| t.id()),
+            PictureSource::Stage(kind) => {
+                let key = snap.file.as_ref().zip(self.derived.as_ref()).and_then(
+                    |(f, d)| {
+                        f.decode_idx(d.display_idx)
+                            .map(|di| (Arc::as_ptr(f) as usize, di))
+                    },
+                );
+                if let (Some(file), Some((fp, di))) = (snap.file.as_ref(), key) {
+                    let current = self.stage_texture.as_ref().is_some_and(|t| {
+                        t.file_ptr == fp && t.decode_idx == di && t.kind == kind
+                    });
+                    if !current {
+                        self.stage_texture =
+                            self.stage_cache.get(file, di, kind).map(|img| {
+                                let ci = egui::ColorImage::from_rgb(
+                                    [img.width as usize, img.height as usize],
+                                    &img.rgb,
+                                );
+                                StageTexture {
+                                    handle: ui.ctx().load_texture(
+                                        "bs_stage",
+                                        egui::ImageData::Color(Arc::new(ci)),
+                                        egui::TextureOptions::NEAREST,
+                                    ),
+                                    file_ptr: fp,
+                                    decode_idx: di,
+                                    kind,
+                                }
+                            });
+                    }
+                } else {
+                    self.stage_texture = None;
+                }
+                if self.stage_texture.is_none() {
+                    // This frame has no loadable stage image: show the
+                    // source and say why (the combo disables items per
+                    // frame, but playback can move onto a frame without
+                    // one while a stage is selected).
+                    stage_missing = true;
+                }
+                self.stage_texture
+                    .as_ref()
+                    .map(|t| t.handle.id())
+                    .or_else(|| self.texture.as_ref().map(|t| t.id()))
+            }
+        };
+        if let Some(id) = bg_tex {
             painter.image(
-                tex.id(),
+                id,
                 image_rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
+            );
+        }
+        if stage_missing {
+            painter.text(
+                canvas_rect.min + egui::vec2(8.0, 8.0),
+                egui::Align2::LEFT_TOP,
+                format!(
+                    "{} not found next to the .catb — re-run decoder-run",
+                    self.picture.label()
+                ),
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_rgb(255, 190, 90),
             );
         }
 
@@ -1706,8 +2026,35 @@ impl BitstreamWindow {
                 }
             }
 
+            // M-C quality fills: per-block rects from BlockQuality (no LOD
+            // variant — the values are block-native, and unlike bpp/QP they
+            // do not aggregate meaningfully by area-mean).
+            if self.view.fill.is_quality() {
+                if let Some((_, Ok(q))) = d.quality.as_ref() {
+                    let vals = if self.view.fill == FillMode::BlockPsnr {
+                        &q.psnr
+                    } else {
+                        &q.ssim
+                    };
+                    for (b, &v) in d.blocks.iter().zip(vals.iter()) {
+                        if let Some(color) =
+                            quality_fill_color(self.view.fill, v, q, opacity)
+                        {
+                            let rect =
+                                block_rect(b.x as f32, b.y as f32, b.w as f32, b.h as f32);
+                            if rect.intersects(canvas_rect) {
+                                painter.rect_filled(rect, 0.0, color);
+                            }
+                        }
+                    }
+                }
+            }
+
             // Fill layer — LOD aggregate cells below 1.5x, per-CU rects above.
-            if self.view.fill != FillMode::None && self.view.fill != FillMode::Opportunity {
+            if !matches!(
+                self.view.fill,
+                FillMode::None | FillMode::Opportunity | FillMode::BlockPsnr | FillMode::BlockSsim
+            ) {
                 if lod_mode {
                     let g = &d.grid_lod;
                     for r in 0..g.rows {
@@ -1824,10 +2171,32 @@ impl BitstreamWindow {
                     if !rect.intersects(canvas_rect) || rect.width() < 18.0 {
                         continue;
                     }
-                    let txt = fill_value_text(
-                        self.view.fill,
-                        &FillSample::from_block(b, d.tx_agg.get(bi)),
-                    );
+                    // M-C: quality fills label the quality value ('e' for
+                    // bit-exact blocks, VQA convention).
+                    let quality_txt = self
+                        .view
+                        .fill
+                        .is_quality()
+                        .then(|| {
+                            d.quality.as_ref().and_then(|(_, r)| r.as_ref().ok()).map(|q| {
+                                let v = if self.view.fill == FillMode::BlockPsnr {
+                                    q.psnr.get(bi)
+                                } else {
+                                    q.ssim.get(bi)
+                                };
+                                quality_value_text(
+                                    self.view.fill,
+                                    v.copied().unwrap_or(f32::NAN),
+                                )
+                            })
+                        })
+                        .flatten();
+                    let txt = quality_txt.unwrap_or_else(|| {
+                        fill_value_text(
+                            self.view.fill,
+                            &FillSample::from_block(b, d.tx_agg.get(bi)),
+                        )
+                    });
                     let font_size = (rect.height() * 0.4).clamp(8.0, 14.0);
                     painter.text(
                         rect.center(),
@@ -1962,6 +2331,18 @@ impl BitstreamWindow {
                                 "energy {:.1}/px · nz {:.2}/px · {text}",
                                 s.coeff, s.nz
                             );
+                        } else if self.view.fill.is_quality() {
+                            if let Some((_, Ok(q))) = d.quality.as_ref() {
+                                let (p, s) = (
+                                    q.psnr.get(bi).copied().unwrap_or(f32::NAN),
+                                    q.ssim.get(bi).copied().unwrap_or(f32::NAN),
+                                );
+                                text = format!(
+                                    "PSNR {} dB · SSIM {} · {text}",
+                                    quality_value_text(FillMode::BlockPsnr, p),
+                                    quality_value_text(FillMode::BlockSsim, s),
+                                );
+                            }
                         }
                         response.clone().on_hover_text(text);
                     }
@@ -1992,6 +2373,13 @@ impl BitstreamWindow {
                             format!("z({})−z({})", self.corr_y.label(), self.corr_x.label())
                         };
                     draw_opportunity_legend(&painter, canvas_rect, &name, zmax);
+                }
+            } else if self.view.fill.is_quality() {
+                // M-C: finite min/max scale, or the unmet-precondition
+                // reason in the legend slot (D: the fill stays selectable).
+                if let Some((_, result)) = self.derived.as_ref().and_then(|d| d.quality.as_ref())
+                {
+                    draw_quality_legend(&painter, canvas_rect, self.view.fill, result);
                 }
             } else if let Some(d) = self.derived.as_ref() {
                 draw_legend(&painter, canvas_rect, self.view.fill, &d.stats);
@@ -2764,7 +3152,26 @@ impl BitstreamWindow {
             return;
         };
         let (sw, sh) = (file.width.max(1), file.height.max(1));
-        let bs_g = aggregate_bitstream_to_g(&derived.grid_l1, sw, sh, self.corr_g);
+        let mut bs_g = aggregate_bitstream_to_g(&derived.grid_l1, sw, sh, self.corr_g);
+        // M-C ReconPsnr: image-derived Y values — final_recon vs the viewer
+        // frame at the stream resolution. Left empty (⇒ all cells invalid)
+        // when the stage image is missing or the resolutions disagree.
+        if self.corr_y == YMetric::ReconPsnr {
+            let recon = file
+                .decode_idx(display_idx)
+                .and_then(|di| self.stage_cache.get(file, di, StageKind::FinalRecon));
+            if let (Some(img), Some(recon)) = (snap.frame_pixels.as_ref(), recon) {
+                let (vw, vh) = (img.size[0] as u32, img.size[1] as u32);
+                if (recon.width, recon.height) == (vw, vh) && (vw, vh) == (sw, sh) {
+                    let viewer_luma = color_image_luma(img);
+                    let recon_luma = crate::analysis::stage::luma_bt601(
+                        &recon.rgb,
+                        (vw as usize) * (vh as usize),
+                    );
+                    bs_g.psnr = psnr_to_g(&viewer_luma, &recon_luma, sw, sh, self.corr_g);
+                }
+            }
+        }
         let pair = x_grid(&analysis.grids, self.corr_x, self.corr_g)
             .map(|xg| align(&xg, &bs_g, self.corr_y));
         let (r, rho) = pair
@@ -4103,7 +4510,12 @@ fn draw_legend(
     let bg = egui::Color32::from_black_alpha(170);
 
     match fill {
-        FillMode::None => {}
+        // Opportunity and the M-C quality fills have dedicated legends
+        // (`draw_opportunity_legend` / `draw_quality_legend`).
+        FillMode::None
+        | FillMode::Opportunity
+        | FillMode::BlockPsnr
+        | FillMode::BlockSsim => {}
         FillMode::Mode => {
             let entries = [
                 ModeClass::Intra,
@@ -4262,6 +4674,96 @@ fn draw_opportunity_legend(
         font,
         text_color,
     );
+}
+
+/// Bottom-left legend for the M-C quality fills: finite min/max ramp, or
+/// the unmet-precondition reason in the same slot. Bit-exact (`e`) blocks
+/// sit outside the ramp by design — they render transparent.
+fn draw_quality_legend(
+    painter: &egui::Painter,
+    canvas_rect: egui::Rect,
+    fill: FillMode,
+    result: &Result<BlockQuality, QualityUnavailable>,
+) {
+    let pad = 8.0;
+    let font = egui::FontId::monospace(11.0);
+    let text_color = egui::Color32::from_rgb(235, 235, 235);
+    let bg = egui::Color32::from_black_alpha(170);
+    match result {
+        Err(reason) => {
+            let msg = reason.message();
+            let w = 8.0 * msg.chars().count() as f32 + 12.0;
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(canvas_rect.min.x + pad, canvas_rect.max.y - pad - 22.0),
+                egui::vec2(w, 22.0),
+            );
+            painter.rect_filled(rect, 3.0, bg);
+            painter.text(
+                egui::pos2(rect.min.x + 6.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                msg,
+                font,
+                egui::Color32::from_rgb(255, 190, 90),
+            );
+        }
+        Ok(q) => {
+            let (name, lo, hi) = match fill {
+                FillMode::BlockPsnr => ("PSNR dB", q.psnr_min, q.psnr_max),
+                _ => ("SSIM", q.ssim_min, q.ssim_max),
+            };
+            let bar_w = 90.0_f32;
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(canvas_rect.min.x + pad, canvas_rect.max.y - pad - 22.0),
+                egui::vec2(bar_w + 175.0, 22.0),
+            );
+            painter.rect_filled(rect, 3.0, bg);
+            painter.text(
+                egui::pos2(rect.min.x + 4.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                name,
+                font.clone(),
+                text_color,
+            );
+            let bar = egui::Rect::from_min_size(
+                egui::pos2(rect.min.x + 62.0, rect.min.y + 6.0),
+                egui::vec2(bar_w, 10.0),
+            );
+            let steps = 24;
+            for s in 0..steps {
+                let t = s as f32 / (steps - 1) as f32;
+                let v = lo + t * (hi - lo);
+                let color = quality_fill_color(fill, v, q, 1.0)
+                    .unwrap_or(egui::Color32::TRANSPARENT);
+                let seg = egui::Rect::from_min_size(
+                    egui::pos2(bar.min.x + t * (bar_w - bar_w / steps as f32), bar.min.y),
+                    egui::vec2(bar_w / steps as f32 + 1.0, bar.height()),
+                );
+                painter.rect_filled(seg, 0.0, color);
+            }
+            let fmt = |v: f32| {
+                if fill == FillMode::BlockPsnr {
+                    format!("{v:.1}")
+                } else {
+                    format!("{v:.3}")
+                }
+            };
+            painter.text(
+                egui::pos2(bar.min.x - 3.0, rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                fmt(lo),
+                font.clone(),
+                text_color,
+            );
+            painter.text(
+                egui::pos2(bar.max.x + 3.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                // VQA convention: bit-exact blocks are 'e', outside the ramp.
+                format!("{} (e=exact)", fmt(hi)),
+                font,
+                text_color,
+            );
+        }
+    }
 }
 
 /// Value loupe (§5, M key): magnified grid of the L1 8-px cells around the
@@ -4502,6 +5004,44 @@ mod tests {
         // Unknown labels (future fills read from an old settings.toml)
         // degrade to None rather than failing.
         assert_eq!(FillMode::from_label("Chroma-heat"), FillMode::None);
+    }
+
+    #[test]
+    fn quality_fill_color_and_text() {
+        let q = BlockQuality {
+            psnr: vec![30.0, 45.0, f32::INFINITY],
+            ssim: vec![0.8, 0.99, 1.0],
+            psnr_min: 30.0,
+            psnr_max: 45.0,
+            ssim_min: 0.8,
+            ssim_max: 1.0,
+        };
+        // Worst block is most opaque; best is faintest; bit-exact ('e')
+        // renders no fill at all.
+        let worst = quality_fill_color(FillMode::BlockPsnr, 30.0, &q, 1.0).unwrap();
+        let best = quality_fill_color(FillMode::BlockPsnr, 45.0, &q, 1.0).unwrap();
+        assert!(worst.a() > best.a());
+        assert!(quality_fill_color(FillMode::BlockPsnr, f32::INFINITY, &q, 1.0).is_none());
+        // Non-quality fills yield no colour from this path.
+        assert!(quality_fill_color(FillMode::Qp, 30.0, &q, 1.0).is_none());
+        // VQA 'e' convention for bit-exact PSNR; SSIM keeps its number.
+        assert_eq!(quality_value_text(FillMode::BlockPsnr, f32::INFINITY), "e");
+        assert_eq!(quality_value_text(FillMode::BlockPsnr, 41.234), "41.2");
+        assert_eq!(quality_value_text(FillMode::BlockSsim, 0.98765), "0.988");
+        // Keys 1–9 cover exactly the first nine fills; BlockSSIM stays
+        // combo-only.
+        assert_eq!(FILL_MODES[8], FillMode::BlockPsnr);
+        assert_eq!(FILL_MODES[9], FillMode::BlockSsim);
+    }
+
+    #[test]
+    fn picture_source_labels_unique() {
+        // The combo relies on distinct labels for the 5 entries.
+        let mut labels: Vec<&str> = PictureSource::ALL.iter().map(|p| p.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), PictureSource::ALL.len());
+        assert_eq!(PictureSource::Source.label(), "Source");
     }
 
     #[test]

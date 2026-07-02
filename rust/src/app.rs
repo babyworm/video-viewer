@@ -1935,6 +1935,22 @@ impl VideoViewerApp {
         let h = reader.height();
         let fmt = reader.format_name().to_string();
         let color_matrix = reader.color_matrix.clone();
+        // M-C ReconPsnr: PSNR pairs the stage BMP (stream-sized) with the
+        // viewer frame — a resolution mismatch can never produce a single
+        // valid cell, so fail the scan up front with the reason.
+        if req.y == corr::YMetric::ReconPsnr && (w, h) != (file.width, file.height) {
+            let mut s = self.bitstream_window.shared.lock();
+            s.corr_scan = Some(Arc::new(corr::CorrScanResult::new(
+                req,
+                Vec::new(),
+                Some(format!(
+                    "recon PSNR needs matching resolutions — stream {}x{} vs viewer {w}x{h}",
+                    file.width, file.height
+                )),
+            )));
+            s.corr_scanning = false;
+            return;
+        }
         // The request carries the offset it was built with — keeping it in
         // the result lets the window detect offset-change staleness.
         let offset = req.offset;
@@ -2009,6 +2025,11 @@ impl VideoViewerApp {
                     h,
                     Some(req.x),
                 );
+                // M-C ReconPsnr: luma of the current frame, captured before
+                // the RGB buffer moves into `prev_rgb` below.
+                let viewer_luma = (req.y == corr::YMetric::ReconPsnr).then(|| {
+                    crate::analysis::stage::luma_bt601(&rgb, (sw as usize) * (sh as usize))
+                });
                 prev_rgb = Some(rgb);
                 let Some(xg) = corr::x_grid(&grids, req.x, req.g) else {
                     continue; // e.g. motion metric at the very first frame
@@ -2038,7 +2059,40 @@ impl VideoViewerApp {
                     sh,
                     8,
                 );
-                let bs_g = corr::aggregate_bitstream_to_g(&l1, sw, sh, req.g);
+                let mut bs_g = corr::aggregate_bitstream_to_g(&l1, sw, sh, req.g);
+                // M-C ReconPsnr: per-frame stage BMP loaded on the scan
+                // thread. A frame without a loadable image is skipped —
+                // not pushed into `frames` — so the per-frame timeline
+                // stays sorted and gap-free instead of carrying all-invalid
+                // pairs (resolution was verified before the thread spawned).
+                if req.y == corr::YMetric::ReconPsnr {
+                    let recon = file
+                        .decode_idx(display_idx)
+                        .and_then(|di| {
+                            crate::analysis::stage::stage_rel_path(
+                                &file,
+                                di,
+                                crate::analysis::stage::StageKind::FinalRecon,
+                            )
+                        })
+                        .and_then(|rel| {
+                            crate::analysis::stage::resolve_stage_path(&file.path, rel)
+                        })
+                        .and_then(|p| crate::core::bmp::load_bmp(&p).ok());
+                    let Some(recon) = recon else {
+                        continue;
+                    };
+                    if (recon.width, recon.height) != (sw, sh) {
+                        continue;
+                    }
+                    let n_px = (sw as usize) * (sh as usize);
+                    let recon_luma = crate::analysis::stage::luma_bt601(&recon.rgb, n_px);
+                    // Always Some for ReconPsnr (set above, same condition).
+                    if let Some(vl) = viewer_luma.as_ref() {
+                        bs_g.psnr =
+                            crate::analysis::stage::psnr_to_g(vl, &recon_luma, sw, sh, req.g);
+                    }
+                }
                 frames.push((i, corr::align(&xg, &bs_g, req.y)));
                 {
                     let mut s = shared.lock();

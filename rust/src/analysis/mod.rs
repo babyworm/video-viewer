@@ -8,5 +8,6 @@ pub mod metrics;
 pub mod motion;
 pub mod orientation;
 pub mod scene;
+pub mod stage;
 pub mod vectorscope;
 pub mod waveform;

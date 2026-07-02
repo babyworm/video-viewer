@@ -177,6 +177,11 @@ pub struct CatbFrameMeta {
     pub exactness_missing: Vec<String>,
     /// Per-block dropped telemetry row count, parallel to BLOCK records.
     pub block_dropped_rows: Vec<i64>,
+    /// M-C: decoder-run stage image paths, sorted (key, path) pairs.
+    /// Observed keys: `residual`, `prediction`, `recon_unfiltered`,
+    /// `final_recon`; observed values: file names relative to the .catb
+    /// directory (decoder-run writes both into the same workdir).
+    pub stage_images: Vec<(String, String)>,
 }
 
 /// One FRAME record (80 bytes), with string ids resolved and −1 sentinels
@@ -1040,11 +1045,18 @@ fn parse_frame_meta(v: &serde_json::Value) -> CatbFrameMeta {
         .and_then(|x| x.as_array())
         .map(|arr| arr.iter().map(|e| e.as_i64().unwrap_or(0)).collect())
         .unwrap_or_default();
+    // M-C: stage image map — scalar (key, path) pairs, key-sorted like every
+    // other field grid (serde_json objects iterate key-sorted).
+    let stage_images = v
+        .get("stage_images")
+        .map(scalar_fields)
+        .unwrap_or_default();
     CatbFrameMeta {
         slice_headers,
         dpb,
         exactness_missing,
         block_dropped_rows,
+        stage_images,
     }
 }
 

@@ -1,3 +1,4 @@
+pub mod bmp;
 pub mod cache;
 pub mod catb;
 pub mod colorspace;

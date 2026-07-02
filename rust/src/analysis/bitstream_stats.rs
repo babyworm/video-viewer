@@ -52,6 +52,9 @@ pub struct FrameSummary {
 /// A loaded `.catb` with display-order mapping, resolution, and block cache.
 pub struct BitstreamFile {
     pub catb: CatbFile,
+    /// Path the `.catb` was opened from — anchor for resolving relative
+    /// stage-image paths (M-C: decoder-run writes the BMPs next to it).
+    pub path: std::path::PathBuf,
     /// `display_map[display_idx] = decode_idx`. Only `output == true` frames
     /// appear; built CVS-segment by CVS-segment (POC resets at IDR/BLA).
     pub display_map: Vec<usize>,
@@ -75,11 +78,13 @@ impl std::fmt::Debug for BitstreamFile {
 
 impl BitstreamFile {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, String> {
+        let path = path.as_ref();
         let catb = CatbFile::open(path)?;
         let display_map = build_display_map(&catb);
         let (width, height, resolution_source) = resolve_resolution(&catb)?;
         Ok(Self {
             catb,
+            path: path.to_path_buf(),
             display_map,
             width,
             height,
