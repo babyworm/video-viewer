@@ -597,6 +597,75 @@ pub fn spearman_rho(a: &[f32], b: &[f32], valid: &[bool]) -> Option<f64> {
 }
 
 // ---------------------------------------------------------------------------
+// Opportunity map (M3, 02 §2 view 4)
+// ---------------------------------------------------------------------------
+
+/// Signed mismatch map over the aligned pair: both sides are z-score
+/// normalized over the **valid cells only**, then the cell value is
+/// `z_b − z_a` (default direction: b = bpp, a = complexity).
+///
+/// Sign convention (02 §2-4): **positive** = the bitstream side is high
+/// relative to what the analysis side explains — e.g. flat block burning
+/// bits → noise/dither → preprocessing (denoise) candidate. Negative =
+/// complexity present but cheap to code.
+///
+/// A zero standard deviation on either side (uniform values carry no
+/// ranking information) contributes z = 0 for that side rather than NaN.
+/// Invalid cells are `None`.
+pub fn opportunity_grid(pair: &AlignedPair) -> Vec<Option<f32>> {
+    let n = pair.valid.len().min(pair.a.len()).min(pair.b.len());
+    let mut out = vec![None; pair.valid.len()];
+    let mut cnt = 0.0_f64;
+    let (mut sa, mut sb, mut saa, mut sbb) = (0.0_f64, 0.0, 0.0, 0.0);
+    for i in 0..n {
+        if !pair.valid[i] {
+            continue;
+        }
+        let (x, y) = (pair.a[i] as f64, pair.b[i] as f64);
+        cnt += 1.0;
+        sa += x;
+        sb += y;
+        saa += x * x;
+        sbb += y * y;
+    }
+    if cnt <= 0.0 {
+        return out;
+    }
+    let ma = sa / cnt;
+    let mb = sb / cnt;
+    let sda = (saa / cnt - ma * ma).max(0.0).sqrt();
+    let sdb = (sbb / cnt - mb * mb).max(0.0).sqrt();
+    for (i, slot) in out.iter_mut().enumerate().take(n) {
+        if !pair.valid[i] {
+            continue;
+        }
+        let za = if sda > 0.0 { (pair.a[i] as f64 - ma) / sda } else { 0.0 };
+        let zb = if sdb > 0.0 { (pair.b[i] as f64 - mb) / sdb } else { 0.0 };
+        *slot = Some((zb - za) as f32);
+    }
+    out
+}
+
+/// Top-N ranking of the opportunity grid: **z descending** (not |z| — the
+/// positive mismatch is the preprocessing candidate, 02 §2-4), ties broken
+/// by ascending cell index (raster order) for determinism. Returns
+/// `(cell_index, z)` pairs.
+pub fn top_n_ranking(grid: &[Option<f32>], n: usize) -> Vec<(usize, f32)> {
+    let mut ranked: Vec<(usize, f32)> = grid
+        .iter()
+        .enumerate()
+        .filter_map(|(i, z)| z.map(|z| (i, z)))
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    ranked.truncate(n);
+    ranked
+}
+
+// ---------------------------------------------------------------------------
 // Conditional class table (02 §2 view 3)
 // ---------------------------------------------------------------------------
 
@@ -777,16 +846,57 @@ pub struct CorrScanRequest {
     pub y: YMetric,
 }
 
+/// Per-frame correlation statistics accumulated during a range scan
+/// (M3 timeline, 02 §2-5).
+#[derive(Debug, Clone, Copy)]
+pub struct FramePairStat {
+    pub frame: usize,
+    pub r: Option<f64>,
+    pub rho: Option<f64>,
+    pub n: usize,
+}
+
+/// Per-frame (frame, r, ρ, N) for a scanned frame list.
+pub fn per_frame_stats(frames: &[(usize, AlignedPair)]) -> Vec<FramePairStat> {
+    frames
+        .iter()
+        .map(|(frame, p)| FramePairStat {
+            frame: *frame,
+            r: pearson_r(&p.a, &p.b, &p.valid),
+            rho: spearman_rho(&p.a, &p.b, &p.valid),
+            n: p.n_valid(),
+        })
+        .collect()
+}
+
 /// Background scan output: per-frame aligned pairs (kept per frame so the
-/// CSV dump can carry the frame column).
+/// CSV dump can carry the frame column) plus the per-frame r timeline.
 #[derive(Debug, Clone)]
 pub struct CorrScanResult {
     pub request: CorrScanRequest,
     pub frames: Vec<(usize, AlignedPair)>,
+    /// Per-frame r/ρ/N sequence for the timeline (M3), computed once on the
+    /// scan thread.
+    pub per_frame: Vec<FramePairStat>,
     pub error: Option<String>,
 }
 
 impl CorrScanResult {
+    /// Build a result, accumulating the per-frame statistics.
+    pub fn new(
+        request: CorrScanRequest,
+        frames: Vec<(usize, AlignedPair)>,
+        error: Option<String>,
+    ) -> Self {
+        let per_frame = per_frame_stats(&frames);
+        Self {
+            request,
+            frames,
+            per_frame,
+            error,
+        }
+    }
+
     /// Concatenated (a, b, valid) across all scanned frames.
     pub fn concat(&self) -> (Vec<f32>, Vec<f32>, Vec<bool>) {
         let n: usize = self.frames.iter().map(|(_, p)| p.a.len()).sum();
@@ -1237,6 +1347,151 @@ mod tests {
         // Empty classes report zero cells.
         assert_eq!(t[1].cells, 0);
         assert_eq!(t[2].cells, 0);
+    }
+
+    fn pair_of(a: Vec<f32>, b: Vec<f32>, valid: Vec<bool>) -> AlignedPair {
+        let n = a.len() as u32;
+        AlignedPair {
+            g: 16,
+            cols: n,
+            rows: 1,
+            a,
+            b,
+            valid,
+        }
+    }
+
+    #[test]
+    fn opportunity_zscore_known_values() {
+        // a = [1,2,3,4] (mean 2.5, σ = √1.25), b reversed → z_b − z_a is
+        // antisymmetric: cell 0 = +2·1.5/√1.25, cell 3 the negative.
+        let p = pair_of(
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![4.0, 3.0, 2.0, 1.0],
+            vec![true; 4],
+        );
+        let g = opportunity_grid(&p);
+        let expect0 = 2.0 * 1.5 / 1.25_f32.sqrt();
+        assert!((g[0].unwrap() - expect0).abs() < 1e-5, "{:?}", g[0]);
+        assert!((g[3].unwrap() + expect0).abs() < 1e-5);
+        // Antisymmetry: sum of all opportunities is 0 (both sides z-scored).
+        let sum: f32 = g.iter().flatten().sum();
+        assert!(sum.abs() < 1e-5);
+    }
+
+    #[test]
+    fn opportunity_zero_stddev_guard() {
+        // Uniform a → z_a = 0 everywhere → opportunity is z_b alone. No NaN.
+        let p = pair_of(
+            vec![5.0; 4],
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![true; 4],
+        );
+        let g = opportunity_grid(&p);
+        assert!(g.iter().flatten().all(|z| z.is_finite()));
+        let expect0 = -1.5 / 1.25_f32.sqrt(); // z_b of the smallest b
+        assert!((g[0].unwrap() - expect0).abs() < 1e-5);
+        // Both sides uniform → all zeros (not NaN).
+        let p = pair_of(vec![5.0; 3], vec![7.0; 3], vec![true; 3]);
+        let g = opportunity_grid(&p);
+        assert!(g.iter().flatten().all(|z| *z == 0.0));
+    }
+
+    #[test]
+    fn opportunity_invalid_cells_are_none_and_excluded_from_stats() {
+        // The masked outlier (100, 100) must not shift the valid statistics:
+        // valid cells alone are symmetric → opportunity 0 for matched cells.
+        let p = pair_of(
+            vec![1.0, 3.0, 100.0],
+            vec![10.0, 30.0, 100.0],
+            vec![true, true, false],
+        );
+        let g = opportunity_grid(&p);
+        assert!(g[2].is_none(), "invalid cell must be None");
+        // a and b rank identically → z_a == z_b → opportunity 0.
+        assert!(g[0].unwrap().abs() < 1e-5);
+        assert!(g[1].unwrap().abs() < 1e-5);
+        // All-invalid pair → all None (no division by zero).
+        let p = pair_of(vec![1.0, 2.0], vec![3.0, 4.0], vec![false, false]);
+        assert!(opportunity_grid(&p).iter().all(|z| z.is_none()));
+    }
+
+    #[test]
+    fn opportunity_flat_high_bpp_is_positive_noise_explained_is_not() {
+        // 02 §2-4 semantics: positive = bpp exceeds what complexity explains.
+        // Cells 0–1: flat (a low) but expensive (b high) → true opportunity.
+        // Cells 2–3: noisy (a high) and expensive (b high) → variance
+        // explains the bits → NOT the top of the ranking.
+        let p = pair_of(
+            vec![0.0, 0.0, 10.0, 10.0],
+            vec![8.0, 8.0, 8.0, 8.0],
+            vec![true; 4],
+        );
+        // b uniform → z_b = 0; flat cells get −z_a > 0.
+        let g = opportunity_grid(&p);
+        assert!(g[0].unwrap() > 0.9, "flat+high-bpp must be positive: {:?}", g[0]);
+        assert!(g[2].unwrap() < -0.9, "noise-explained must be negative");
+        let top = top_n_ranking(&g, 2);
+        assert_eq!(top[0].0, 0);
+        assert_eq!(top[1].0, 1);
+    }
+
+    #[test]
+    fn top_n_sorts_z_descending_with_index_tiebreak() {
+        let grid = vec![
+            Some(1.0_f32),
+            None,
+            Some(3.0),
+            Some(-2.0),
+            Some(3.0), // tie with cell 2 → cell 2 first (raster order)
+            Some(0.5),
+        ];
+        let top = top_n_ranking(&grid, 4);
+        assert_eq!(
+            top.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![2, 4, 0, 5],
+            "z descending (NOT |z|), ties by ascending index"
+        );
+        // Truncation and the n > available case.
+        assert_eq!(top_n_ranking(&grid, 2).len(), 2);
+        assert_eq!(top_n_ranking(&grid, 99).len(), 5, "None cells excluded");
+        assert!(top_n_ranking(&[], 5).is_empty());
+    }
+
+    #[test]
+    fn per_frame_stats_accumulates_r_rho_n() {
+        let f0 = pair_of(
+            vec![1.0, 2.0, 3.0],
+            vec![2.0, 4.0, 6.0],
+            vec![true, true, true],
+        );
+        let f1 = pair_of(
+            vec![1.0, 2.0, 3.0],
+            vec![9.0, 5.0, 1.0],
+            vec![true, true, true],
+        );
+        // Frame 2 has < 2 valid samples → r/ρ None but still listed.
+        let f2 = pair_of(vec![1.0, 2.0], vec![3.0, 4.0], vec![true, false]);
+        let scan = CorrScanResult::new(
+            CorrScanRequest {
+                start: 3,
+                end: 5,
+                g: 16,
+                x: XMetric::Variance,
+                y: YMetric::Bpp,
+            },
+            vec![(3, f0), (4, f1), (5, f2)],
+            None,
+        );
+        assert_eq!(scan.per_frame.len(), 3);
+        assert_eq!(scan.per_frame[0].frame, 3);
+        assert!((scan.per_frame[0].r.unwrap() - 1.0).abs() < 1e-9);
+        assert!((scan.per_frame[1].r.unwrap() + 1.0).abs() < 1e-9);
+        assert!((scan.per_frame[1].rho.unwrap() + 1.0).abs() < 1e-9);
+        assert_eq!(scan.per_frame[1].n, 3);
+        assert_eq!(scan.per_frame[2].frame, 5);
+        assert!(scan.per_frame[2].r.is_none());
+        assert_eq!(scan.per_frame[2].n, 1);
     }
 
     #[test]

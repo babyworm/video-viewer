@@ -91,12 +91,13 @@ fn test_settings_view_config_conversion() {
 
 #[test]
 fn test_preset_apply_table() {
-    let cases: [(Preset, FillMode, bool, bool); 5] = [
+    let cases: [(Preset, FillMode, bool, bool); 6] = [
         // (preset, fill, grid, label)
         (Preset::Rate, FillMode::Bpp, true, false),
         (Preset::QpMap, FillMode::Qp, true, true),
         (Preset::Motion, FillMode::MvHeat, true, false),
         (Preset::Mode, FillMode::Mode, true, false),
+        (Preset::Opportunity, FillMode::Opportunity, true, false),
         (Preset::Clean, FillMode::None, false, false),
     ];
     for (preset, fill, grid, label) in cases {

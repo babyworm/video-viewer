@@ -1479,6 +1479,7 @@ impl VideoViewerApp {
         s.corr_scan_request = None;
         s.corr_scanning = false;
         s.corr_scan_progress = (0, 0);
+        s.corr_hover_cell = None;
         self.corr_scan_active_job.store(0, Ordering::Release);
     }
 
@@ -1508,6 +1509,11 @@ impl VideoViewerApp {
             shared.viewer_size = self.reader.as_ref().map(|r| (r.width(), r.height()));
             shared.offset = self.bitstream_offset;
             shared.is_playing = self.is_playing;
+            // M3: scene-change markers for the r timeline — existing results
+            // only, never triggers a detection run.
+            if shared.scene_changes != self.scene_changes {
+                shared.scene_changes = self.scene_changes.clone();
+            }
             if let (Some(rgb), Some(r)) = (&self.current_rgb, &self.reader) {
                 shared.frame_image = Some(egui::ColorImage::from_rgb(
                     [r.width() as usize, r.height() as usize],
@@ -1613,11 +1619,11 @@ impl VideoViewerApp {
                 match crate::core::reader::VideoReader::open(&path, w, h, &fmt, &color_matrix) {
                     Ok(r) => r,
                     Err(e) => {
-                        publish(corr::CorrScanResult {
-                            request: req,
-                            frames: Vec::new(),
-                            error: Some(format!("failed to open video: {e}")),
-                        });
+                        publish(corr::CorrScanResult::new(
+                            req,
+                            Vec::new(),
+                            Some(format!("failed to open video: {e}")),
+                        ));
                         return;
                     }
                 };
@@ -1677,11 +1683,7 @@ impl VideoViewerApp {
                 }
                 ctx2.request_repaint();
             }
-            publish(corr::CorrScanResult {
-                request: req,
-                frames,
-                error,
-            });
+            publish(corr::CorrScanResult::new(req, frames, error));
         });
     }
 
@@ -2921,7 +2923,13 @@ impl eframe::App for VideoViewerApp {
         // Mirror playback state every root pass so the child can self-repaint
         // during playback and stop when playback ends (sidebar convention).
         if self.bitstream_window.open {
-            self.bitstream_window.shared.lock().is_playing = self.is_playing;
+            let mut s = self.bitstream_window.shared.lock();
+            s.is_playing = self.is_playing;
+            // Keep scene markers fresh even when no frame change pushed them
+            // (detection completes asynchronously).
+            if s.scene_changes != self.scene_changes {
+                s.scene_changes = self.scene_changes.clone();
+            }
         }
         if let Some(new_view_settings) = self.bitstream_window.show(ctx) {
             // §2: toggle state persists across window/app restarts.
@@ -2978,6 +2986,40 @@ impl eframe::App for VideoViewerApp {
                                 },
                             );
                         }
+                    }
+                }
+
+                // M3 (02 §2 view 1): mirror the Correlation scatter's
+                // hovered opportunity cell onto the main canvas — same
+                // faint cyan marker as the Bitstream window's canvas.
+                if self.bitstream_window.open {
+                    let hover = self.bitstream_window.shared.lock().corr_hover_cell;
+                    if let (Some((c, r, g)), Some(file), Some(image_rect)) = (
+                        hover,
+                        self.bitstream_file.as_ref(),
+                        self.canvas.image_rect(),
+                    ) {
+                        // Stream px → screen: the viewer image spans
+                        // image_rect, so the viewer-px scale cancels out.
+                        let sw = file.width.max(1) as f32;
+                        let sh = file.height.max(1) as f32;
+                        let zx = image_rect.width() / sw;
+                        let zy = image_rect.height() / sh;
+                        let gf = g as f32;
+                        let rect = egui::Rect::from_min_size(
+                            image_rect.min
+                                + egui::vec2(c as f32 * gf * zx, r as f32 * gf * zy),
+                            egui::vec2(gf * zx, gf * zy),
+                        );
+                        ui.painter().rect_stroke(
+                            rect,
+                            0.0,
+                            egui::Stroke::new(
+                                1.5,
+                                egui::Color32::from_rgba_unmultiplied(0, 230, 230, 150),
+                            ),
+                            egui::StrokeKind::Outside,
+                        );
                     }
                 }
 

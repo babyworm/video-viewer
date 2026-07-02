@@ -23,19 +23,21 @@ use crate::analysis::bitstream_stats::{
     BitstreamFile, BitstreamGrid, FrameTypeClass, ModeClass,
 };
 use crate::analysis::correlation::{
-    aggregate_bitstream_to_g, align, class_table, classes_at_g, csv_dump, pearson_r,
-    spearman_rho, x_grid, AlignedPair, AnalysisFrameGrids, BitstreamG, CorrScanRequest,
-    CorrScanResult, XMetric, YMetric, G_SIZES, PRESET_PAIRS,
+    aggregate_bitstream_to_g, align, class_table, classes_at_g, csv_dump, opportunity_grid,
+    pearson_r, spearman_rho, top_n_ranking, x_grid, AlignedPair, AnalysisFrameGrids, BitstreamG,
+    CorrScanRequest, CorrScanResult, XMetric, YMetric, G_SIZES, PRESET_PAIRS,
 };
 use crate::analysis::motion::MotionClass;
 use crate::core::catb::BsBlock;
 use crate::ui::settings::BitstreamViewSettings;
+use crate::ui::sideband_overlay::diverging_colormap;
 
 // ---------------------------------------------------------------------------
 // Fill / layer / preset model (§2, §3) — pure data, unit-tested below.
 // ---------------------------------------------------------------------------
 
-/// Exclusive fill layer (§2). Opportunity arrives in M3.
+/// Exclusive fill layer (§2). Opportunity (M3) renders the correlation
+/// z-mismatch on G cells, not L0 rects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillMode {
     None,
@@ -43,7 +45,18 @@ pub enum FillMode {
     Bpp,
     Mode,
     MvHeat,
+    Opportunity,
 }
+
+/// All fill modes in §8 shortcut order (keys 1–6).
+pub const FILL_MODES: [FillMode; 6] = [
+    FillMode::None,
+    FillMode::Qp,
+    FillMode::Bpp,
+    FillMode::Mode,
+    FillMode::MvHeat,
+    FillMode::Opportunity,
+];
 
 impl FillMode {
     pub fn label(&self) -> &'static str {
@@ -53,6 +66,7 @@ impl FillMode {
             FillMode::Bpp => "bpp",
             FillMode::Mode => "Mode",
             FillMode::MvHeat => "MV-heat",
+            FillMode::Opportunity => "Opportunity",
         }
     }
 
@@ -62,6 +76,7 @@ impl FillMode {
             "bpp" => FillMode::Bpp,
             "Mode" => FillMode::Mode,
             "MV-heat" => FillMode::MvHeat,
+            "Opportunity" => FillMode::Opportunity,
             _ => FillMode::None,
         }
     }
@@ -119,21 +134,23 @@ impl ViewConfig {
     }
 }
 
-/// One-click configurations (§3). Opportunity preset arrives with M3.
+/// One-click configurations (§3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Preset {
     Rate,
     QpMap,
     Motion,
     Mode,
+    Opportunity,
     Clean,
 }
 
-pub const PRESETS: [Preset; 5] = [
+pub const PRESETS: [Preset; 6] = [
     Preset::Rate,
     Preset::QpMap,
     Preset::Motion,
     Preset::Mode,
+    Preset::Opportunity,
     Preset::Clean,
 ];
 
@@ -144,6 +161,7 @@ impl Preset {
             Preset::QpMap => "QP Map",
             Preset::Motion => "Motion",
             Preset::Mode => "Mode",
+            Preset::Opportunity => "Opportunity",
             Preset::Clean => "Clean",
         }
     }
@@ -181,6 +199,12 @@ impl Preset {
             Preset::Mode => ViewConfig {
                 fill: FillMode::Mode,
                 part: true, // M4 layer
+                grid: true,
+                ..base
+            },
+            // §3: {fill=Opportunity, Grid, Sel} — ranked-cell traversal.
+            Preset::Opportunity => ViewConfig {
+                fill: FillMode::Opportunity,
                 grid: true,
                 ..base
             },
@@ -316,7 +340,9 @@ pub fn fill_color(
 ) -> Option<egui::Color32> {
     let a255 = |t: f32| ((opacity * t).clamp(0.0, 1.0) * 255.0) as u8;
     match fill {
-        FillMode::None => None,
+        // Opportunity is a G-cell layer drawn from the aligned pair, not a
+        // per-block colour — see `opportunity_cell_color`.
+        FillMode::None | FillMode::Opportunity => None,
         FillMode::Qp => {
             let t = normalize(qp, stats.qp_min, stats.qp_max);
             Some(egui::Color32::from_rgba_unmultiplied(
@@ -359,11 +385,31 @@ pub fn fill_color(
 /// Short value text for tooltips / labels / loupe under a fill mode.
 pub fn fill_value_text(fill: FillMode, qp: f32, bpp: f32, mode: ModeClass, mv: f32) -> String {
     match fill {
-        FillMode::None | FillMode::Qp => format!("{qp:.0}"),
+        // Opportunity z lives on G cells, not blocks — fall back to QP for
+        // block-level text (labels / loupe).
+        FillMode::None | FillMode::Qp | FillMode::Opportunity => format!("{qp:.0}"),
         FillMode::Bpp => format!("{bpp:.2}"),
         FillMode::Mode => mode.label().to_string(),
         FillMode::MvHeat => format!("{mv:.1}"),
     }
+}
+
+/// Diverging fill colour for an opportunity z value on the symmetric scale
+/// −zmax..+zmax (blue = negative, white = 0, red = positive). `opacity`
+/// applies to the fill only (§2).
+pub fn opportunity_cell_color(z: f32, zmax: f32, opacity: f32) -> egui::Color32 {
+    let t = if zmax > 0.0 {
+        (0.5 + z / (2.0 * zmax)).clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let c = diverging_colormap(t as f64);
+    egui::Color32::from_rgba_unmultiplied(
+        c.r(),
+        c.g(),
+        c.b(),
+        (opacity.clamp(0.0, 1.0) * 255.0) as u8,
+    )
 }
 
 /// Quarter-pel MV pair display, e.g. `(-3.25, 0.5)`.
@@ -424,6 +470,14 @@ pub struct BitstreamShared {
     pub corr_scanning: bool,
     /// (frames done, frames total) while scanning.
     pub corr_scan_progress: (usize, usize),
+    /// Root-pushed scene-change frame indices (existing detection results
+    /// only — the window never triggers a detection run). Timeline markers.
+    pub scene_changes: Vec<usize>,
+    /// Child → root: scatter-hovered opportunity cell `(col, row, g)` in
+    /// stream px grid units — mirrored as a highlight on the main viewer
+    /// canvas (02 §2 view 1). Kept until replaced, like the window's own
+    /// marker; Esc clears it.
+    pub corr_hover_cell: Option<(u32, u32, u32)>,
 }
 
 /// Analysis-side grids for one viewer frame, computed by the root
@@ -464,6 +518,8 @@ impl BitstreamShared {
             corr_scan: None,
             corr_scanning: false,
             corr_scan_progress: (0, 0),
+            scene_changes: Vec::new(),
+            corr_hover_cell: None,
         }
     }
 }
@@ -517,6 +573,7 @@ struct Snapshot {
     corr_scan: Option<Arc<CorrScanResult>>,
     corr_scanning: bool,
     corr_scan_progress: (usize, usize),
+    scene_changes: Vec<usize>,
 }
 
 pub struct BitstreamWindow {
@@ -559,6 +616,28 @@ pub struct BitstreamWindow {
     /// Cached range-scan statistics + scatter points (see
     /// [`Self::refresh_corr_scan_derived`]).
     corr_scan_derived: Option<CorrScanDerived>,
+
+    // -- M3: opportunity map + bidirectional highlight state --
+    /// Scatter-hovered G cell `(col, row, g)`: faint highlight on the Viewer
+    /// canvas, kept until replaced (window-local, §6).
+    corr_hover_cell: Option<(u32, u32, u32)>,
+    /// Selected opportunity G cell `(col, row, g)`: Sel-layer highlight on
+    /// the canvas, emphasized scatter point, Inspector raw values.
+    opp_focus: Option<(u32, u32, u32)>,
+    /// Stream-px point to centre the canvas on (Top-N [Jump], V22) — applied
+    /// on the next canvas pass where the effective zoom is known.
+    pending_center: Option<egui::Pos2>,
+}
+
+/// Opportunity grid derived from the current frame's aligned pair (M3).
+struct OppData {
+    g: u32,
+    cols: u32,
+    rows: u32,
+    /// `z_b − z_a` per G cell; `None` on invalid cells.
+    grid: Vec<Option<f32>>,
+    /// max |z| over valid cells — symmetric legend scale.
+    zmax: f32,
 }
 
 /// Cached current-frame correlation data, keyed on everything that feeds it.
@@ -576,6 +655,8 @@ struct CorrDerived {
     classes: Option<(Vec<MotionClass>, Vec<bool>, u32, u32)>,
     r: Option<f64>,
     rho: Option<f64>,
+    /// Opportunity map of `pair` (M3); `None` when `pair` is.
+    opp: Option<OppData>,
 }
 
 /// Cached statistics and valid scatter points of a range-scan result. The
@@ -627,6 +708,9 @@ impl BitstreamWindow {
             corr_csv_status: None,
             corr_derived: None,
             corr_scan_derived: None,
+            corr_hover_cell: None,
+            opp_focus: None,
+            pending_center: None,
         }
     }
 
@@ -688,6 +772,7 @@ impl BitstreamWindow {
                 corr_scan: s.corr_scan.clone(),
                 corr_scanning: s.corr_scanning,
                 corr_scan_progress: s.corr_scan_progress,
+                scene_changes: s.scene_changes.clone(),
             };
             (snap, title)
         };
@@ -736,13 +821,25 @@ impl BitstreamWindow {
                 // only pay for visible views).
                 {
                     let mut s = shared.lock();
-                    let active = self.tab == BsTab::Correlation;
+                    // M3: the Opportunity fill on the Viewer tab consumes
+                    // the same analysis grids as the Correlation tab.
+                    let active = self.tab == BsTab::Correlation
+                        || (self.tab == BsTab::Viewer
+                            && self.view.fill == FillMode::Opportunity);
                     if active && !s.corr_active {
                         // Freshly activated: the root computes on its next
                         // pass — wake it up.
                         ctx.request_repaint_of(egui::ViewportId::ROOT);
                     }
                     s.corr_active = active;
+                    // M3 (02 §2 view 1): mirror the scatter-hover cell to
+                    // the root so the main viewer canvas can highlight it
+                    // too. Wake the root when it changes — the root only
+                    // repaints on its own events otherwise.
+                    if s.corr_hover_cell != self.corr_hover_cell {
+                        s.corr_hover_cell = self.corr_hover_cell;
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    }
                 }
 
                 // Keep repainting while the root plays back (see sidebar.rs:
@@ -857,19 +954,10 @@ impl BitstreamWindow {
         if k.g {
             self.view.grid = !self.view.grid;
         }
-        let fills = [
-            FillMode::None,
-            FillMode::Qp,
-            FillMode::Bpp,
-            FillMode::Mode,
-            FillMode::MvHeat,
-        ];
         for (i, &pressed) in k.nums.iter().enumerate() {
             if pressed {
-                if let Some(&f) = fills.get(i) {
+                if let Some(&f) = FILL_MODES.get(i) {
                     self.view.fill = f;
-                } else {
-                    self.set_hint(ctx, "Opportunity fill arrives in M3");
                 }
             }
         }
@@ -891,6 +979,8 @@ impl BitstreamWindow {
         }
         if k.esc {
             self.selection = None;
+            self.opp_focus = None;
+            self.corr_hover_cell = None;
         }
         if wake_root {
             ctx.request_repaint_of(egui::ViewportId::ROOT);
@@ -952,13 +1042,7 @@ impl BitstreamWindow {
                 egui::ComboBox::from_id_salt("bs_fill")
                     .selected_text(self.view.fill.label())
                     .show_ui(ui, |ui| {
-                        for f in [
-                            FillMode::None,
-                            FillMode::Qp,
-                            FillMode::Bpp,
-                            FillMode::Mode,
-                            FillMode::MvHeat,
-                        ] {
+                        for f in FILL_MODES {
                             ui.selectable_value(&mut self.view.fill, f, f.label());
                         }
                     });
@@ -1041,6 +1125,10 @@ impl BitstreamWindow {
         // Refresh per-frame derived data (blocks, stats, grids). The frame
         // texture itself is uploaded tab-independently in `show()`.
         self.refresh_derived(snap);
+        // Opportunity fill consumes the correlation derivation (M3).
+        if self.view.fill == FillMode::Opportunity {
+            self.refresh_corr_derived(snap);
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             self.ui_canvas(ui, snap);
@@ -1154,6 +1242,23 @@ impl BitstreamWindow {
             zoom = fit_zoom;
         }
 
+        // M3 [Jump]: centre the canvas on a stream-px point (V22). Applied
+        // here because only the canvas pass knows the effective zoom.
+        if let Some(p) = self.pending_center.take() {
+            let (sw0, sh0) = snap
+                .file
+                .as_ref()
+                .map(|f| (f.width.max(1) as f32, f.height.max(1) as f32))
+                .unwrap_or((vw_f, vh_f));
+            let (zx0, zy0) = (zoom * vw_f / sw0, zoom * vh_f / sh0);
+            // origin + p·z = canvas centre ⇔ pan = img/2 − p·z.
+            self.pan = egui::vec2(
+                vw_f * zoom * 0.5 - p.x * zx0,
+                vh_f * zoom * 0.5 - p.y * zy0,
+            );
+            self.zoom = Some(zoom); // panning leaves fit mode
+        }
+
         let img_w = vw_f * zoom;
         let img_h = vh_f * zoom;
         let origin = canvas_rect.min
@@ -1196,8 +1301,41 @@ impl BitstreamWindow {
             let opacity = self.view.opacity;
             let lod_mode = use_lod(zoom);
 
+            // Opportunity fill (M3): G-grid cells from the aligned pair —
+            // the cell count is small, so no LOD is needed.
+            if self.view.fill == FillMode::Opportunity {
+                let opp = self
+                    .corr_derived
+                    .as_ref()
+                    .filter(|cd| cd.display_idx == d.display_idx)
+                    .and_then(|cd| cd.opp.as_ref());
+                if let Some(o) = opp {
+                    let cell = o.g as f32;
+                    for r in 0..o.rows {
+                        for c in 0..o.cols {
+                            let i = (r as usize) * (o.cols as usize) + c as usize;
+                            if let Some(z) = o.grid.get(i).copied().flatten() {
+                                let rect = block_rect(
+                                    c as f32 * cell,
+                                    r as f32 * cell,
+                                    cell,
+                                    cell,
+                                );
+                                if rect.intersects(canvas_rect) {
+                                    painter.rect_filled(
+                                        rect,
+                                        0.0,
+                                        opportunity_cell_color(z, o.zmax, opacity),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Fill layer — LOD aggregate cells below 1.5x, per-CU rects above.
-            if self.view.fill != FillMode::None {
+            if self.view.fill != FillMode::None && self.view.fill != FillMode::Opportunity {
                 if lod_mode {
                     let g = &d.grid_lod;
                     for r in 0..g.rows {
@@ -1333,6 +1471,33 @@ impl BitstreamWindow {
                         }
                     }
                 }
+                // M3: selected opportunity G cell (Top-N [Jump] / cell click).
+                if let Some((c, r, g)) = self.opp_focus {
+                    let gf = g as f32;
+                    let rect = block_rect(c as f32 * gf, r as f32 * gf, gf, gf);
+                    painter.rect_stroke(
+                        rect,
+                        0.0,
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 220, 40)),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+            }
+
+            // M3: scatter-hovered cell — a faint marker distinct from the
+            // Sel layer (§6: linger without stealing the selection look).
+            if let Some((c, r, g)) = self.corr_hover_cell {
+                let gf = g as f32;
+                let rect = block_rect(c as f32 * gf, r as f32 * gf, gf, gf);
+                painter.rect_stroke(
+                    rect,
+                    0.0,
+                    egui::Stroke::new(
+                        1.5,
+                        egui::Color32::from_rgba_unmultiplied(0, 230, 230, 150),
+                    ),
+                    egui::StrokeKind::Outside,
+                );
             }
         }
 
@@ -1347,8 +1512,26 @@ impl BitstreamWindow {
                             display_idx: d.display_idx,
                             block_idx,
                         });
+                    // M3: with the Opportunity fill, a click also selects the
+                    // G cell — the Inspector shows its raw (a, b, z).
+                    if self.view.fill == FillMode::Opportunity {
+                        self.opp_focus = self
+                            .corr_derived
+                            .as_ref()
+                            .filter(|cd| cd.display_idx == d.display_idx)
+                            .and_then(|cd| cd.opp.as_ref())
+                            .and_then(|o| {
+                                let (c, r) = (sx as u32 / o.g, sy as u32 / o.g);
+                                let i = (r as usize) * (o.cols as usize) + c as usize;
+                                (c < o.cols
+                                    && r < o.rows
+                                    && o.grid.get(i).copied().flatten().is_some())
+                                .then_some((c, r, o.g))
+                            });
+                    }
                 } else {
                     self.selection = None;
+                    self.opp_focus = None;
                 }
             }
         }
@@ -1394,7 +1577,28 @@ impl BitstreamWindow {
         // Legend — always visible, bottom-left (§5): min/max re-normalize per
         // frame, so hiding it would make colours incomparable.
         if !peek {
-            if let Some(d) = self.derived.as_ref() {
+            if self.view.fill == FillMode::Opportunity {
+                // No-data guard: like the other fills (whose legend hides
+                // when `derived` is None), skip the bar entirely instead of
+                // rendering a meaningless "−0.00 .. +0.00" scale.
+                if let Some(zmax) = self
+                    .corr_derived
+                    .as_ref()
+                    .and_then(|cd| cd.opp.as_ref())
+                    .map(|o| o.zmax)
+                {
+                    // Symmetric z scale; name states the direction
+                    // ("z(Y)−z(X)") whenever X/Y stray from the default
+                    // variance/bpp pair.
+                    let name =
+                        if self.corr_x == XMetric::Variance && self.corr_y == YMetric::Bpp {
+                            "Opportunity".to_string()
+                        } else {
+                            format!("z({})−z({})", self.corr_y.label(), self.corr_x.label())
+                        };
+                    draw_opportunity_legend(&painter, canvas_rect, &name, zmax);
+                }
+            } else if let Some(d) = self.derived.as_ref() {
                 draw_legend(&painter, canvas_rect, self.view.fill, &d.stats);
             }
         }
@@ -1441,6 +1645,49 @@ impl BitstreamWindow {
                     });
                 });
                 ui.separator();
+
+                // M3: raw values of the selected opportunity G cell
+                // ((a, b, z) — the heatmap colour's provenance).
+                if let Some((c, r, g)) = self.opp_focus {
+                    let cell = self
+                        .corr_derived
+                        .as_ref()
+                        .filter(|cd| cd.g == g)
+                        .and_then(|cd| {
+                            let p = cd.pair.as_ref()?;
+                            let o = cd.opp.as_ref()?;
+                            if c >= p.cols || r >= p.rows {
+                                return None;
+                            }
+                            let i = (r as usize) * (p.cols as usize) + c as usize;
+                            let z = o.grid.get(i).copied().flatten()?;
+                            Some((p.a[i], p.b[i], z, cd.x, cd.y))
+                        });
+                    if let Some((a, b, z, x, y)) = cell {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Opportunity cell ({}, {})",
+                                c * g,
+                                r * g
+                            ))
+                            .strong(),
+                        );
+                        egui::Grid::new("bs_opp_cell_grid")
+                            .spacing(egui::vec2(10.0, 3.0))
+                            .show(ui, |ui| {
+                                ui.label(x.label());
+                                ui.monospace(format!("{a:.3}"));
+                                ui.end_row();
+                                ui.label(y.label());
+                                ui.monospace(format!("{b:.3}"));
+                                ui.end_row();
+                                ui.label("z");
+                                ui.monospace(format!("{z:+.3}"));
+                                ui.end_row();
+                            });
+                        ui.separator();
+                    }
+                }
 
                 let Some(file) = snap.file.as_ref() else {
                     ui.label("No .catb loaded.");
@@ -1804,6 +2051,21 @@ impl BitstreamWindow {
             .unwrap_or((None, None));
         let classes = classes_at_g(&analysis.grids, self.corr_g)
             .map(|(classes, grid)| (classes, grid.valid, grid.cols, grid.rows));
+        // M3: opportunity map of the same pair (cheap — O(cells)).
+        let opp = pair.as_ref().map(|p| {
+            let grid = opportunity_grid(p);
+            let zmax = grid
+                .iter()
+                .flatten()
+                .fold(0.0_f32, |m, z| m.max(z.abs()));
+            OppData {
+                g: self.corr_g,
+                cols: p.cols,
+                rows: p.rows,
+                grid,
+                zmax,
+            }
+        });
         self.corr_derived = Some(CorrDerived {
             frame_idx: snap.viewer_frame,
             display_idx,
@@ -1815,6 +2077,7 @@ impl BitstreamWindow {
             classes,
             r,
             rho,
+            opp,
         });
     }
 
@@ -1909,6 +2172,8 @@ impl BitstreamWindow {
     #[allow(clippy::too_many_lines)]
     fn ui_correlation_tab(&mut self, ctx: &egui::Context, snap: &Snapshot) {
         self.ui_transport_and_status(ctx, snap);
+        // M3 timeline strip — added after the transport so it stacks above it.
+        self.ui_corr_timeline(ctx, snap);
         self.refresh_corr_derived(snap);
         self.refresh_corr_scan_derived(snap);
 
@@ -2026,53 +2291,133 @@ impl BitstreamWindow {
             });
         });
 
-        // -- right dock: conditional class table (02 §2 view 3) --
+        // -- right dock: conditional class table (02 §2 view 3) + M3 Top-N --
         egui::SidePanel::right("bs_corr_classes")
             .default_width(300.0)
             .show(ctx, |ui| {
                 ui.heading("Motion class × bitstream");
                 ui.separator();
-                let Some(d) = self.corr_derived.as_ref() else {
+                // Owned Top-N snapshot first (small), so the [Jump] handler
+                // below can mutate `self` without fighting the `d` borrow.
+                // `(g, [(col, row, z)])` rows of the ranking table.
+                type TopnRows = (u32, Vec<(u32, u32, f32)>);
+                let topn: Option<TopnRows> =
+                    self.corr_derived.as_ref().and_then(|d| {
+                        let p = d.pair.as_ref()?;
+                        let o = d.opp.as_ref()?;
+                        let rows = top_n_ranking(&o.grid, 20)
+                            .into_iter()
+                            .map(|(i, z)| {
+                                (i as u32 % p.cols, i as u32 / p.cols, z)
+                            })
+                            .collect();
+                        Some((o.g, rows))
+                    });
+                if let Some(d) = self.corr_derived.as_ref() {
+                    match &d.classes {
+                        Some((classes, valid, cols, rows)) => {
+                            let table = class_table(classes, valid, *cols, *rows, &d.bs_g);
+                            egui::Grid::new("bs_corr_class_grid")
+                                .striped(true)
+                                .spacing(egui::vec2(10.0, 4.0))
+                                .show(ui, |ui| {
+                                    for head in
+                                        ["class", "cells", "QP", "bpp", "|MV|px", "intra%"]
+                                    {
+                                        ui.label(egui::RichText::new(head).small().strong());
+                                    }
+                                    ui.end_row();
+                                    for row in table {
+                                        ui.label(row.class.label());
+                                        ui.monospace(format!("{}", row.cells));
+                                        if row.cells > 0 {
+                                            ui.monospace(format!("{:.1}", row.mean_qp));
+                                            ui.monospace(format!("{:.2}", row.mean_bpp));
+                                            ui.monospace(format!("{:.1}", row.mean_mv));
+                                            ui.monospace(format!(
+                                                "{:.0}%",
+                                                row.intra_ratio * 100.0
+                                            ));
+                                        } else {
+                                            for _ in 0..4 {
+                                                ui.monospace("–");
+                                            }
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                            ui.add_space(4.0);
+                            ui.weak("current frame · valid cells only");
+                        }
+                        None => {
+                            ui.label("Motion classes need a previous frame —");
+                            ui.label("step forward once (→) to populate.");
+                        }
+                    }
+                } else {
                     ui.label(if snap.file.is_none() {
                         "No .catb loaded."
                     } else {
                         "No data for this frame."
                     });
-                    return;
-                };
-                match &d.classes {
-                    Some((classes, valid, cols, rows)) => {
-                        let table = class_table(classes, valid, *cols, *rows, &d.bs_g);
-                        egui::Grid::new("bs_corr_class_grid")
-                            .striped(true)
-                            .spacing(egui::vec2(10.0, 4.0))
+                }
+
+                // -- Opportunity Top-N (M3, 02 §2-4 / UX §6): z descending,
+                // [Jump] pans the Viewer canvas to the cell (V22).
+                ui.add_space(8.0);
+                ui.separator();
+                ui.heading("Opportunity Top-N");
+                match topn {
+                    Some((g, rows)) if !rows.is_empty() => {
+                        let mut jump: Option<(u32, u32)> = None;
+                        egui::ScrollArea::vertical()
+                            .id_salt("bs_opp_topn")
+                            .max_height(260.0)
                             .show(ui, |ui| {
-                                for head in ["class", "cells", "QP", "bpp", "|MV|px", "intra%"] {
-                                    ui.label(egui::RichText::new(head).small().strong());
-                                }
-                                ui.end_row();
-                                for row in table {
-                                    ui.label(row.class.label());
-                                    ui.monospace(format!("{}", row.cells));
-                                    if row.cells > 0 {
-                                        ui.monospace(format!("{:.1}", row.mean_qp));
-                                        ui.monospace(format!("{:.2}", row.mean_bpp));
-                                        ui.monospace(format!("{:.1}", row.mean_mv));
-                                        ui.monospace(format!("{:.0}%", row.intra_ratio * 100.0));
-                                    } else {
-                                        for _ in 0..4 {
-                                            ui.monospace("–");
+                                egui::Grid::new("bs_opp_topn_grid")
+                                    .striped(true)
+                                    .spacing(egui::vec2(8.0, 2.0))
+                                    .show(ui, |ui| {
+                                        for head in ["#", "cell (px)", "z", ""] {
+                                            ui.label(
+                                                egui::RichText::new(head).small().strong(),
+                                            );
                                         }
-                                    }
-                                    ui.end_row();
-                                }
+                                        ui.end_row();
+                                        for (k, (c, r, z)) in rows.iter().enumerate() {
+                                            ui.monospace(format!("{}", k + 1));
+                                            ui.monospace(format!("({}, {})", c * g, r * g));
+                                            ui.monospace(format!("{z:+.2}"));
+                                            if ui
+                                                .small_button("Jump")
+                                                .on_hover_text(
+                                                    "Viewer tab · pan to cell · Sel highlight",
+                                                )
+                                                .clicked()
+                                            {
+                                                jump = Some((*c, *r));
+                                            }
+                                            ui.end_row();
+                                        }
+                                    });
                             });
-                        ui.add_space(4.0);
-                        ui.weak("current frame · valid cells only");
+                        ui.weak("current frame · z = z(Y) − z(X), positive = bits above what X explains");
+                        if let Some((c, r)) = jump {
+                            self.tab = BsTab::Viewer;
+                            self.view.sel = true; // V22: highlight must be visible
+                            self.opp_focus = Some((c, r, g));
+                            let gf = g as f32;
+                            self.pending_center = Some(egui::pos2(
+                                c as f32 * gf + gf * 0.5,
+                                r as f32 * gf + gf * 0.5,
+                            ));
+                        }
                     }
-                    None => {
-                        ui.label("Motion classes need a previous frame —");
-                        ui.label("step forward once (→) to populate.");
+                    _ => {
+                        ui.weak(
+                            "Needs current-frame aligned data — Opportunity ranks the \
+                             current frame's z(Y)−z(X) mismatch.",
+                        );
                     }
                 }
             });
@@ -2092,6 +2437,10 @@ impl BitstreamWindow {
             // derivation (borrowed, not rebuilt — the scan can hold millions
             // of samples).
             let mut frame_pts: Vec<[f64; 2]> = Vec::new();
+            // Parallel G-cell coordinates for the M3 scatter↔canvas link
+            // (current-frame mode only — scan samples have no cell identity
+            // across frames worth linking).
+            let mut frame_cells: Vec<(u32, u32)> = Vec::new();
             let mut note: Option<String> = None;
             if self.corr_range_mode {
                 match snap.corr_scan.as_ref() {
@@ -2120,6 +2469,10 @@ impl BitstreamWindow {
                             for i in 0..p.valid.len() {
                                 if p.valid[i] {
                                     frame_pts.push([p.a[i] as f64, p.b[i] as f64]);
+                                    frame_cells.push((
+                                        i as u32 % p.cols,
+                                        i as u32 / p.cols,
+                                    ));
                                 }
                             }
                         }
@@ -2152,7 +2505,26 @@ impl BitstreamWindow {
             if let Some(note) = &note {
                 ui.weak(note);
             }
-            Plot::new("bs_corr_scatter")
+
+            // M3 reverse link: the Viewer-selected opportunity cell shows as
+            // an emphasized scatter point (current-frame mode, matching G).
+            let sel_pt: Option<[f64; 2]> = (|| {
+                if self.corr_range_mode {
+                    return None;
+                }
+                let (c, r, g) = self.opp_focus?;
+                if g != self.corr_g {
+                    return None;
+                }
+                let p = self.corr_derived.as_ref()?.pair.as_ref()?;
+                if c >= p.cols || r >= p.rows {
+                    return None;
+                }
+                let i = (r as usize) * (p.cols as usize) + c as usize;
+                p.valid[i].then(|| [p.a[i] as f64, p.b[i] as f64])
+            })();
+
+            let plot_resp = Plot::new("bs_corr_scatter")
                 .x_axis_label(self.corr_x.label())
                 .y_axis_label(self.corr_y.label())
                 .allow_drag(true)
@@ -2164,8 +2536,119 @@ impl BitstreamWindow {
                             .radius(1.6)
                             .color(egui::Color32::from_rgb(120, 190, 255)),
                     );
+                    if let Some(pt) = sel_pt {
+                        plot_ui.points(
+                            Points::new(PlotPoints::new(vec![pt]))
+                                .radius(5.0)
+                                .color(egui::Color32::from_rgb(255, 220, 40)),
+                        );
+                    }
+                    (plot_ui.pointer_coordinate(), plot_ui.plot_bounds())
                 });
+
+            // M3 forward link: hovering near a scatter point marks its G
+            // cell on the Viewer canvas (kept until replaced, §6) and shows
+            // a coordinate tooltip.
+            if !self.corr_range_mode && !frame_pts.is_empty() {
+                let (pointer, bounds) = plot_resp.inner;
+                if let Some(ptr) = pointer {
+                    let bw = bounds.width().max(f64::EPSILON);
+                    let bh = bounds.height().max(f64::EPSILON);
+                    let mut best: Option<(usize, f64)> = None;
+                    for (i, q) in frame_pts.iter().enumerate() {
+                        let dx = (q[0] - ptr.x) / bw;
+                        let dy = (q[1] - ptr.y) / bh;
+                        let dd = dx * dx + dy * dy;
+                        if best.map(|(_, bd)| dd < bd).unwrap_or(true) {
+                            best = Some((i, dd));
+                        }
+                    }
+                    if let Some((i, dd)) = best {
+                        if dd.sqrt() < 0.02 {
+                            let (c, r) = frame_cells[i];
+                            self.corr_hover_cell = Some((c, r, self.corr_g));
+                            let g = self.corr_g;
+                            plot_resp.response.on_hover_text(format!(
+                                "cell ({}, {}) px · {} {:.3} · {} {:.3}",
+                                c * g,
+                                r * g,
+                                self.corr_x.label(),
+                                frame_pts[i][0],
+                                self.corr_y.label(),
+                                frame_pts[i][1],
+                            ));
+                        }
+                    }
+                }
+            }
         });
+    }
+
+    /// M3 (02 §2-5): per-frame r timeline under the Correlation tab — the
+    /// scanned range's r per frame, the current-frame marker, and scene
+    /// change markers (existing detection results only, never recomputed
+    /// here). Click = seek via the root (filmstrip seek path).
+    fn ui_corr_timeline(&mut self, ctx: &egui::Context, snap: &Snapshot) {
+        egui::TopBottomPanel::bottom("bs_corr_timeline")
+            .exact_height(130.0)
+            .show(ctx, |ui| {
+                use egui_plot::{Line, LineStyle, Plot, PlotPoints, VLine};
+
+                let scan = snap
+                    .corr_scan
+                    .as_ref()
+                    .filter(|s| !self.corr_scan_stale(s));
+                let Some(scan) = scan else {
+                    ui.weak("Per-frame r timeline — run a range Scan to populate.");
+                    return;
+                };
+                let pts: Vec<[f64; 2]> = scan
+                    .per_frame
+                    .iter()
+                    .filter_map(|s| s.r.map(|r| [s.frame as f64, r]))
+                    .collect();
+                if pts.is_empty() {
+                    ui.weak("No per-frame r in the scan (each frame needs ≥ 2 valid cells).");
+                    return;
+                }
+                let total = snap.viewer_total;
+                let resp = Plot::new("bs_corr_timeline_plot")
+                    .x_axis_label("frame")
+                    .y_axis_label("r")
+                    .include_y(-1.0)
+                    .include_y(1.0)
+                    .allow_drag(false)
+                    .allow_zoom(false)
+                    .allow_scroll(false)
+                    .show(ui, |plot_ui| {
+                        plot_ui.line(
+                            Line::new(PlotPoints::new(pts))
+                                .color(egui::Color32::from_rgb(120, 190, 255))
+                                .name("r"),
+                        );
+                        // Current frame (white), scene changes (grey dashed).
+                        plot_ui.vline(
+                            VLine::new(snap.viewer_frame as f64)
+                                .color(egui::Color32::WHITE)
+                                .width(1.0),
+                        );
+                        for &sc in &snap.scene_changes {
+                            plot_ui.vline(
+                                VLine::new(sc as f64)
+                                    .color(egui::Color32::from_rgb(150, 150, 150))
+                                    .style(LineStyle::Dashed { length: 6.0 }),
+                            );
+                        }
+                        plot_ui.pointer_coordinate()
+                    });
+                if resp.response.clicked() && total > 0 {
+                    if let Some(p) = resp.inner {
+                        let idx = p.x.round().clamp(0.0, (total - 1) as f64) as usize;
+                        self.shared.lock().seek_request = Some(idx);
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    }
+                }
+            });
     }
 
     /// Write the CSV dump for the current mode. Returns a status line.
@@ -2387,6 +2870,61 @@ fn draw_legend(
     }
 }
 
+/// Bottom-left legend for the Opportunity fill (M3): diverging gradient bar
+/// on the symmetric scale −max|z| .. +max|z|.
+fn draw_opportunity_legend(
+    painter: &egui::Painter,
+    canvas_rect: egui::Rect,
+    name: &str,
+    zmax: f32,
+) {
+    let pad = 8.0;
+    let font = egui::FontId::monospace(11.0);
+    let text_color = egui::Color32::from_rgb(235, 235, 235);
+    let bg = egui::Color32::from_black_alpha(170);
+    let bar_w = 90.0_f32;
+    let name_w = 8.0 * name.chars().count() as f32;
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(canvas_rect.min.x + pad, canvas_rect.max.y - pad - 22.0),
+        egui::vec2(bar_w + name_w + 110.0, 22.0),
+    );
+    painter.rect_filled(rect, 3.0, bg);
+    painter.text(
+        egui::pos2(rect.min.x + 4.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        name,
+        font.clone(),
+        text_color,
+    );
+    let bar = egui::Rect::from_min_size(
+        egui::pos2(rect.min.x + name_w + 48.0, rect.min.y + 6.0),
+        egui::vec2(bar_w, 10.0),
+    );
+    let steps = 24;
+    for s in 0..steps {
+        let t = s as f32 / (steps - 1) as f32;
+        let seg = egui::Rect::from_min_size(
+            egui::pos2(bar.min.x + t * (bar_w - bar_w / steps as f32), bar.min.y),
+            egui::vec2(bar_w / steps as f32 + 1.0, bar.height()),
+        );
+        painter.rect_filled(seg, 0.0, diverging_colormap(t as f64));
+    }
+    painter.text(
+        egui::pos2(bar.min.x - 3.0, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        format!("{:+.2}", -zmax),
+        font.clone(),
+        text_color,
+    );
+    painter.text(
+        egui::pos2(bar.max.x + 3.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        format!("{:+.2}", zmax),
+        font,
+        text_color,
+    );
+}
+
 /// Value loupe (§5, M key): magnified grid of the L1 8-px cells around the
 /// cursor with numeric values — the only way to read cell values at low zoom.
 /// Ported from the sidebar's `draw_value_loupe`.
@@ -2450,9 +2988,15 @@ fn draw_l1_loupe(
                 && (row as u32) < grid.rows;
             if in_range {
                 let i = (row as u32 * grid.cols + col as u32) as usize;
+                // The loupe reads QP when the fill has no L1 value of its
+                // own (None; Opportunity lives on G cells, not L1).
+                let loupe_fill = if matches!(fill, FillMode::None | FillMode::Opportunity) {
+                    FillMode::Qp
+                } else {
+                    fill
+                };
                 let color = fill_color(
-                    // The loupe reads QP when fill is None — always useful.
-                    if fill == FillMode::None { FillMode::Qp } else { fill },
+                    loupe_fill,
                     grid.qp[i],
                     grid.bpp[i],
                     grid.mode[i],
@@ -2463,7 +3007,7 @@ fn draw_l1_loupe(
                 .unwrap_or(empty_fill);
                 painter.rect_filled(cell_rect.shrink(0.5), 0.0, color);
                 let txt = fill_value_text(
-                    if fill == FillMode::None { FillMode::Qp } else { fill },
+                    loupe_fill,
                     grid.qp[i],
                     grid.bpp[i],
                     grid.mode[i],
@@ -2561,6 +3105,11 @@ mod tests {
         assert_eq!(md.fill, FillMode::Mode);
         assert!(md.part && md.grid);
 
+        // M3 §3: Opportunity = {fill=Opportunity, Grid, Sel}.
+        let o = Preset::Opportunity.config();
+        assert_eq!(o.fill, FillMode::Opportunity);
+        assert!(o.grid && o.sel && !o.label && !o.mv && !o.part);
+
         let c = Preset::Clean.config();
         assert_eq!(c.fill, FillMode::None);
         assert!(!c.mv && !c.part && !c.label && !c.grid && !c.sel);
@@ -2602,18 +3151,29 @@ mod tests {
 
     #[test]
     fn fill_mode_label_roundtrip() {
-        for f in [
-            FillMode::None,
-            FillMode::Qp,
-            FillMode::Bpp,
-            FillMode::Mode,
-            FillMode::MvHeat,
-        ] {
+        for f in FILL_MODES {
             assert_eq!(FillMode::from_label(f.label()), f);
         }
-        // Unknown labels (e.g. future "Opportunity" read from an old file)
+        // Unknown labels (future fills read from an old settings.toml)
         // degrade to None rather than failing.
-        assert_eq!(FillMode::from_label("Opportunity"), FillMode::None);
+        assert_eq!(FillMode::from_label("Chroma-heat"), FillMode::None);
+    }
+
+    #[test]
+    fn opportunity_cell_color_diverges_symmetrically() {
+        // Negative → blue-dominant, zero → white, positive → red-dominant;
+        // zmax 0 degenerates to the white midpoint (no division by zero).
+        let neg = opportunity_cell_color(-2.0, 2.0, 1.0);
+        let mid = opportunity_cell_color(0.0, 2.0, 1.0);
+        let pos = opportunity_cell_color(2.0, 2.0, 1.0);
+        assert!(neg.b() > neg.r());
+        assert_eq!((mid.r(), mid.g(), mid.b()), (255, 255, 255));
+        assert!(pos.r() > pos.b());
+        let degen = opportunity_cell_color(1.0, 0.0, 1.0);
+        assert_eq!((degen.r(), degen.g(), degen.b()), (255, 255, 255));
+        // Opacity maps to alpha (fill-only rule, §2).
+        assert_eq!(opportunity_cell_color(1.0, 1.0, 0.0).a(), 0);
+        assert_eq!(opportunity_cell_color(1.0, 1.0, 1.0).a(), 255);
     }
 
     #[test]

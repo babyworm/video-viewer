@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use video_viewer::analysis::bitstream_stats::{rasterize_blocks, BitstreamFile};
 use video_viewer::analysis::correlation::{
     aggregate_bitstream_to_g, align, class_table, classes_at_g, compute_analysis_grids, csv_dump,
-    pearson_r, spearman_rho, x_grid, AlignedPair, XMetric, YMetric, CSV_HEADER,
+    opportunity_grid, pearson_r, spearman_rho, top_n_ranking, x_grid, AlignedPair,
+    CorrScanRequest, CorrScanResult, XMetric, YMetric, CSV_HEADER,
 };
 
 mod common;
@@ -188,6 +189,82 @@ fn test_v19_motion_score_correlates_with_bits() {
         none_row.mean_bpp,
         hot.mean_bpp
     );
+}
+
+// ===========================================================================
+// V21 (M3): opportunity map — Top-N concentrates where bpp exceeds what
+// the analysis complexity explains
+// ===========================================================================
+
+#[test]
+fn test_v21_opportunity_topn_concentrates_on_flat_high_bpp_half() {
+    // z_b − z_a semantics (02 §2-4): positive = bits above what complexity
+    // explains. Fixture built to that definition: the LEFT half is FLAT
+    // (variance ≈ 0) yet expensive (512 bits / 8×8 block = 8 bpp) → the true
+    // preprocessing opportunity; the RIGHT half is noisy with modest bits
+    // (64 → 1 bpp), i.e. the variance explains the spend.
+    let (w, h) = (64u32, 64u32);
+    let rgb = flat_noise_rgb(w, h); // left flat / right noise
+    let catb = write_temp(&flat_noise_catb(w, h, 512, 64)); // left HIGH bits
+    let file = BitstreamFile::open(catb.path()).expect("open catb");
+    let pair = pipeline_pair(&rgb, None, w, h, &file, XMetric::Variance, YMetric::Bpp, 8);
+    assert_eq!((pair.cols, pair.rows), (8, 8));
+
+    let opp = opportunity_grid(&pair);
+    let half = pair.cols as usize / 2;
+
+    // Top-20 must land entirely in the flat + high-bpp left half, positive z.
+    let top = top_n_ranking(&opp, 20);
+    assert_eq!(top.len(), 20);
+    for (i, z) in &top {
+        let col = i % pair.cols as usize;
+        assert!(
+            col < half,
+            "V21: top-N cell {i} (col {col}) must lie in the flat+high-bpp half"
+        );
+        assert!(*z > 0.0, "top-N z must be positive, got {z}");
+    }
+    // The noise-explained half sits at negative z (bits fully accounted for).
+    for r in 0..pair.rows as usize {
+        for c in half..pair.cols as usize {
+            let i = r * pair.cols as usize + c;
+            if let Some(z) = opp[i] {
+                assert!(z < 0.0, "noise-explained cell ({c},{r}) must be negative: {z}");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_m3_per_frame_r_sequence_through_scan_result() {
+    // Two frames with opposite injected correlations → the accumulated
+    // per-frame (frame, r, ρ, N) sequence must carry both signs.
+    let (w, h) = (64u32, 64u32);
+    let rgb = flat_noise_rgb(w, h);
+    let pos = BitstreamFile::open(write_temp(&flat_noise_catb(w, h, 16, 512)).path())
+        .expect("pos catb");
+    let neg = BitstreamFile::open(write_temp(&flat_noise_catb(w, h, 512, 16)).path())
+        .expect("neg catb");
+    let p0 = pipeline_pair(&rgb, None, w, h, &pos, XMetric::Variance, YMetric::Bpp, 16);
+    let p1 = pipeline_pair(&rgb, None, w, h, &neg, XMetric::Variance, YMetric::Bpp, 16);
+    let scan = CorrScanResult::new(
+        CorrScanRequest {
+            start: 0,
+            end: 1,
+            g: 16,
+            x: XMetric::Variance,
+            y: YMetric::Bpp,
+        },
+        vec![(0, p0), (1, p1)],
+        None,
+    );
+    assert_eq!(scan.per_frame.len(), 2);
+    assert_eq!(scan.per_frame[0].frame, 0);
+    assert_eq!(scan.per_frame[1].frame, 1);
+    assert!(scan.per_frame[0].r.expect("r0") > 0.8);
+    assert!(scan.per_frame[1].r.expect("r1") < -0.8);
+    assert_eq!(scan.per_frame[0].n, 16);
+    assert_eq!(scan.per_frame[1].n, 16);
 }
 
 // ===========================================================================

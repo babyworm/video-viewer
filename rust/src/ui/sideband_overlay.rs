@@ -144,8 +144,10 @@ fn get_ctu_color(ctu: &SidebandCtu, mode: SidebandOverlayMode) -> (f64, Color32)
     }
 }
 
-/// Blue -> White -> Red diverging colormap
-fn diverging_colormap(t: f64) -> Color32 {
+/// Blue -> White -> Red diverging colormap. Public: the Bitstream window's
+/// Opportunity fill (M3) reuses the exact same ramp so every diverging map
+/// in the app reads identically.
+pub fn diverging_colormap(t: f64) -> Color32 {
     let t = t as f32;
     if t < 0.5 {
         // Blue to White (t: 0.0 -> 0.5)
