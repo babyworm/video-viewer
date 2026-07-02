@@ -66,10 +66,22 @@ pub enum YMetric {
     Bpp,
     MvMag,
     IntraRatio,
+    /// M-B: TX `coeff_abs_sum` energy per covered pixel. Blocks without TX
+    /// rows contribute **0, not "missing"** — zero residual energy is the
+    /// true coded value for skip/uncoded blocks; masking them out would
+    /// bias the correlation toward residual-carrying blocks (rationale in
+    /// [`crate::analysis::bitstream_stats::BlockTxAgg`]).
+    CoeffEnergy,
 }
 
 impl YMetric {
-    pub const ALL: [YMetric; 4] = [YMetric::Qp, YMetric::Bpp, YMetric::MvMag, YMetric::IntraRatio];
+    pub const ALL: [YMetric; 5] = [
+        YMetric::Qp,
+        YMetric::Bpp,
+        YMetric::MvMag,
+        YMetric::IntraRatio,
+        YMetric::CoeffEnergy,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -77,6 +89,7 @@ impl YMetric {
             YMetric::Bpp => "bpp",
             YMetric::MvMag => "|MV|",
             YMetric::IntraRatio => "intra %",
+            YMetric::CoeffEnergy => "coeff energy",
         }
     }
 }
@@ -85,9 +98,10 @@ impl YMetric {
 /// no skip-rate / intra-direction axis yet, so the two presets that need
 /// them (`motion_class↔skip률`, `orientation↔intra 방향`) are approximated
 /// with the closest available Y metric and revisited in M3/M4.
-pub const PRESET_PAIRS: [(&str, XMetric, YMetric); 5] = [
+pub const PRESET_PAIRS: [(&str, XMetric, YMetric); 6] = [
     ("variance ↔ bits", XMetric::Variance, YMetric::Bpp),
     ("variance ↔ QP", XMetric::Variance, YMetric::Qp),
+    ("variance ↔ coeff energy", XMetric::Variance, YMetric::CoeffEnergy),
     ("motion ↔ |MV|", XMetric::MotionScore, YMetric::MvMag),
     ("motion ↔ bits", XMetric::MotionScore, YMetric::Bpp),
     ("orientation ↔ intra %", XMetric::Orientation, YMetric::IntraRatio),
@@ -123,6 +137,9 @@ pub struct BitstreamG {
     pub mv_mag: Vec<f32>,
     /// Covered-area fraction classified Intra ∈ [0, 1].
     pub intra_ratio: Vec<f32>,
+    /// TX coefficient energy per covered pixel (M-B; sum → renormalize,
+    /// same rule as `bpp`).
+    pub coeff_energy: Vec<f32>,
     /// False when partially covered (coverage < 1) or a partial edge cell.
     pub valid: Vec<bool>,
 }
@@ -424,6 +441,7 @@ pub fn aggregate_bitstream_to_g(l1: &BitstreamGrid, width: u32, height: u32, g: 
     let mut acc_bits = vec![0.0_f64; n]; // bpp·area = bits
     let mut acc_mv = vec![0.0_f64; n];
     let mut acc_intra = vec![0.0_f64; n];
+    let mut acc_coeff = vec![0.0_f64; n]; // energy·area (sum → renormalize)
     let cell = l1.cell.max(1);
     let cell_area = (cell as f64) * (cell as f64);
     accumulate_overlaps(cell, l1.cols, l1.rows, width, height, g, |gi, src, area| {
@@ -447,6 +465,7 @@ pub fn aggregate_bitstream_to_g(l1: &BitstreamGrid, width: u32, height: u32, g: 
         acc_qp[gi] += l1.qp[src] as f64 * covered;
         acc_bits[gi] += l1.bpp[src] as f64 * covered;
         acc_mv[gi] += l1.mv_mag[src] as f64 * covered;
+        acc_coeff[gi] += l1.coeff_energy[src] as f64 * covered;
         if l1.mode[src] == ModeClass::Intra {
             acc_intra[gi] += covered;
         }
@@ -456,6 +475,7 @@ pub fn aggregate_bitstream_to_g(l1: &BitstreamGrid, width: u32, height: u32, g: 
     let mut bpp = vec![0.0_f32; n];
     let mut mv = vec![0.0_f32; n];
     let mut intra = vec![0.0_f32; n];
+    let mut coeff = vec![0.0_f32; n];
     let mut valid = vec![false; n];
     let full = (g as f64) * (g as f64);
     for gr in 0..grows {
@@ -467,6 +487,7 @@ pub fn aggregate_bitstream_to_g(l1: &BitstreamGrid, width: u32, height: u32, g: 
                 bpp[i] = (acc_bits[i] / a) as f32;
                 mv[i] = (acc_mv[i] / a) as f32;
                 intra[i] = (acc_intra[i] / a) as f32;
+                coeff[i] = (acc_coeff[i] / a) as f32;
                 // Fully covered (coverage == 1 everywhere) ⇔ covered px == g².
                 valid[i] = cell_fully_inside(gc, gr, g, width, height) && a >= full * 0.999;
             }
@@ -480,6 +501,7 @@ pub fn aggregate_bitstream_to_g(l1: &BitstreamGrid, width: u32, height: u32, g: 
         bpp,
         mv_mag: mv,
         intra_ratio: intra,
+        coeff_energy: coeff,
         valid,
     }
 }
@@ -500,6 +522,7 @@ pub fn align(x: &GGrid, y: &BitstreamG, y_metric: YMetric) -> AlignedPair {
         YMetric::Bpp => &y.bpp,
         YMetric::MvMag => &y.mv_mag,
         YMetric::IntraRatio => &y.intra_ratio,
+        YMetric::CoeffEnergy => &y.coeff_energy,
     };
     for r in 0..rows as usize {
         for c in 0..cols as usize {
@@ -1287,6 +1310,70 @@ mod tests {
     }
 
     #[test]
+    fn coeff_energy_aggregates_like_bpp() {
+        use crate::analysis::bitstream_stats::{rasterize_blocks_tx, BlockTxAgg};
+        use crate::core::catb::BsBlock;
+        let block = |x: u32| BsBlock {
+            x,
+            y: 0,
+            w: 8,
+            h: 8,
+            ctu_address: 0,
+            qp: 30,
+            partition: String::new(),
+            prediction_mode: "Intra".into(),
+            bits: 64,
+            bit_offset: 0,
+            exactness_flags: 0,
+            syntax_off: 0,
+            syntax_n: 0,
+            cabac_off: 0,
+            cabac_n: 0,
+            tx_off: 0,
+            tx_n: 0,
+            ref_off: 0,
+            ref_n: 0,
+            mv_flags: 0,
+            mvp: None,
+            mvd: None,
+            mv: None,
+            reference: None,
+            reference_list: None,
+            reference_label: None,
+            reference_list_index: None,
+            reference_poc: None,
+            reference_frame: None,
+            reference_long_term: None,
+        };
+        // 16×8 frame, two 8×8 blocks: abs_sum 256 and 0 (skip block → true
+        // zero, still covered). G=8: energies 4.0 / 0.0; align on
+        // CoeffEnergy exposes them as the Y values.
+        let blocks = vec![block(0), block(8)];
+        let tx = vec![
+            BlockTxAgg { abs_sum: 256.0, nonzero: 4.0 },
+            BlockTxAgg::default(),
+        ];
+        let l1 = rasterize_blocks_tx(&blocks, Some(&tx), 16, 8, 8);
+        let bg = aggregate_bitstream_to_g(&l1, 16, 8, 8);
+        assert!((bg.coeff_energy[0] - 4.0).abs() < 1e-4);
+        assert_eq!(bg.coeff_energy[1], 0.0);
+        assert!(bg.valid[0] && bg.valid[1], "zero-energy cell stays valid");
+        let x = GGrid {
+            g: 8,
+            cols: 2,
+            rows: 1,
+            values: vec![1.0, 2.0],
+            valid: vec![true, true],
+        };
+        let p = align(&x, &bg, YMetric::CoeffEnergy);
+        assert_eq!(p.b, vec![4.0, 0.0]);
+        // The variance↔coeff-energy preset pair exists (M-B).
+        assert!(PRESET_PAIRS
+            .iter()
+            .any(|(_, x, y)| *x == XMetric::Variance && *y == YMetric::CoeffEnergy));
+    }
+
+    #[test]
     fn align_intersects_and_combines_masks() {
         let x = GGrid {
             g: 16,
@@ -1303,6 +1390,7 @@ mod tests {
             bpp: vec![0.5, 0.6, 0.7],
             mv_mag: vec![0.0; 3],
             intra_ratio: vec![0.0; 3],
+            coeff_energy: vec![9.0, 8.0, 7.0],
             valid: vec![true, true, true],
         };
         let p = align(&x, &y, YMetric::Qp);
@@ -1360,6 +1448,7 @@ mod tests {
             bpp: vec![0.5, 2.0],
             mv_mag: vec![0.0, 12.0],
             intra_ratio: vec![1.0, 0.0],
+            coeff_energy: vec![0.0, 0.0],
             valid: vec![true, true],
         };
         let t = class_table(&classes, &[true, true], 2, 1, &bs);

@@ -3,9 +3,11 @@
 //! rasterization via the public API, and filmstrip classification.
 
 use video_viewer::analysis::bitstream_stats::{
-    hit_test_min_area, lod_cell_size, rasterize_blocks, use_lod, viewer_to_catb_display,
+    aggregate_cabac_rows, aggregate_syntax_rows, hit_test_min_area, lod_cell_size,
+    rasterize_blocks, rasterize_blocks_tx, use_lod, viewer_to_catb_display, BlockTxAgg,
     FrameTypeClass, ModeClass,
 };
+use video_viewer::core::catb::CabacRow;
 use video_viewer::ui::bitstream_overlay::MvSource;
 use video_viewer::ui::bitstream_window::{
     filmstrip_color, matching_preset, next_preset, FillMode, Preset, ViewConfig, PRESETS,
@@ -71,6 +73,7 @@ fn test_settings_view_config_conversion() {
         fill: "bpp".to_string(),
         layer_mv: false,
         layer_part: false,
+        layer_tu: false,
         layer_intra: false,
         layer_label: false,
         layer_grid: true,
@@ -108,8 +111,26 @@ inspector_collapsed = false
     );
     let s: Settings = toml::from_str(&toml_str).expect("0.12 settings must parse");
     assert!(!s.bitstream.layer_intra);
+    // M-B: pre-0.18 files have no layer_tu either — serde default off.
+    assert!(!s.bitstream.layer_tu);
     assert_eq!(s.bitstream.mv_source, "MV");
     assert_eq!(MvSource::from_label(&s.bitstream.mv_source), MvSource::Mv);
+}
+
+#[test]
+fn test_settings_tu_layer_and_new_fills_roundtrip() {
+    // M-B: layer_tu + the CoeffEnergy / NonzeroCoeffs fill labels survive
+    // a settings round-trip.
+    let mut s = Settings::default();
+    s.bitstream.fill = "CoeffEnergy".to_string();
+    s.bitstream.layer_tu = true;
+    let toml_str = toml::to_string_pretty(&s).unwrap();
+    let back: Settings = toml::from_str(&toml_str).unwrap();
+    assert_eq!(back.bitstream, s.bitstream);
+    let cfg = ViewConfig::from_settings(&back.bitstream);
+    assert_eq!(cfg.fill, FillMode::CoeffEnergy);
+    assert!(cfg.tu);
+    assert_eq!(FillMode::from_label("NonzeroCoeffs"), FillMode::NonzeroCoeffs);
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +260,81 @@ fn test_rasterize_bpp_and_partial_coverage() {
     assert_eq!(g.coverage[3], 0.0); // bottom-right untouched
     assert_eq!(g.mode[0], ModeClass::Inter);
     assert_eq!(g.mode[2], ModeClass::Intra);
+}
+
+#[test]
+fn test_rasterize_coeff_energy_area_weighted() {
+    // M-B: two 8×8 blocks in a 16×8 frame; TX aggregate abs_sum 128 / 0,
+    // nonzero 16 / 0 → per-px energy 2.0 / 0.0, nz density 0.25 / 0.0.
+    let blocks = vec![
+        make_block(0, 0, 8, 8, 30, 64, "Intra"),
+        make_block(8, 0, 8, 8, 30, 64, "Inter"),
+    ];
+    let tx = vec![
+        BlockTxAgg { abs_sum: 128.0, nonzero: 16.0 },
+        BlockTxAgg::default(), // no TX rows → true zero, not missing
+    ];
+    let g = rasterize_blocks_tx(&blocks, Some(&tx), 16, 8, 8);
+    assert!((g.coeff_energy[0] - 2.0).abs() < 1e-5);
+    assert!((g.nz_density[0] - 0.25).abs() < 1e-5);
+    assert_eq!(g.coeff_energy[1], 0.0);
+    assert_eq!(g.nz_density[1], 0.0);
+    // Both cells fully covered — the zero-energy block is data, not a hole.
+    assert!((g.coverage[1] - 1.0).abs() < 1e-5);
+    // 16px cell over both blocks: energy = 128 / 128 px = 1.0 (renormalized).
+    let g16 = rasterize_blocks_tx(&blocks, Some(&tx), 16, 8, 16);
+    assert!((g16.coeff_energy[0] - 1.0).abs() < 1e-4);
+    // No aggregate supplied → all-zero fields, same shape.
+    let none = rasterize_blocks(&blocks, 16, 8, 8);
+    assert!(none.coeff_energy.iter().all(|&v| v == 0.0));
+    assert!(none.nz_density.iter().all(|&v| v == 0.0));
+}
+
+// ---------------------------------------------------------------------------
+// M-B Stats tab aggregation (pure)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_stats_syntax_aggregation_sorted_by_bits() {
+    let rows = [
+        ("split_cu_flag", 1),
+        ("coeff_abs_level", 40),
+        ("split_cu_flag", 2),
+        ("(slice) slice_type", 3),
+        ("coeff_abs_level", 10),
+    ];
+    let agg = aggregate_syntax_rows(rows.iter().map(|(n, b)| (*n, *b)));
+    assert_eq!(agg.len(), 3);
+    assert_eq!((agg[0].name.as_str(), agg[0].count, agg[0].bits), ("coeff_abs_level", 2, 50));
+    assert_eq!((agg[1].name.as_str(), agg[1].count, agg[1].bits), ("(slice) slice_type", 1, 3));
+    assert_eq!((agg[2].name.as_str(), agg[2].count, agg[2].bits), ("split_cu_flag", 2, 3));
+    assert!(aggregate_syntax_rows(std::iter::empty()).is_empty());
+}
+
+#[test]
+fn test_stats_cabac_aggregation() {
+    let row = |name: &str, ctx: i32, bits: i64| CabacRow {
+        name: name.to_string(),
+        ctx,
+        bin: 1,
+        bit_offset: 0,
+        bits,
+    };
+    let rows = vec![
+        row("sig_coeff_flag", 10, 1),
+        row("sig_coeff_flag", 11, 0),
+        row("sig_coeff_flag", 10, 2),
+        row("split_cu_flag", 2, 1),
+    ];
+    let agg = aggregate_cabac_rows(&rows);
+    assert_eq!(agg.len(), 2);
+    // Sorted by bin count desc.
+    assert_eq!(agg[0].name, "sig_coeff_flag");
+    assert_eq!(agg[0].bins, 3);
+    assert_eq!(agg[0].ctx_count, 2, "two distinct contexts");
+    assert!((agg[0].bits_per_bin() - 1.0).abs() < 1e-9);
+    assert_eq!(agg[1].bins, 1);
+    assert!(aggregate_cabac_rows(&[]).is_empty());
 }
 
 #[test]

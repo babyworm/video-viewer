@@ -19,8 +19,9 @@ use parking_lot::Mutex;
 
 use crate::analysis::bitstream_panel::format_bits;
 use crate::analysis::bitstream_stats::{
-    build_filmstrip_refs, hit_test_min_area, lod_cell_size, rasterize_blocks, ref_count_tier,
-    use_lod, viewer_to_catb_display, BitstreamFile, BitstreamGrid, FilmstripRefs, FrameTypeClass,
+    aggregate_block_tx, build_filmstrip_refs, compute_frame_stats, hit_test_min_area,
+    lod_cell_size, rasterize_blocks_tx, ref_count_tier, use_lod, viewer_to_catb_display,
+    BitstreamFile, BitstreamGrid, BlockTxAgg, FilmstripRefs, FrameStatsData, FrameTypeClass,
     IntraDir, ModeClass,
 };
 use crate::analysis::correlation::{
@@ -29,11 +30,11 @@ use crate::analysis::correlation::{
     CorrScanRequest, CorrScanResult, XMetric, YMetric, G_SIZES, PRESET_PAIRS,
 };
 use crate::analysis::motion::MotionClass;
-use crate::core::catb::{BsBlock, BsRef};
+use crate::core::catb::{BsBlock, BsRef, TxRow};
 use crate::core::dropped::{classify_dropped_file, DroppedKind};
 use crate::ui::bitstream_overlay::{
-    build_intra, build_refs, draw_intra_layer, draw_mv_layer, draw_part_layer, LayerGeom,
-    MvSource, MV_SOURCES,
+    build_intra, build_refs, build_tx, draw_intra_layer, draw_mv_layer, draw_part_layer,
+    draw_tu_layer, LayerGeom, MvSource, MV_SOURCES,
 };
 use crate::ui::settings::BitstreamViewSettings;
 use crate::ui::sideband_overlay::diverging_colormap;
@@ -52,16 +53,23 @@ pub enum FillMode {
     Mode,
     MvHeat,
     Opportunity,
+    /// M-B: TX coeff_abs_sum energy per pixel (frame-max normalized,
+    /// orange→red ramp).
+    CoeffEnergy,
+    /// M-B: nonzero-coefficient density per pixel.
+    NonzeroCoeffs,
 }
 
-/// All fill modes in §8 shortcut order (keys 1–6).
-pub const FILL_MODES: [FillMode; 6] = [
+/// All fill modes in §8 shortcut order (keys 1–8).
+pub const FILL_MODES: [FillMode; 8] = [
     FillMode::None,
     FillMode::Qp,
     FillMode::Bpp,
     FillMode::Mode,
     FillMode::MvHeat,
     FillMode::Opportunity,
+    FillMode::CoeffEnergy,
+    FillMode::NonzeroCoeffs,
 ];
 
 impl FillMode {
@@ -73,6 +81,8 @@ impl FillMode {
             FillMode::Mode => "Mode",
             FillMode::MvHeat => "MV-heat",
             FillMode::Opportunity => "Opportunity",
+            FillMode::CoeffEnergy => "CoeffEnergy",
+            FillMode::NonzeroCoeffs => "NonzeroCoeffs",
         }
     }
 
@@ -83,6 +93,8 @@ impl FillMode {
             "Mode" => FillMode::Mode,
             "MV-heat" => FillMode::MvHeat,
             "Opportunity" => FillMode::Opportunity,
+            "CoeffEnergy" => FillMode::CoeffEnergy,
+            "NonzeroCoeffs" => FillMode::NonzeroCoeffs,
             _ => FillMode::None,
         }
     }
@@ -96,6 +108,9 @@ pub struct ViewConfig {
     pub mv: bool,
     /// Partition outlines (M4): CU on every block + per-PU boundaries.
     pub part: bool,
+    /// TU outlines (M-B): yellow, depth-shaded; cbf=0 dashed;
+    /// transform_skip shaded.
+    pub tu: bool,
     /// Intra direction lines + P/DC badges (M4).
     pub intra: bool,
     /// Per-block value text, rendered at zoom ≥ 2x only.
@@ -120,6 +135,7 @@ impl ViewConfig {
             fill: FillMode::from_label(&s.fill),
             mv: s.layer_mv,
             part: s.layer_part,
+            tu: s.layer_tu,
             intra: s.layer_intra,
             label: s.layer_label,
             grid: s.layer_grid,
@@ -138,6 +154,7 @@ impl ViewConfig {
             fill: self.fill.label().to_string(),
             layer_mv: self.mv,
             layer_part: self.part,
+            layer_tu: self.tu,
             layer_intra: self.intra,
             layer_label: self.label,
             layer_grid: self.grid,
@@ -189,6 +206,7 @@ impl Preset {
             fill: FillMode::None,
             mv: false,
             part: false,
+            tu: false,
             intra: false,
             label: false,
             grid: false,
@@ -244,6 +262,7 @@ pub fn matching_preset(cfg: &ViewConfig) -> Option<Preset> {
         c.fill == cfg.fill
             && c.mv == cfg.mv
             && c.part == cfg.part
+            && c.tu == cfg.tu
             && c.intra == cfg.intra
             && c.label == cfg.label
             && c.grid == cfg.grid
@@ -323,6 +342,67 @@ pub struct FrameFillStats {
     /// Max L1-norm |MV| in **pixels** (quarter-pel / 4) — the one unit every
     /// consumer shares (L1 grid, LOD grid, labels, loupe, legend).
     pub mv_max: f32,
+    /// Max TX coeff_abs_sum energy per pixel (M-B CoeffEnergy fill).
+    pub coeff_max: f32,
+    /// Max nonzero-coefficient density per pixel (M-B NonzeroCoeffs fill).
+    pub nz_max: f32,
+}
+
+/// One fill-value sample: everything a fill mode can colour/label, whether
+/// it came from an L0 block or an L1/LOD grid cell (M-B: the growing
+/// per-sample tuple outgrew positional parameters).
+#[derive(Debug, Clone, Copy)]
+pub struct FillSample {
+    pub qp: f32,
+    pub bpp: f32,
+    pub mode: ModeClass,
+    /// |MV| in pixels.
+    pub mv: f32,
+    /// TX coeff_abs_sum energy per pixel.
+    pub coeff: f32,
+    /// Nonzero-coefficient density per pixel.
+    pub nz: f32,
+}
+
+impl Default for FillSample {
+    fn default() -> Self {
+        Self {
+            qp: 0.0,
+            bpp: 0.0,
+            mode: ModeClass::Unknown,
+            mv: 0.0,
+            coeff: 0.0,
+            nz: 0.0,
+        }
+    }
+}
+
+impl FillSample {
+    /// Sample of one L0 block (+ its optional TX aggregate).
+    pub fn from_block(b: &BsBlock, tx: Option<&BlockTxAgg>) -> Self {
+        let area = (b.w as f64 * b.h as f64).max(1.0);
+        let agg = tx.copied().unwrap_or_default();
+        Self {
+            qp: b.qp as f32,
+            bpp: (b.bits.max(0) as f64 / area) as f32,
+            mode: ModeClass::from_label(&b.prediction_mode),
+            mv: block_mv_px(b),
+            coeff: (agg.abs_sum.max(0.0) / area) as f32,
+            nz: (agg.nonzero.max(0.0) / area) as f32,
+        }
+    }
+
+    /// Sample of one L1/LOD grid cell.
+    pub fn from_grid(g: &BitstreamGrid, i: usize) -> Self {
+        Self {
+            qp: g.qp[i],
+            bpp: g.bpp[i],
+            mode: g.mode[i],
+            mv: g.mv_mag[i],
+            coeff: g.coeff_energy[i],
+            nz: g.nz_density[i],
+        }
+    }
 }
 
 /// L1-norm MV magnitude of a block in **pixels** (quarter-pel `|x|+|y|` / 4)
@@ -334,21 +414,28 @@ pub fn block_mv_px(b: &BsBlock) -> f32 {
         .unwrap_or(0.0)
 }
 
-/// Compute fill statistics over a frame's L0 block list.
-pub fn frame_fill_stats(blocks: &[BsBlock]) -> FrameFillStats {
+/// Compute fill statistics over a frame's L0 block list (+ its optional
+/// per-block TX aggregate, parallel — see [`BlockTxAgg`]).
+pub fn frame_fill_stats(blocks: &[BsBlock], tx: Option<&[BlockTxAgg]>) -> FrameFillStats {
     let mut s = FrameFillStats {
         qp_min: f32::INFINITY,
         qp_max: f32::NEG_INFINITY,
         bpp_max: 0.0,
         mv_max: 0.0,
+        coeff_max: 0.0,
+        nz_max: 0.0,
     };
-    for b in blocks {
+    for (i, b) in blocks.iter().enumerate() {
         let qp = b.qp as f32;
         s.qp_min = s.qp_min.min(qp);
         s.qp_max = s.qp_max.max(qp);
-        let area = (b.w as f32 * b.h as f32).max(1.0);
-        s.bpp_max = s.bpp_max.max(b.bits.max(0) as f32 / area);
+        let area = (b.w as f64 * b.h as f64).max(1.0);
+        s.bpp_max = s.bpp_max.max(b.bits.max(0) as f32 / area as f32);
         s.mv_max = s.mv_max.max(block_mv_px(b));
+        if let Some(agg) = tx.and_then(|t| t.get(i)) {
+            s.coeff_max = s.coeff_max.max((agg.abs_sum.max(0.0) / area) as f32);
+            s.nz_max = s.nz_max.max((agg.nonzero.max(0.0) / area) as f32);
+        }
     }
     if !s.qp_min.is_finite() {
         s.qp_min = 0.0;
@@ -357,24 +444,22 @@ pub fn frame_fill_stats(blocks: &[BsBlock]) -> FrameFillStats {
     s
 }
 
-/// Fill colour for a (qp, bpp, mode, mv) sample under the current fill mode.
-/// `opacity` applies to the fill only (§2).
+/// Fill colour for a sample under the current fill mode. `opacity` applies
+/// to the fill only (§2).
 pub fn fill_color(
     fill: FillMode,
-    qp: f32,
-    bpp: f32,
-    mode: ModeClass,
-    mv: f32,
+    s: &FillSample,
     stats: &FrameFillStats,
     opacity: f32,
 ) -> Option<egui::Color32> {
     let a255 = |t: f32| ((opacity * t).clamp(0.0, 1.0) * 255.0) as u8;
+    let ramp = |v: f32, max: f32| if max > 0.0 { (v / max).clamp(0.0, 1.0) } else { 0.0 };
     match fill {
         // Opportunity is a G-cell layer drawn from the aligned pair, not a
         // per-block colour — see `opportunity_cell_color`.
         FillMode::None | FillMode::Opportunity => None,
         FillMode::Qp => {
-            let t = normalize(qp, stats.qp_min, stats.qp_max);
+            let t = normalize(s.qp, stats.qp_min, stats.qp_max);
             Some(egui::Color32::from_rgba_unmultiplied(
                 225,
                 40,
@@ -383,7 +468,7 @@ pub fn fill_color(
             ))
         }
         FillMode::Bpp => {
-            let t = if stats.bpp_max > 0.0 { (bpp / stats.bpp_max).clamp(0.0, 1.0) } else { 0.0 };
+            let t = ramp(s.bpp, stats.bpp_max);
             Some(egui::Color32::from_rgba_unmultiplied(
                 255,
                 150,
@@ -392,7 +477,7 @@ pub fn fill_color(
             ))
         }
         FillMode::Mode => {
-            let c = mode_color(mode);
+            let c = mode_color(s.mode);
             Some(egui::Color32::from_rgba_unmultiplied(
                 c.r(),
                 c.g(),
@@ -401,7 +486,7 @@ pub fn fill_color(
             ))
         }
         FillMode::MvHeat => {
-            let t = if stats.mv_max > 0.0 { (mv / stats.mv_max).clamp(0.0, 1.0) } else { 0.0 };
+            let t = ramp(s.mv, stats.mv_max);
             Some(egui::Color32::from_rgba_unmultiplied(
                 55,
                 125,
@@ -409,18 +494,39 @@ pub fn fill_color(
                 a255(0.10 + 0.90 * t),
             ))
         }
+        // M-B: orange→red ramp (hue shifts with t, frame-max normalized).
+        FillMode::CoeffEnergy => {
+            let t = ramp(s.coeff, stats.coeff_max);
+            Some(egui::Color32::from_rgba_unmultiplied(
+                255,
+                (140.0 - 110.0 * t) as u8,
+                10,
+                a255(0.10 + 0.90 * t),
+            ))
+        }
+        FillMode::NonzeroCoeffs => {
+            let t = ramp(s.nz, stats.nz_max);
+            Some(egui::Color32::from_rgba_unmultiplied(
+                210,
+                70,
+                220,
+                a255(0.10 + 0.90 * t),
+            ))
+        }
     }
 }
 
 /// Short value text for tooltips / labels / loupe under a fill mode.
-pub fn fill_value_text(fill: FillMode, qp: f32, bpp: f32, mode: ModeClass, mv: f32) -> String {
+pub fn fill_value_text(fill: FillMode, s: &FillSample) -> String {
     match fill {
         // Opportunity z lives on G cells, not blocks — fall back to QP for
         // block-level text (labels / loupe).
-        FillMode::None | FillMode::Qp | FillMode::Opportunity => format!("{qp:.0}"),
-        FillMode::Bpp => format!("{bpp:.2}"),
-        FillMode::Mode => mode.label().to_string(),
-        FillMode::MvHeat => format!("{mv:.1}"),
+        FillMode::None | FillMode::Qp | FillMode::Opportunity => format!("{:.0}", s.qp),
+        FillMode::Bpp => format!("{:.2}", s.bpp),
+        FillMode::Mode => s.mode.label().to_string(),
+        FillMode::MvHeat => format!("{:.1}", s.mv),
+        FillMode::CoeffEnergy => format!("{:.1}", s.coeff),
+        FillMode::NonzeroCoeffs => format!("{:.2}", s.nz),
     }
 }
 
@@ -574,6 +680,9 @@ enum BsTab {
     /// M-A: parameter sets / slice headers / DPB / exactness (VQA Syntax
     /// panel + Unit Info DPB tab analogue).
     Structure,
+    /// M-B: syntax-element aggregate + CABAC summary + MV scatter (VQA
+    /// Stats tab analogue, current frame only).
+    Stats,
 }
 
 /// Selection: catb display frame + index into that frame's block list.
@@ -592,6 +701,10 @@ struct FrameDerived {
     file_ptr: usize,
     display_idx: usize,
     blocks: Arc<Vec<BsBlock>>,
+    /// Per-block TX aggregate (M-B), parallel to `blocks` — eager because
+    /// the L1/LOD grids bake it in (one cheap fixed-field pass over the
+    /// frame's TX records; empty TRANSFORMS section ⇒ all zeros).
+    tx_agg: Vec<BlockTxAgg>,
     stats: FrameFillStats,
     /// L1 canonical 8-px grid (loupe).
     grid_l1: BitstreamGrid,
@@ -603,6 +716,9 @@ struct FrameDerived {
     /// Per-block intra dirs, parallel to `blocks` — lazily for the Intra
     /// layer (M4).
     intra: Option<Vec<Vec<IntraDir>>>,
+    /// Per-block TX rows, parallel to `blocks` — lazily for the TU layer
+    /// and the Inspector TU table (M-B).
+    tx: Option<Vec<Vec<TxRow>>>,
 }
 
 /// Snapshot of the shared state taken at the top of the child pass so the
@@ -690,6 +806,14 @@ pub struct BitstreamWindow {
     show_refs: bool,
     /// M-A §B: Structure tab parameter-set field name filter.
     structure_filter: String,
+    /// M-B: Inspector TU-table selection (index into the selected block's
+    /// TX rows) — opens the coefficient detail section. Cleared whenever
+    /// the block selection changes.
+    selected_tu: Option<usize>,
+    /// M-B: Stats tab per-frame aggregate, keyed on (file, display_idx).
+    stats_cache: Option<(usize, usize, FrameStatsData)>,
+    /// M-B: Stats tab syntax-element name filter.
+    stats_filter: String,
 }
 
 /// Cached per-viewer-frame filmstrip classes + reference graph (M-A §C).
@@ -790,6 +914,9 @@ impl BitstreamWindow {
             filmstrip_cache: None,
             show_refs: true,
             structure_filter: String::new(),
+            selected_tu: None,
+            stats_cache: None,
+            stats_filter: String::new(),
         }
     }
 
@@ -807,6 +934,7 @@ impl BitstreamWindow {
     /// be interpreted against file B.
     pub fn reset_file_state(&mut self) {
         self.selection = None;
+        self.selected_tu = None;
         self.opp_focus = None;
         self.corr_hover_cell = None;
         self.pending_center = None;
@@ -814,6 +942,7 @@ impl BitstreamWindow {
         self.corr_derived = None;
         self.corr_scan_derived = None;
         self.filmstrip_cache = None;
+        self.stats_cache = None;
     }
 
     /// Render the window. Returns the current view settings when they
@@ -909,6 +1038,7 @@ impl BitstreamWindow {
                     BsTab::Correlation => self.ui_correlation_tab(ctx, &snap),
                     BsTab::FrameGraph => self.ui_frame_graph_tab(ctx, &snap),
                     BsTab::Structure => self.ui_structure_tab(ctx, &snap),
+                    BsTab::Stats => self.ui_stats_tab(ctx, &snap),
                 }
 
                 // Tell the root whether it must keep computing analysis
@@ -1022,9 +1152,10 @@ impl BitstreamWindow {
             m: bool,
             c: bool,
             g: bool,
-            nums: [bool; 6],
+            nums: [bool; 8],
             v: bool,
             p: bool,
+            t: bool,
             d: bool,
             l: bool,
             s: bool,
@@ -1051,9 +1182,12 @@ impl BitstreamWindow {
                     plain && i.key_pressed(egui::Key::Num4),
                     plain && i.key_pressed(egui::Key::Num5),
                     plain && i.key_pressed(egui::Key::Num6),
+                    plain && i.key_pressed(egui::Key::Num7),
+                    plain && i.key_pressed(egui::Key::Num8),
                 ],
                 v: plain && i.key_pressed(egui::Key::V),
                 p: plain && i.key_pressed(egui::Key::P),
+                t: plain && i.key_pressed(egui::Key::T),
                 d: plain && i.key_pressed(egui::Key::D),
                 l: plain && i.key_pressed(egui::Key::L),
                 s: plain && i.key_pressed(egui::Key::S),
@@ -1114,6 +1248,9 @@ impl BitstreamWindow {
         if k.p {
             self.view.part = !self.view.part;
         }
+        if k.t {
+            self.view.tu = !self.view.tu;
+        }
         if k.d {
             self.view.intra = !self.view.intra;
         }
@@ -1131,6 +1268,7 @@ impl BitstreamWindow {
         }
         if k.esc {
             self.selection = None;
+            self.selected_tu = None;
             self.opp_focus = None;
             self.corr_hover_cell = None;
         }
@@ -1161,6 +1299,7 @@ impl BitstreamWindow {
                 ui.selectable_value(&mut self.tab, BsTab::Correlation, "Correlation");
                 ui.selectable_value(&mut self.tab, BsTab::FrameGraph, "Frame Graph");
                 ui.selectable_value(&mut self.tab, BsTab::Structure, "Structure");
+                ui.selectable_value(&mut self.tab, BsTab::Stats, "Stats");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.monospace(self.sync_readout(snap));
                 });
@@ -1232,12 +1371,23 @@ impl BitstreamWindow {
                     .on_hover_text(
                         "Partition outlines (P): CU grey on every block, \
                          per-PU boundaries magenta where REF rows carry PU \
-                         geometry. TU outlines not available (transforms \
-                         section unparsed).",
+                         geometry.",
                     )
                     .clicked()
                 {
                     self.view.part = !self.view.part;
+                }
+                if ui
+                    .selectable_label(self.view.tu, "TU")
+                    .on_hover_text(
+                        "Transform-unit outlines (T): yellow, brighter at \
+                         deeper TU depth; cbf=0 TUs dashed; transform_skip \
+                         TUs shaded; Coeffs:n labels at zoom ≥ 2x. Rendered \
+                         at zoom ≥ 1.5x.",
+                    )
+                    .clicked()
+                {
+                    self.view.tu = !self.view.tu;
                 }
                 if ui
                     .selectable_label(self.view.intra, "Intra")
@@ -1359,25 +1509,29 @@ impl BitstreamWindow {
             return;
         };
         let (w, h) = (file.width.max(1), file.height.max(1));
-        let stats = frame_fill_stats(&blocks);
-        let grid_l1 = rasterize_blocks(&blocks, w, h, 8);
+        let tx_agg = aggregate_block_tx(file, &blocks);
+        let stats = frame_fill_stats(&blocks, Some(&tx_agg));
+        let grid_l1 = rasterize_blocks_tx(&blocks, Some(&tx_agg), w, h, 8);
         let lod = lod_cell_size(&file.catb.meta.codec);
-        let grid_lod = rasterize_blocks(&blocks, w, h, lod);
+        let grid_lod = rasterize_blocks_tx(&blocks, Some(&tx_agg), w, h, lod);
         self.derived = Some(FrameDerived {
             file_ptr,
             display_idx,
             blocks,
+            tx_agg,
             stats,
             grid_l1,
             grid_lod,
             refs: None,
             intra: None,
+            tx: None,
         });
     }
 
-    /// Lazily build the M4 layer data (REF rows / intra dirs) the current
-    /// view needs. Called after `refresh_derived`; a toggle flipped later
-    /// fills the missing piece on the next pass without re-deriving.
+    /// Lazily build the M4/M-B layer data (REF rows / intra dirs / TX rows)
+    /// the current view needs. Called after `refresh_derived`; a toggle
+    /// flipped later fills the missing piece on the next pass without
+    /// re-deriving.
     fn ensure_layer_data(&mut self, snap: &Snapshot) {
         let Some(file) = snap.file.as_ref() else { return };
         let Some(d) = self.derived.as_mut() else { return };
@@ -1386,6 +1540,9 @@ impl BitstreamWindow {
         }
         if self.view.intra && d.intra.is_none() {
             d.intra = Some(build_intra(file, &d.blocks));
+        }
+        if self.view.tu && d.tx.is_none() {
+            d.tx = Some(build_tx(file, &d.blocks));
         }
     }
 
@@ -1561,10 +1718,7 @@ impl BitstreamWindow {
                             }
                             if let Some(color) = fill_color(
                                 self.view.fill,
-                                g.qp[i],
-                                g.bpp[i],
-                                g.mode[i],
-                                g.mv_mag[i],
+                                &FillSample::from_grid(g, i),
                                 &d.stats,
                                 opacity,
                             ) {
@@ -1582,16 +1736,10 @@ impl BitstreamWindow {
                         }
                     }
                 } else {
-                    for b in d.blocks.iter() {
-                        let area = (b.w as f32 * b.h as f32).max(1.0);
-                        let bpp = b.bits.max(0) as f32 / area;
-                        let mv = block_mv_px(b);
+                    for (bi, b) in d.blocks.iter().enumerate() {
                         if let Some(color) = fill_color(
                             self.view.fill,
-                            b.qp as f32,
-                            bpp,
-                            ModeClass::from_label(&b.prediction_mode),
-                            mv,
+                            &FillSample::from_block(b, d.tx_agg.get(bi)),
                             &d.stats,
                             opacity,
                         ) {
@@ -1650,6 +1798,14 @@ impl BitstreamWindow {
                     draw_part_layer(&painter, &geom, &d.blocks, refs);
                 }
             }
+            // M-B TU layer: yellow depth-shaded TU rects (+ Coeffs:n at
+            // zoom ≥ 2x), drawn between Part (CU/PU) and MV so the arrows
+            // stay on top.
+            if self.view.tu {
+                if let Some(tx) = d.tx.as_ref() {
+                    draw_tu_layer(&painter, &geom, tx);
+                }
+            }
             if self.view.mv {
                 if let Some(refs) = d.refs.as_ref() {
                     draw_mv_layer(&painter, &geom, &d.blocks, refs, self.mv_source);
@@ -1663,19 +1819,14 @@ impl BitstreamWindow {
 
             // Label layer: per-block value text at zoom ≥ 2x (§2).
             if self.view.label && zoom >= 2.0 && !lod_mode {
-                for b in d.blocks.iter() {
+                for (bi, b) in d.blocks.iter().enumerate() {
                     let rect = block_rect(b.x as f32, b.y as f32, b.w as f32, b.h as f32);
                     if !rect.intersects(canvas_rect) || rect.width() < 18.0 {
                         continue;
                     }
-                    let area = (b.w as f32 * b.h as f32).max(1.0);
-                    let bpp = b.bits.max(0) as f32 / area;
                     let txt = fill_value_text(
                         self.view.fill,
-                        b.qp as f32,
-                        bpp,
-                        ModeClass::from_label(&b.prediction_mode),
-                        block_mv_px(b),
+                        &FillSample::from_block(b, d.tx_agg.get(bi)),
                     );
                     let font_size = (rect.height() * 0.4).clamp(8.0, 14.0);
                     painter.text(
@@ -1740,11 +1891,16 @@ impl BitstreamWindow {
                 let sx = (pos.x - origin.x) / zx;
                 let sy = (pos.y - origin.y) / zy;
                 if sx >= 0.0 && sy >= 0.0 && sx < sw && sy < sh {
-                    self.selection = hit_test_min_area(&d.blocks, sx as u32, sy as u32)
+                    let new_sel = hit_test_min_area(&d.blocks, sx as u32, sy as u32)
                         .map(|block_idx| Selection {
                             display_idx: d.display_idx,
                             block_idx,
                         });
+                    if new_sel != self.selection {
+                        // M-B: the TU-table selection belongs to the block.
+                        self.selected_tu = None;
+                    }
+                    self.selection = new_sel;
                     // M3: with the Opportunity fill, a click also selects the
                     // G cell — the Inspector shows its raw (a, b, z).
                     if self.view.fill == FillMode::Opportunity {
@@ -1764,6 +1920,7 @@ impl BitstreamWindow {
                     }
                 } else {
                     self.selection = None;
+                    self.selected_tu = None;
                     self.opp_focus = None;
                 }
             }
@@ -1792,10 +1949,19 @@ impl BitstreamWindow {
                             b.qp, b.bits, mode, b.w, b.h, b.x, b.y, bpp,
                         );
                         // §5: the tooltip leads with the current fill value —
-                        // QP/bpp/mode are already in the summary; MV-heat
-                        // needs its |MV| (in pixels) prepended.
+                        // QP/bpp/mode are already in the summary; MV-heat /
+                        // the M-B TX fills need their value prepended.
                         if self.view.fill == FillMode::MvHeat {
                             text = format!("|MV| {:.1}px · {text}", block_mv_px(b));
+                        } else if matches!(
+                            self.view.fill,
+                            FillMode::CoeffEnergy | FillMode::NonzeroCoeffs
+                        ) {
+                            let s = FillSample::from_block(b, d.tx_agg.get(bi));
+                            text = format!(
+                                "energy {:.1}/px · nz {:.2}/px · {text}",
+                                s.coeff, s.nz
+                            );
                         }
                         response.clone().on_hover_text(text);
                     }
@@ -2071,7 +2237,179 @@ impl BitstreamWindow {
                         }
                     }
                 }
+
+                // M-B: TU table (VQA TU tab analogue). Row click opens the
+                // coefficient detail below (Transform Detail stage 1 —
+                // decoded levels; inverse quant/transform are out of scope).
+                if b.tx_n > 0 {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Transform units").strong());
+                    match file.catb.tx_for_block(&b) {
+                        Ok(tx_rows) => {
+                            self.ui_inspector_tu_table(ui, file, &tx_rows);
+                        }
+                        Err(e) => {
+                            ui.colored_label(egui::Color32::RED, format!("TX parse: {e}"));
+                        }
+                    }
+                }
             });
+    }
+
+    /// Inspector TU table + selected-TU coefficient grid (M-B).
+    fn ui_inspector_tu_table(
+        &mut self,
+        ui: &mut egui::Ui,
+        file: &BitstreamFile,
+        tx_rows: &[TxRow],
+    ) {
+        egui::ScrollArea::vertical()
+            .id_salt("bs_tu_table")
+            .max_height(180.0)
+            .show(ui, |ui| {
+                egui::Grid::new("bs_tu_grid")
+                    .striped(true)
+                    .spacing(egui::vec2(8.0, 2.0))
+                    .show(ui, |ui| {
+                        for head in ["TU", "d", "cbf", "nz", "abs", "bits"] {
+                            ui.label(egui::RichText::new(head).small());
+                        }
+                        ui.end_row();
+                        for (k, t) in tx_rows.iter().enumerate() {
+                            let selected = self.selected_tu == Some(k);
+                            let label = format!("{}×{}@({},{})", t.w, t.h, t.x, t.y);
+                            if ui.selectable_label(selected, egui::RichText::new(label).monospace())
+                                .on_hover_text(format!(
+                                    "type: {} · click for coefficients",
+                                    if t.tx_type.is_empty() { "?" } else { &t.tx_type },
+                                ))
+                                .clicked()
+                            {
+                                self.selected_tu = (!selected).then_some(k);
+                            }
+                            ui.monospace(format!("{}", t.depth));
+                            let cbf = format!(
+                                "{}{}{}",
+                                if t.cbf_luma() { "Y" } else { "-" },
+                                if t.cbf_cb() { "b" } else { "-" },
+                                if t.cbf_cr() { "r" } else { "-" },
+                            );
+                            ui.monospace(cbf);
+                            ui.monospace(
+                                t.nonzero_coeff_count
+                                    .map(|n| n.to_string())
+                                    .unwrap_or_else(|| "-".into()),
+                            );
+                            ui.monospace(
+                                t.coeff_abs_sum
+                                    .map(|n| n.to_string())
+                                    .unwrap_or_else(|| "-".into()),
+                            );
+                            ui.monospace(format!("{}", t.bits));
+                            ui.end_row();
+                        }
+                    });
+            });
+
+        // Selected TU → coefficient detail (levels grid, scan indices).
+        let Some(k) = self.selected_tu else { return };
+        let Some(t) = tx_rows.get(k) else {
+            self.selected_tu = None;
+            return;
+        };
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(format!(
+                "TU {k}: {}×{}@({},{}) coefficients",
+                t.w, t.h, t.x, t.y
+            ))
+            .strong(),
+        );
+        let mut meta_line = format!(
+            "type {} · last_sig ({}, {})",
+            if t.tx_type.is_empty() { "?" } else { &t.tx_type },
+            t.last_sig_coeff_x.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+            t.last_sig_coeff_y.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+        );
+        if t.has_detail() {
+            meta_line += &format!(
+                " · {} {} · groups {}×{}",
+                t.coeff_component, t.coeff_level_kind, t.coeff_group_width, t.coeff_group_height,
+            );
+        }
+        ui.weak(meta_line);
+        match file.catb.coeffs_for_tx(t) {
+            Ok(Some(detail)) => {
+                // Coeff grid width: the group grid is in 4×4 sub-blocks
+                // (fixture-observed: cc == (4·gw)·(4·gh)); fall back to the
+                // TU width when the shape disagrees.
+                let gw4 = t.coeff_group_width.max(0) as usize * 4;
+                let gh4 = t.coeff_group_height.max(0) as usize * 4;
+                let cc = detail.levels.len();
+                let cols = if gw4 > 0 && gw4 * gh4 == cc {
+                    gw4
+                } else if t.w > 0 && cc % (t.w as usize) == 0 {
+                    t.w as usize
+                } else {
+                    cc.max(1)
+                };
+                egui::ScrollArea::both()
+                    .id_salt("bs_tu_coeffs")
+                    .max_height(200.0)
+                    .show(ui, |ui| {
+                        // Levels in raster order; nonzero cells carry the
+                        // scan-order index as "level(scan)".
+                        for (ri, row) in detail.levels.chunks(cols).take(64).enumerate() {
+                            let base = ri * cols;
+                            let line: String = row
+                                .iter()
+                                .enumerate()
+                                .map(|(j, &v)| {
+                                    if v != 0 {
+                                        let scan = detail
+                                            .scan
+                                            .get(base + j)
+                                            .copied()
+                                            .unwrap_or(-1);
+                                        format!("{v}({scan})")
+                                    } else {
+                                        "·".to_string()
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            ui.monospace(line);
+                        }
+                        if !detail.group_flags.is_empty() {
+                            ui.add_space(2.0);
+                            ui.weak(format!(
+                                "group flags ({}×{}): {}",
+                                t.coeff_group_width,
+                                t.coeff_group_height,
+                                detail
+                                    .group_flags
+                                    .iter()
+                                    .map(|g| g.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(" "),
+                            ));
+                        }
+                    });
+            }
+            Ok(None) => {
+                if t.detail_dropped() {
+                    ui.weak(
+                        "Coefficient detail dropped by the decoder — \
+                         re-run with Deep telemetry (--telemetry-level full).",
+                    );
+                } else {
+                    ui.weak("No coefficient detail for this TU.");
+                }
+            }
+            Err(e) => {
+                ui.colored_label(egui::Color32::RED, format!("coeffs: {e}"));
+            }
+        }
     }
 
     // -- filmstrip (§4) --------------------------------------------------------
@@ -3257,7 +3595,7 @@ impl BitstreamWindow {
                                             .striped(true)
                                             .spacing(egui::vec2(12.0, 2.0))
                                             .show(ui, |ui| {
-                                                for (n, v) in &sh.syntax {
+                                                for (n, v, _) in &sh.syntax {
                                                     ui.label(n);
                                                     ui.monospace(v);
                                                     ui.end_row();
@@ -3453,6 +3791,232 @@ impl BitstreamWindow {
         });
     }
 
+    // -- Stats tab (M-B) --------------------------------------------------
+    //
+    // VQAnalyzer Stats-tab analogue (Syntax Stats + the Picture Stats
+    // header line + the Motion vectors scatter), current frame only.
+
+    #[allow(clippy::too_many_lines)]
+    fn ui_stats_tab(&mut self, ctx: &egui::Context, snap: &Snapshot) {
+        self.ui_transport_and_status(ctx, snap, true);
+        self.ui_filmstrip(ctx, snap);
+
+        // Refresh the per-frame aggregate cache (file identity + display
+        // index key, FrameDerived convention).
+        let file_ptr = snap
+            .file
+            .as_ref()
+            .map(|f| Arc::as_ptr(f) as usize)
+            .unwrap_or(0);
+        let display_idx = viewer_to_catb_display(snap.viewer_frame, snap.offset);
+        if let (Some(file), Some(display_idx)) = (snap.file.as_ref(), display_idx) {
+            let current = self
+                .stats_cache
+                .as_ref()
+                .is_some_and(|(fp, di, _)| *fp == file_ptr && *di == display_idx);
+            if !current {
+                self.stats_cache = compute_frame_stats(file, display_idx)
+                    .map(|s| (file_ptr, display_idx, s));
+            }
+        } else {
+            self.stats_cache = None;
+        }
+
+        // -- right dock: MV scatter (VQA "Motion vectors" chart) --
+        egui::SidePanel::right("bs_stats_mv")
+            .default_width(340.0)
+            .show(ctx, |ui| {
+                use egui_plot::{Plot, PlotPoints, Points};
+                ui.heading("MV scatter");
+                let Some((_, _, stats)) = self.stats_cache.as_ref() else {
+                    ui.weak("No frame data.");
+                    return;
+                };
+                if stats.mv_points.is_empty() {
+                    ui.weak("No motion vectors in this frame (intra / no MV data).");
+                    return;
+                }
+                let l0: Vec<[f64; 2]> = stats
+                    .mv_points
+                    .iter()
+                    .filter(|p| p.list == 0)
+                    .map(|p| [p.x, p.y])
+                    .collect();
+                let l1: Vec<[f64; 2]> = stats
+                    .mv_points
+                    .iter()
+                    .filter(|p| p.list == 1)
+                    .map(|p| [p.x, p.y])
+                    .collect();
+                // Symmetric axes around 0 (VQA quarter-pel 2D distribution
+                // convention, shown here in px).
+                let m = stats
+                    .mv_points
+                    .iter()
+                    .fold(1.0_f64, |m, p| m.max(p.x.abs()).max(p.y.abs()))
+                    * 1.1;
+                let pts = &stats.mv_points;
+                let resp = Plot::new("bs_stats_mv_plot")
+                    .x_axis_label("mv_x (px)")
+                    .y_axis_label("mv_y (px)")
+                    .include_x(-m)
+                    .include_x(m)
+                    .include_y(-m)
+                    .include_y(m)
+                    .data_aspect(1.0)
+                    .show(ui, |plot_ui| {
+                        plot_ui.points(
+                            Points::new(PlotPoints::new(l0))
+                                .radius(2.0)
+                                .name("L0")
+                                .color(egui::Color32::from_rgb(255, 150, 20)),
+                        );
+                        plot_ui.points(
+                            Points::new(PlotPoints::new(l1))
+                                .radius(2.0)
+                                .name("L1")
+                                .color(egui::Color32::from_rgb(170, 90, 230)),
+                        );
+                        (plot_ui.pointer_coordinate(), plot_ui.plot_bounds())
+                    });
+                // Hover: nearest point → block-coordinate tooltip (corr
+                // scatter convention).
+                if let (Some(ptr), bounds) = resp.inner {
+                    let bw = bounds.width().max(f64::EPSILON);
+                    let bh = bounds.height().max(f64::EPSILON);
+                    let mut best: Option<(usize, f64)> = None;
+                    for (i, p) in pts.iter().enumerate() {
+                        let dx = (p.x - ptr.x) / bw;
+                        let dy = (p.y - ptr.y) / bh;
+                        let dd = dx * dx + dy * dy;
+                        if best.map(|(_, bd)| dd < bd).unwrap_or(true) {
+                            best = Some((i, dd));
+                        }
+                    }
+                    if let Some((i, dd)) = best {
+                        if dd.sqrt() < 0.02 {
+                            let p = &pts[i];
+                            resp.response.on_hover_text(format!(
+                                "{} ({:+.2}, {:+.2}) px · block ({}, {})",
+                                if p.list == 0 { "L0" } else { "L1" },
+                                p.x,
+                                p.y,
+                                p.block_x,
+                                p.block_y,
+                            ));
+                        }
+                    }
+                }
+            });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if snap.file.is_none() {
+                ui.centered_and_justified(|ui| {
+                    ui.label("Load a .catb to see per-frame syntax / CABAC statistics.");
+                });
+                return;
+            }
+            let Some((_, _, stats)) = self.stats_cache.as_ref() else {
+                ui.weak("No catb frame maps to this viewer frame — check the offset.");
+                return;
+            };
+            // -- summary line --
+            ui.monospace(format!(
+                "blocks {} · TUs {} · syntax rows {} · cabac bins {} · {} bits",
+                stats.blocks,
+                stats.tus,
+                stats.syntax_rows,
+                stats.cabac_bins,
+                format_bits(stats.total_bits),
+            ));
+            ui.separator();
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                // -- 1. syntax element aggregate --
+                egui::CollapsingHeader::new(format!(
+                    "Syntax elements ({})",
+                    stats.syntax.len()
+                ))
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Filter:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.stats_filter)
+                                .desired_width(180.0)
+                                .hint_text("name contains…"),
+                        );
+                        if !self.stats_filter.is_empty() && ui.small_button("×").clicked() {
+                            self.stats_filter.clear();
+                        }
+                    });
+                    let needle = self.stats_filter.to_ascii_lowercase();
+                    let total = stats.total_bits.max(1) as f64;
+                    egui::Grid::new("bs_stats_syntax_grid")
+                        .striped(true)
+                        .spacing(egui::vec2(14.0, 2.0))
+                        .show(ui, |ui| {
+                            for head in ["name", "count", "bits", "% of data"] {
+                                ui.label(egui::RichText::new(head).small().strong());
+                            }
+                            ui.end_row();
+                            for row in stats
+                                .syntax
+                                .iter()
+                                .filter(|r| {
+                                    needle.is_empty()
+                                        || r.name.to_ascii_lowercase().contains(&needle)
+                                })
+                            {
+                                ui.monospace(&row.name);
+                                ui.monospace(format!("{}", row.count));
+                                ui.monospace(format_bits(row.bits));
+                                ui.monospace(format!(
+                                    "{:.1}%",
+                                    row.bits as f64 / total * 100.0
+                                ));
+                                ui.end_row();
+                            }
+                        });
+                    ui.weak(
+                        "\"(slice)\" rows come from the frame's slice headers \
+                         (frames_meta); % is of frame data_bits.",
+                    );
+                });
+
+                // -- 2. CABAC summary --
+                egui::CollapsingHeader::new(format!("CABAC bins ({})", stats.cabac_bins))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        if stats.cabac.is_empty() {
+                            ui.weak(
+                                "No CABAC bins captured for this frame — \
+                                 re-run with Deep telemetry \
+                                 (--telemetry-level full).",
+                            );
+                            return;
+                        }
+                        egui::Grid::new("bs_stats_cabac_grid")
+                            .striped(true)
+                            .spacing(egui::vec2(14.0, 2.0))
+                            .show(ui, |ui| {
+                                for head in ["name", "bins", "bits/bin", "ctx used"] {
+                                    ui.label(egui::RichText::new(head).small().strong());
+                                }
+                                ui.end_row();
+                                for row in &stats.cabac {
+                                    ui.monospace(&row.name);
+                                    ui.monospace(format!("{}", row.bins));
+                                    ui.monospace(format!("{:.2}", row.bits_per_bin()));
+                                    ui.monospace(format!("{}", row.ctx_count));
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            });
+        });
+    }
+
     // -- Frame Graph tab -------------------------------------------------------
 
     fn ui_frame_graph_tab(&mut self, ctx: &egui::Context, snap: &Snapshot) {
@@ -3578,6 +4142,8 @@ fn draw_legend(
                 FillMode::Qp => ("QP", stats.qp_min, stats.qp_max),
                 FillMode::Bpp => ("bpp", 0.0, stats.bpp_max),
                 FillMode::MvHeat => ("|MV|px", 0.0, stats.mv_max),
+                FillMode::CoeffEnergy => ("energy", 0.0, stats.coeff_max),
+                FillMode::NonzeroCoeffs => ("nz/px", 0.0, stats.nz_max),
                 _ => unreachable!(),
             };
             let bar_w = 90.0_f32;
@@ -3601,16 +4167,17 @@ fn draw_legend(
             for s in 0..steps {
                 let t = s as f32 / (steps - 1) as f32;
                 let v = lo + t * (hi - lo);
-                let color = fill_color(
-                    fill,
-                    if fill == FillMode::Qp { v } else { 0.0 },
-                    if fill == FillMode::Bpp { v } else { 0.0 },
-                    ModeClass::Unknown,
-                    if fill == FillMode::MvHeat { v } else { 0.0 },
-                    stats,
-                    1.0,
-                )
-                .unwrap_or(egui::Color32::TRANSPARENT);
+                let mut sample = FillSample::default();
+                match fill {
+                    FillMode::Qp => sample.qp = v,
+                    FillMode::Bpp => sample.bpp = v,
+                    FillMode::MvHeat => sample.mv = v,
+                    FillMode::CoeffEnergy => sample.coeff = v,
+                    FillMode::NonzeroCoeffs => sample.nz = v,
+                    _ => {}
+                }
+                let color = fill_color(fill, &sample, stats, 1.0)
+                    .unwrap_or(egui::Color32::TRANSPARENT);
                 let seg = egui::Rect::from_min_size(
                     egui::pos2(bar.min.x + t * (bar_w - bar_w / steps as f32), bar.min.y),
                     egui::vec2(bar_w / steps as f32 + 1.0, bar.height()),
@@ -3742,6 +4309,8 @@ fn draw_l1_loupe(
         qp_max: grid.qp.iter().copied().fold(0.0, f32::max),
         bpp_max: grid.bpp.iter().copied().fold(0.0, f32::max),
         mv_max: grid.mv_mag.iter().copied().fold(0.0, f32::max),
+        coeff_max: grid.coeff_energy.iter().copied().fold(0.0, f32::max),
+        nz_max: grid.nz_density.iter().copied().fold(0.0, f32::max),
     };
     let font = egui::FontId::monospace(10.0);
     let empty_fill = egui::Color32::from_rgb(20, 22, 28);
@@ -3767,24 +4336,11 @@ fn draw_l1_loupe(
                 } else {
                     fill
                 };
-                let color = fill_color(
-                    loupe_fill,
-                    grid.qp[i],
-                    grid.bpp[i],
-                    grid.mode[i],
-                    grid.mv_mag[i],
-                    &stats,
-                    1.0,
-                )
-                .unwrap_or(empty_fill);
+                let sample = FillSample::from_grid(grid, i);
+                let color = fill_color(loupe_fill, &sample, &stats, 1.0)
+                    .unwrap_or(empty_fill);
                 painter.rect_filled(cell_rect.shrink(0.5), 0.0, color);
-                let txt = fill_value_text(
-                    loupe_fill,
-                    grid.qp[i],
-                    grid.bpp[i],
-                    grid.mode[i],
-                    grid.mv_mag[i],
-                );
+                let txt = fill_value_text(loupe_fill, &sample);
                 painter.text(
                     cell_rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -3992,16 +4548,52 @@ mod tests {
             qp_max: 0.0,
             bpp_max: 2.0,
             mv_max: 0.0,
+            coeff_max: 0.0,
+            nz_max: 0.0,
         };
-        let half = fill_color(FillMode::Bpp, 0.0, 1.0, ModeClass::Unknown, 0.0, &stats, 1.0)
-            .unwrap();
-        let full = fill_color(FillMode::Bpp, 0.0, 2.0, ModeClass::Unknown, 0.0, &stats, 1.0)
-            .unwrap();
+        let sample = |bpp: f32| FillSample {
+            bpp,
+            ..Default::default()
+        };
+        let half = fill_color(FillMode::Bpp, &sample(1.0), &stats, 1.0).unwrap();
+        let full = fill_color(FillMode::Bpp, &sample(2.0), &stats, 1.0).unwrap();
         assert!(full.a() > half.a());
         // Opacity 0 → fully transparent fill (V8).
-        let zero = fill_color(FillMode::Bpp, 0.0, 2.0, ModeClass::Unknown, 0.0, &stats, 0.0)
-            .unwrap();
+        let zero = fill_color(FillMode::Bpp, &sample(2.0), &stats, 0.0).unwrap();
         assert_eq!(zero.a(), 0);
+    }
+
+    #[test]
+    fn coeff_energy_fill_normalizes_and_labels() {
+        // M-B: CoeffEnergy alpha ramps with frame-max normalization;
+        // NonzeroCoeffs likewise. Zero max (no TX data) → base alpha.
+        let stats = FrameFillStats {
+            qp_min: 0.0,
+            qp_max: 0.0,
+            bpp_max: 0.0,
+            mv_max: 0.0,
+            coeff_max: 4.0,
+            nz_max: 0.5,
+        };
+        let s = |coeff: f32, nz: f32| FillSample {
+            coeff,
+            nz,
+            ..Default::default()
+        };
+        let lo = fill_color(FillMode::CoeffEnergy, &s(1.0, 0.0), &stats, 1.0).unwrap();
+        let hi = fill_color(FillMode::CoeffEnergy, &s(4.0, 0.0), &stats, 1.0).unwrap();
+        assert!(hi.a() > lo.a());
+        // Orange→red ramp: green channel drops as t rises.
+        assert!(hi.g() < lo.g());
+        let nz_hi = fill_color(FillMode::NonzeroCoeffs, &s(0.0, 0.5), &stats, 1.0).unwrap();
+        let nz_lo = fill_color(FillMode::NonzeroCoeffs, &s(0.0, 0.1), &stats, 1.0).unwrap();
+        assert!(nz_hi.a() > nz_lo.a());
+        // Value text arms.
+        assert_eq!(fill_value_text(FillMode::CoeffEnergy, &s(2.5, 0.0)), "2.5");
+        assert_eq!(fill_value_text(FillMode::NonzeroCoeffs, &s(0.0, 0.25)), "0.25");
+        // Degenerate max → t = 0, still a colour (base alpha).
+        let none_stats = FrameFillStats::default();
+        assert!(fill_color(FillMode::CoeffEnergy, &s(1.0, 0.0), &none_stats, 1.0).is_some());
     }
 
     #[test]

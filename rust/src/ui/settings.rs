@@ -48,6 +48,9 @@ pub struct BitstreamViewSettings {
     pub fill: String,
     pub layer_mv: bool,
     pub layer_part: bool,
+    /// M-B TU outline layer (`serde(default)` for pre-0.18 files).
+    #[serde(default)]
+    pub layer_tu: bool,
     /// M4 Intra direction layer. `serde(default)` keeps pre-0.13 settings
     /// files loading (field absent → false).
     #[serde(default)]
@@ -77,6 +80,7 @@ impl Default for BitstreamViewSettings {
             fill: "QP".to_string(),
             layer_mv: false,
             layer_part: false,
+            layer_tu: false,
             layer_intra: false,
             layer_label: true,
             layer_grid: true,

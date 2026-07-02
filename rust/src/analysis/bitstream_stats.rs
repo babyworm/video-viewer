@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use lru::LruCache;
 
-use crate::core::catb::{BsBlock, CatbFile, SyntaxRow};
+use crate::core::catb::{BsBlock, CabacRow, CatbFile, SyntaxRow};
 
 /// How many frames' block lists to keep parsed in memory.
 const BLOCK_CACHE_FRAMES: usize = 32;
@@ -672,6 +672,260 @@ pub fn intra_subblock_pos(k: usize, dim: u32) -> Option<(u32, u32)> {
 }
 
 // ---------------------------------------------------------------------------
+// M-B: per-block TRANSFORM aggregates (CoeffEnergy / NonzeroCoeffs fills)
+// ---------------------------------------------------------------------------
+
+/// Per-block TX aggregate, parallel to a frame's block list: total
+/// `coeff_abs_sum` and total `nonzero_coeff_count` over the block's TX
+/// records (absent §9.1 scalars contribute 0).
+///
+/// A block without TX rows (skip CU, capture level below `full`… ) yields
+/// `(0, 0)` — **0-값 취급, coverage 제외 아님**: zero residual energy is the
+/// true coded value for skip/uncoded blocks, and excluding them would bias
+/// every correlation toward residual-carrying blocks only. Capture levels
+/// that drop the TRANSFORMS section entirely degrade to an all-zero (thus
+/// zero-variance → `r = None`) metric rather than a misleading partial one.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BlockTxAgg {
+    pub abs_sum: f64,
+    pub nonzero: f64,
+}
+
+/// Aggregate every block's TX rows (one cheap fixed-field pass; parse
+/// errors on a malformed sub-range decay to 0 — one bad block must not kill
+/// the whole fill).
+pub fn aggregate_block_tx(file: &BitstreamFile, blocks: &[BsBlock]) -> Vec<BlockTxAgg> {
+    blocks
+        .iter()
+        .map(|b| {
+            if b.tx_n > 0 {
+                file.catb
+                    .tx_aggregate_for_block(b)
+                    .map(|(a, n)| BlockTxAgg {
+                        abs_sum: a as f64,
+                        nonzero: n as f64,
+                    })
+                    .unwrap_or_default()
+            } else {
+                BlockTxAgg::default()
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// M-B: Stats tab aggregation (VQA Syntax Stats / Picture Stats analogue)
+// ---------------------------------------------------------------------------
+
+/// One aggregated syntax-element row of the Stats tab.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SyntaxAgg {
+    pub name: String,
+    pub count: usize,
+    pub bits: i64,
+}
+
+/// Aggregate `(name, bits)` syntax rows by name, sorted by total bits
+/// descending (ties: name ascending, deterministic).
+pub fn aggregate_syntax_rows<'a, I>(rows: I) -> Vec<SyntaxAgg>
+where
+    I: IntoIterator<Item = (&'a str, i64)>,
+{
+    let mut map: std::collections::HashMap<&'a str, (usize, i64)> =
+        std::collections::HashMap::new();
+    for (name, bits) in rows {
+        let e = map.entry(name).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += bits;
+    }
+    let mut out: Vec<SyntaxAgg> = map
+        .into_iter()
+        .map(|(name, (count, bits))| SyntaxAgg {
+            name: name.to_string(),
+            count,
+            bits,
+        })
+        .collect();
+    out.sort_by(|a, b| b.bits.cmp(&a.bits).then_with(|| a.name.cmp(&b.name)));
+    out
+}
+
+/// One aggregated CABAC row of the Stats tab.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CabacAgg {
+    pub name: String,
+    /// Number of decoded bins.
+    pub bins: usize,
+    /// Total bits attributed to the bins.
+    pub bits: i64,
+    /// Number of distinct context indices used.
+    pub ctx_count: usize,
+}
+
+impl CabacAgg {
+    /// Mean bits per bin (0 when no bins).
+    pub fn bits_per_bin(&self) -> f64 {
+        if self.bins == 0 {
+            0.0
+        } else {
+            self.bits as f64 / self.bins as f64
+        }
+    }
+}
+
+/// Aggregate CABAC bin rows by name, sorted by bin count descending
+/// (ties: name ascending).
+pub fn aggregate_cabac_rows(rows: &[CabacRow]) -> Vec<CabacAgg> {
+    use std::collections::{HashMap, HashSet};
+    let mut map: HashMap<&str, (usize, i64, HashSet<i32>)> = HashMap::new();
+    for r in rows {
+        let e = map.entry(r.name.as_str()).or_default();
+        e.0 += 1;
+        e.1 += r.bits;
+        e.2.insert(r.ctx);
+    }
+    let mut out: Vec<CabacAgg> = map
+        .into_iter()
+        .map(|(name, (bins, bits, ctxs))| CabacAgg {
+            name: name.to_string(),
+            bins,
+            bits,
+            ctx_count: ctxs.len(),
+        })
+        .collect();
+    out.sort_by(|a, b| b.bins.cmp(&a.bins).then_with(|| a.name.cmp(&b.name)));
+    out
+}
+
+/// One MV scatter point of the Stats tab (px units, §14.5 quarter-pel / 4).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MvPoint {
+    pub x: f64,
+    pub y: f64,
+    /// 0 = L0 (orange), 1 = L1 (purple).
+    pub list: u8,
+    /// Block origin, for the hover tooltip.
+    pub block_x: u32,
+    pub block_y: u32,
+}
+
+/// Collect every PU-level MV of a frame as scatter points: per-PU REF rows
+/// when present, block-level MV fallback otherwise (draw_mv_layer rule).
+pub fn collect_mv_points(file: &BitstreamFile, blocks: &[BsBlock]) -> Vec<MvPoint> {
+    let mut out = Vec::new();
+    for b in blocks {
+        let mut any_pu = false;
+        if b.ref_n > 0 {
+            if let Ok(refs) = file.catb.refs_for_block(b) {
+                for r in &refs {
+                    let Some((mx, my)) = r.mv else { continue };
+                    any_pu = true;
+                    let list = u8::from(
+                        r.list
+                            .as_deref()
+                            .is_some_and(|l| l.eq_ignore_ascii_case("l1")),
+                    );
+                    out.push(MvPoint {
+                        x: mx as f64 / 4.0,
+                        y: my as f64 / 4.0,
+                        list,
+                        block_x: b.x,
+                        block_y: b.y,
+                    });
+                }
+            }
+        }
+        if !any_pu {
+            if let Some((mx, my)) = b.mv {
+                let list = u8::from(
+                    b.reference_list
+                        .as_deref()
+                        .is_some_and(|l| l.eq_ignore_ascii_case("l1")),
+                );
+                out.push(MvPoint {
+                    x: mx as f64 / 4.0,
+                    y: my as f64 / 4.0,
+                    list,
+                    block_x: b.x,
+                    block_y: b.y,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Everything the Stats tab shows for one frame (built once per
+/// (file, display frame) — see the window's cache).
+#[derive(Debug, Clone, Default)]
+pub struct FrameStatsData {
+    pub blocks: usize,
+    pub tus: usize,
+    pub syntax_rows: usize,
+    pub cabac_bins: usize,
+    /// Frame `data_bits` when the FRAME record carries it, else the block
+    /// bits sum (percentage base for the syntax table).
+    pub total_bits: i64,
+    /// Block-level syntax aggregate + slice-header "(slice)" rows,
+    /// bits-descending.
+    pub syntax: Vec<SyntaxAgg>,
+    pub cabac: Vec<CabacAgg>,
+    pub mv_points: Vec<MvPoint>,
+}
+
+/// Build the Stats tab data for a catb **display-order** frame index.
+pub fn compute_frame_stats(file: &BitstreamFile, display_idx: usize) -> Option<FrameStatsData> {
+    let decode_idx = file.decode_idx(display_idx)?;
+    let frame = file.catb.frames.get(decode_idx)?;
+    let blocks = file.blocks_display(display_idx).ok()?;
+
+    // Syntax rows over all blocks (owned strings collected once so the
+    // aggregate can borrow them), plus slice-header rows with the
+    // "(slice) " prefix (§C-1).
+    let mut syntax_rows: Vec<(String, i64)> = Vec::new();
+    let mut cabac_rows: Vec<CabacRow> = Vec::new();
+    let mut tus = 0usize;
+    for b in blocks.iter() {
+        if b.syntax_n > 0 {
+            if let Ok(rows) = file.catb.syntax_for_block(b) {
+                syntax_rows.extend(rows.into_iter().map(|r| (r.name, r.bits)));
+            }
+        }
+        if b.cabac_n > 0 {
+            if let Ok(rows) = file.catb.cabac_for_block(b) {
+                cabac_rows.extend(rows);
+            }
+        }
+        tus += b.tx_n.max(0) as usize;
+    }
+    let block_syntax_rows = syntax_rows.len();
+    if let Some(m) = file.catb.meta.frames_meta.get(decode_idx) {
+        for sh in &m.slice_headers {
+            for (name, _value, bits) in &sh.syntax {
+                syntax_rows.push((format!("(slice) {name}"), *bits));
+            }
+        }
+    }
+    let total_bits = frame.data_bits.unwrap_or_else(|| {
+        blocks.iter().map(|b| b.bits.max(0)).sum()
+    });
+    let syntax = aggregate_syntax_rows(syntax_rows.iter().map(|(n, b)| (n.as_str(), *b)));
+    let cabac_bins = cabac_rows.len();
+    let cabac = aggregate_cabac_rows(&cabac_rows);
+    let mv_points = collect_mv_points(file, &blocks);
+    Some(FrameStatsData {
+        blocks: blocks.len(),
+        tus,
+        syntax_rows: block_syntax_rows,
+        cabac_bins,
+        total_bits,
+        syntax,
+        cabac,
+        mv_points,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // M1: L1 rasterization — variable CU rects → fixed-cell grid
 // ---------------------------------------------------------------------------
 
@@ -696,6 +950,12 @@ pub struct BitstreamGrid {
     pub mv_mag: Vec<f32>,
     /// Majority (largest-area) mode class per cell.
     pub mode: Vec<ModeClass>,
+    /// Coefficient energy per covered pixel (M-B): each block's TX
+    /// `coeff_abs_sum` total distributed area-proportionally, like `bpp`.
+    /// All-zero when no TX aggregate was supplied (see [`BlockTxAgg`]).
+    pub coeff_energy: Vec<f32>,
+    /// Nonzero-coefficient density per covered pixel (M-B), same rule.
+    pub nz_density: Vec<f32>,
     /// Covered area / full cell area ∈ [0, 1].
     pub coverage: Vec<f32>,
 }
@@ -726,8 +986,22 @@ pub fn use_lod(zoom: f32) -> bool {
 }
 
 /// Rasterize variable-size blocks into a `cell`-px grid over a
-/// `width`×`height` stream, area-weighting every value.
+/// `width`×`height` stream, area-weighting every value. No TX aggregate:
+/// `coeff_energy` / `nz_density` come out all-zero.
 pub fn rasterize_blocks(blocks: &[BsBlock], width: u32, height: u32, cell: u32) -> BitstreamGrid {
+    rasterize_blocks_tx(blocks, None, width, height, cell)
+}
+
+/// Like [`rasterize_blocks`] but with an optional per-block TX aggregate
+/// (parallel to `blocks`, see [`aggregate_block_tx`]) feeding the
+/// `coeff_energy` / `nz_density` cells (M-B).
+pub fn rasterize_blocks_tx(
+    blocks: &[BsBlock],
+    tx: Option<&[BlockTxAgg]>,
+    width: u32,
+    height: u32,
+    cell: u32,
+) -> BitstreamGrid {
     let cell = cell.max(1);
     let cols = width.div_ceil(cell);
     let rows = height.div_ceil(cell);
@@ -741,6 +1015,8 @@ pub fn rasterize_blocks(blocks: &[BsBlock], width: u32, height: u32, cell: u32) 
             bpp: Vec::new(),
             mv_mag: Vec::new(),
             mode: Vec::new(),
+            coeff_energy: Vec::new(),
+            nz_density: Vec::new(),
             coverage: Vec::new(),
         };
     }
@@ -749,15 +1025,20 @@ pub fn rasterize_blocks(blocks: &[BsBlock], width: u32, height: u32, cell: u32) 
     let mut qp_acc = vec![0.0_f64; n];
     let mut bits_acc = vec![0.0_f64; n];
     let mut mv_acc = vec![0.0_f64; n];
+    let mut coeff_acc = vec![0.0_f64; n];
+    let mut nz_acc = vec![0.0_f64; n];
     // Per-cell covered area per mode class (5 classes).
     let mut mode_area = vec![[0.0_f32; 5]; n];
 
-    for b in blocks {
+    for (bi, b) in blocks.iter().enumerate() {
         if b.w == 0 || b.h == 0 {
             continue;
         }
         let block_area = (b.w as f64) * (b.h as f64);
         let bits_per_px = b.bits.max(0) as f64 / block_area;
+        let agg = tx.and_then(|t| t.get(bi)).copied().unwrap_or_default();
+        let coeff_per_px = agg.abs_sum.max(0.0) / block_area;
+        let nz_per_px = agg.nonzero.max(0.0) / block_area;
         // Quarter-pel L1 norm / 4 → pixels (02 §1), so every consumer —
         // heatmap legend, class table, scatter, CSV — shares one unit.
         let mv_mag = b
@@ -792,6 +1073,8 @@ pub fn rasterize_blocks(blocks: &[BsBlock], width: u32, height: u32, cell: u32) 
                 qp_acc[idx] += b.qp as f64 * a;
                 bits_acc[idx] += bits_per_px * a;
                 mv_acc[idx] += mv_mag * a;
+                coeff_acc[idx] += coeff_per_px * a;
+                nz_acc[idx] += nz_per_px * a;
                 mode_area[idx][mode.index()] += a as f32;
             }
         }
@@ -801,6 +1084,8 @@ pub fn rasterize_blocks(blocks: &[BsBlock], width: u32, height: u32, cell: u32) 
     let mut qp = vec![0.0_f32; n];
     let mut bpp = vec![0.0_f32; n];
     let mut mv = vec![0.0_f32; n];
+    let mut coeff_energy = vec![0.0_f32; n];
+    let mut nz_density = vec![0.0_f32; n];
     let mut mode = vec![ModeClass::Unknown; n];
     let mut coverage = vec![0.0_f32; n];
     for i in 0..n {
@@ -808,6 +1093,8 @@ pub fn rasterize_blocks(blocks: &[BsBlock], width: u32, height: u32, cell: u32) 
             qp[i] = (qp_acc[i] / area[i]) as f32;
             bpp[i] = (bits_acc[i] / area[i]) as f32;
             mv[i] = (mv_acc[i] / area[i]) as f32;
+            coeff_energy[i] = (coeff_acc[i] / area[i]) as f32;
+            nz_density[i] = (nz_acc[i] / area[i]) as f32;
             coverage[i] = (area[i] / full_cell) as f32;
             let best = mode_area[i]
                 .iter()
@@ -827,6 +1114,8 @@ pub fn rasterize_blocks(blocks: &[BsBlock], width: u32, height: u32, cell: u32) 
         bpp,
         mv_mag: mv,
         mode,
+        coeff_energy,
+        nz_density,
         coverage,
     }
 }

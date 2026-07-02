@@ -2026,8 +2026,18 @@ impl VideoViewerApp {
                 let Ok(blocks) = file.catb.blocks_for_frame(decode_idx) else {
                     continue;
                 };
-                let l1 =
-                    crate::analysis::bitstream_stats::rasterize_blocks(&blocks, sw, sh, 8);
+                // M-B: the CoeffEnergy Y metric needs the per-block TX
+                // aggregate; other metrics skip the extra TX pass.
+                let tx_agg = (req.y == corr::YMetric::CoeffEnergy).then(|| {
+                    crate::analysis::bitstream_stats::aggregate_block_tx(&file, &blocks)
+                });
+                let l1 = crate::analysis::bitstream_stats::rasterize_blocks_tx(
+                    &blocks,
+                    tx_agg.as_deref(),
+                    sw,
+                    sh,
+                    8,
+                );
                 let bs_g = corr::aggregate_bitstream_to_g(&l1, sw, sh, req.g);
                 frames.push((i, corr::align(&xg, &bs_g, req.y)));
                 {

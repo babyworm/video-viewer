@@ -8,7 +8,8 @@
 use std::io::Write;
 
 use video_viewer::core::catb::{
-    BLOCK_RECORD_SIZE, FRAME_RECORD_SIZE, REF_RECORD_SIZE, SYNTAX_RECORD_SIZE,
+    BLOCK_RECORD_SIZE, CABAC_RECORD_SIZE, FRAME_RECORD_SIZE, REF_RECORD_SIZE,
+    SYNTAX_RECORD_SIZE, TX_RECORD_SIZE,
 };
 
 /// Encode the string table (§3): u32 count + count × (u32 len, utf8 bytes).
@@ -176,6 +177,90 @@ pub fn syntax_record(name_id: i32, value_id: i32, coding_id: i32, bit_offset: i6
     out
 }
 
+/// Named parameters for a synthetic TRANSFORM record (§9). Defaults are
+/// all-zero (no presence bits set).
+#[derive(Default, Clone)]
+pub struct TxSpec {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub depth: i32,
+    pub type_id: i32,
+    pub cbf: u32,
+    pub bits: i64,
+    pub bit_offset: i64,
+    pub nonzero_coeff_count: i32,
+    pub last_sig_coeff_x: i32,
+    pub last_sig_coeff_y: i32,
+    pub coeff_abs_sum: i64,
+    pub coeff_flags: u32,
+    pub coeff_count: i32,
+    pub coeff_group_width: i32,
+    pub coeff_group_height: i32,
+    pub coeff_group_count: i32,
+    pub coeff_component_id: i32,
+    pub coeff_level_kind_id: i32,
+    pub coeff_off: u64,
+}
+
+/// Encode one 104-byte TRANSFORM record (§9): `<6iIqq4iqI6iQ` with the
+/// explicit `_pad` i32 written as 0.
+pub fn tx_record(t: &TxSpec) -> Vec<u8> {
+    let mut out = Vec::with_capacity(TX_RECORD_SIZE);
+    for v in [t.x, t.y, t.w, t.h, t.depth, t.type_id] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&t.cbf.to_le_bytes());
+    out.extend_from_slice(&t.bits.to_le_bytes());
+    out.extend_from_slice(&t.bit_offset.to_le_bytes());
+    for v in [
+        t.nonzero_coeff_count,
+        t.last_sig_coeff_x,
+        t.last_sig_coeff_y,
+        0, // _pad (§9: always 0)
+    ] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&t.coeff_abs_sum.to_le_bytes());
+    out.extend_from_slice(&t.coeff_flags.to_le_bytes());
+    for v in [
+        t.coeff_count,
+        t.coeff_group_width,
+        t.coeff_group_height,
+        t.coeff_group_count,
+        t.coeff_component_id,
+        t.coeff_level_kind_id,
+    ] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&t.coeff_off.to_le_bytes());
+    assert_eq!(out.len(), TX_RECORD_SIZE);
+    out
+}
+
+/// Encode one 28-byte CABAC record (§8): name(string id), ctx, bin,
+/// bit_offset, bits.
+pub fn cabac_record(name_id: i32, ctx: i32, bin: i32, bit_offset: i64, bits: i64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(CABAC_RECORD_SIZE);
+    for v in [name_id, ctx, bin] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&bit_offset.to_le_bytes());
+    out.extend_from_slice(&bits.to_le_bytes());
+    assert_eq!(out.len(), CABAC_RECORD_SIZE);
+    out
+}
+
+/// Encode the coeffs section (§11): a flat little-endian i32 array.
+pub fn encode_coeffs(values: &[i32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() * 4);
+    for v in values {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
 /// Assemble a full `.catb` v4 file: 176-byte header + contiguous sections in
 /// directory order starting at offset 176 (§2). Empty sections get the
 /// running offset with size 0, like the reference writer.
@@ -203,17 +288,39 @@ pub fn build_catb_with_syntax(
     refs: &[u8],
     frame_aux: &[u8],
 ) -> Vec<u8> {
-    let sections: [&[u8]; 10] = [
+    build_catb_full(
+        frame_count,
         strings,
         meta,
         frames,
         blocks,
         syntax,
-        &[], // cabac
-        &[], // transforms
+        &[],
+        &[],
         refs,
-        &[], // coeffs
+        &[],
         frame_aux,
+    )
+}
+
+/// Like [`build_catb`] but with every section supplied (§2 directory
+/// order): M-B tests fill CABAC / TRANSFORMS / coeffs too.
+#[allow(clippy::too_many_arguments)]
+pub fn build_catb_full(
+    frame_count: u32,
+    strings: &[u8],
+    meta: &[u8],
+    frames: &[u8],
+    blocks: &[u8],
+    syntax: &[u8],
+    cabac: &[u8],
+    transforms: &[u8],
+    refs: &[u8],
+    coeffs: &[u8],
+    frame_aux: &[u8],
+) -> Vec<u8> {
+    let sections: [&[u8]; 10] = [
+        strings, meta, frames, blocks, syntax, cabac, transforms, refs, coeffs, frame_aux,
     ];
     let mut out = Vec::new();
     out.extend_from_slice(b"CATB0001");

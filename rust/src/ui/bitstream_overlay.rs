@@ -16,13 +16,12 @@ use std::sync::Arc;
 use eframe::egui;
 
 use crate::analysis::bitstream_stats::{
-    extract_intra_modes, intra_grid_dim, intra_subblock_pos, lod_cell_size, rasterize_blocks,
-    use_lod, BitstreamFile,
-    BitstreamGrid, IntraDir, ModeClass,
+    aggregate_block_tx, extract_intra_modes, intra_grid_dim, intra_subblock_pos, lod_cell_size,
+    rasterize_blocks_tx, use_lod, BitstreamFile, BitstreamGrid, BlockTxAgg, IntraDir,
 };
-use crate::core::catb::{BsBlock, BsRef};
+use crate::core::catb::{BsBlock, BsRef, TxRow};
 use crate::ui::bitstream_window::{
-    block_mv_px, fill_color, frame_fill_stats, FillMode, FrameFillStats, ViewConfig,
+    fill_color, frame_fill_stats, FillMode, FillSample, FrameFillStats, ViewConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -123,6 +122,10 @@ const PU_OUTLINE: egui::Color32 = egui::Color32::from_rgba_premultiplied(210, 10
 const MV_L0: egui::Color32 = egui::Color32::from_rgb(255, 150, 20);
 const MV_L1: egui::Color32 = egui::Color32::from_rgb(170, 90, 230);
 const INTRA_LINE: egui::Color32 = egui::Color32::from_rgb(90, 230, 150);
+/// TU outline base colour (M-B): yellow, brightness scaled by depth.
+const TU_OUTLINE: egui::Color32 = egui::Color32::from_rgb(235, 210, 60);
+/// transform_skip TU shading (M-B).
+const TU_SKIP_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(60, 55, 15, 60);
 
 // ---------------------------------------------------------------------------
 // Part layer — CU outlines on every block + per-PU boundaries where REF
@@ -291,6 +294,81 @@ pub fn draw_mv_layer(
 }
 
 // ---------------------------------------------------------------------------
+// TU layer (M-B) — transform-unit rects: yellow outline (brightness by
+// depth), dashed when cbf == 0, transform_skip shaded, Coeffs:n labels at
+// zoom ≥ 2x. VQA Transform mode analogue.
+// ---------------------------------------------------------------------------
+
+/// TU outline stroke for a transform-tree depth: deeper TUs draw brighter
+/// (smaller rects need more contrast to read).
+pub fn tu_stroke(depth: i32) -> egui::Stroke {
+    let t = (depth.clamp(0, 3) as f32) / 3.0;
+    let scale = 0.55 + 0.45 * t;
+    let c = egui::Color32::from_rgb(
+        (TU_OUTLINE.r() as f32 * scale) as u8,
+        (TU_OUTLINE.g() as f32 * scale) as u8,
+        (TU_OUTLINE.b() as f32 * scale) as u8,
+    );
+    egui::Stroke::new(1.0, c)
+}
+
+/// True when the resolved TX type label denotes a transform-skip TU.
+pub fn is_transform_skip(tx_type: &str) -> bool {
+    tx_type.to_ascii_lowercase().contains("skip")
+}
+
+/// `tx[i]` is parallel to `blocks[i]` (empty when the block has no TX
+/// rows). Skipped entirely below [`LAYER_MIN_ZOOM`] (LOD rule).
+pub fn draw_tu_layer(painter: &egui::Painter, geom: &LayerGeom, tx: &[Vec<TxRow>]) {
+    if geom.zoom() < LAYER_MIN_ZOOM {
+        return;
+    }
+    let labels = geom.zoom() >= 2.0;
+    for rows in tx {
+        for t in rows {
+            if t.w <= 0 || t.h <= 0 {
+                continue;
+            }
+            let rect = geom.rect(t.x as f32, t.y as f32, t.w as f32, t.h as f32);
+            if !rect.intersects(geom.clip) || rect.width() < 3.0 {
+                continue;
+            }
+            if is_transform_skip(&t.tx_type) {
+                painter.rect_filled(rect, 0.0, TU_SKIP_FILL);
+            }
+            let stroke = tu_stroke(t.depth);
+            if t.any_cbf() {
+                painter.rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
+            } else {
+                // cbf = 0 (no coded residual): dashed outline.
+                let p = [
+                    rect.left_top(),
+                    rect.right_top(),
+                    rect.right_bottom(),
+                    rect.left_bottom(),
+                    rect.left_top(),
+                ];
+                for w in p.windows(2) {
+                    painter.add(egui::Shape::dashed_line(w, stroke, 3.0, 3.0));
+                }
+            }
+            if labels && rect.width() >= 34.0 {
+                if let Some(nz) = t.nonzero_coeff_count {
+                    let size = (rect.height() * 0.25).clamp(7.0, 11.0);
+                    painter.text(
+                        rect.left_top() + egui::vec2(2.0, 2.0),
+                        egui::Align2::LEFT_TOP,
+                        format!("Coeffs:{nz}"),
+                        egui::FontId::monospace(size),
+                        stroke.color,
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Intra layer — direction lines through (sub)block centres, P/DC badges.
 // ---------------------------------------------------------------------------
 
@@ -388,6 +466,22 @@ pub fn build_intra(file: &BitstreamFile, blocks: &[BsBlock]) -> Vec<Vec<IntraDir
         .collect()
 }
 
+/// Parse every block's TX rows (M-B TU layer; empty vec on blocks without
+/// any / on parse errors — a malformed sub-record range must not kill the
+/// whole layer).
+pub fn build_tx(file: &BitstreamFile, blocks: &[BsBlock]) -> Vec<Vec<TxRow>> {
+    blocks
+        .iter()
+        .map(|b| {
+            if b.tx_n > 0 {
+                file.catb.tx_for_block(b).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Main-canvas overlay (§D) — mirrors the window's ViewConfig
 // ---------------------------------------------------------------------------
@@ -403,10 +497,14 @@ pub fn build_intra(file: &BitstreamFile, blocks: &[BsBlock]) -> Vec<Vec<IntraDir
 pub struct OverlayCache {
     key: Option<(usize, usize)>,
     blocks: Option<Arc<Vec<BsBlock>>>,
+    /// Per-block TX aggregate (M-B fills), parallel to `blocks`.
+    tx_agg: Vec<BlockTxAgg>,
     stats: FrameFillStats,
     grid_lod: Option<BitstreamGrid>,
     refs: Option<Vec<Vec<BsRef>>>,
     intra: Option<Vec<Vec<IntraDir>>>,
+    /// Per-block TX rows (M-B TU layer), lazy like `refs` / `intra`.
+    tx: Option<Vec<Vec<TxRow>>>,
 }
 
 /// Everything [`draw_bitstream_overlay`] needs from the app.
@@ -441,9 +539,11 @@ pub fn draw_bitstream_overlay(p: &BitstreamOverlayParams, cache: &mut OverlayCac
         let Ok(blocks) = p.file.blocks_display(p.display_idx) else {
             return;
         };
-        cache.stats = frame_fill_stats(&blocks);
-        cache.grid_lod = Some(rasterize_blocks(
+        cache.tx_agg = aggregate_block_tx(p.file, &blocks);
+        cache.stats = frame_fill_stats(&blocks, Some(&cache.tx_agg));
+        cache.grid_lod = Some(rasterize_blocks_tx(
             &blocks,
+            Some(&cache.tx_agg),
             sw,
             sh,
             lod_cell_size(&p.file.catb.meta.codec),
@@ -460,6 +560,9 @@ pub fn draw_bitstream_overlay(p: &BitstreamOverlayParams, cache: &mut OverlayCac
     if p.view.intra && cache.intra.is_none() {
         cache.intra = Some(build_intra(p.file, &blocks));
     }
+    if p.view.tu && cache.tx.is_none() {
+        cache.tx = Some(build_tx(p.file, &blocks));
+    }
 
     // Fill layer — same LOD rule as the window canvas.
     let lod_mode = use_lod(geom.zoom());
@@ -474,10 +577,7 @@ pub fn draw_bitstream_overlay(p: &BitstreamOverlayParams, cache: &mut OverlayCac
                     }
                     if let Some(color) = fill_color(
                         p.view.fill,
-                        g.qp[i],
-                        g.bpp[i],
-                        g.mode[i],
-                        g.mv_mag[i],
+                        &FillSample::from_grid(g, i),
                         &cache.stats,
                         p.view.opacity,
                     ) {
@@ -489,14 +589,10 @@ pub fn draw_bitstream_overlay(p: &BitstreamOverlayParams, cache: &mut OverlayCac
                 }
             }
         } else if !lod_mode {
-            for b in blocks.iter() {
-                let area = (b.w as f32 * b.h as f32).max(1.0);
+            for (bi, b) in blocks.iter().enumerate() {
                 if let Some(color) = fill_color(
                     p.view.fill,
-                    b.qp as f32,
-                    b.bits.max(0) as f32 / area,
-                    ModeClass::from_label(&b.prediction_mode),
-                    block_mv_px(b),
+                    &FillSample::from_block(b, cache.tx_agg.get(bi)),
                     &cache.stats,
                     p.view.opacity,
                 ) {
@@ -539,10 +635,15 @@ pub fn draw_bitstream_overlay(p: &BitstreamOverlayParams, cache: &mut OverlayCac
         }
     }
 
-    // M4 layers — the exact renderers the window canvas uses.
+    // M4/M-B layers — the exact renderers the window canvas uses.
     if p.view.part {
         if let Some(refs) = cache.refs.as_ref() {
             draw_part_layer(p.painter, &geom, &blocks, refs);
+        }
+    }
+    if p.view.tu {
+        if let Some(tx) = cache.tx.as_ref() {
+            draw_tu_layer(p.painter, &geom, tx);
         }
     }
     if p.view.mv {

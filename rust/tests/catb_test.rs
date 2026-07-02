@@ -10,15 +10,18 @@ use video_viewer::analysis::bitstream_stats::{
     extract_intra_modes, intra_grid_dim, intra_subblock_pos, BitstreamFile, ResolutionSource,
 };
 use video_viewer::core::catb::{
-    CatbFile, MV_HAS_LIST_INDEX, MV_HAS_LONG_TERM, MV_HAS_MV, MV_HAS_MVD, MV_HAS_MVP,
-    MV_HAS_POC, MV_LONG_TERM_VALUE, REF_HAS_MV, REF_HAS_MVD, REF_HAS_PU_PART,
+    CatbFile, COEFF_DETAIL_DROPPED, COEFF_HAS_ABS_SUM, COEFF_HAS_DETAIL, COEFF_HAS_LAST_SIG_X,
+    COEFF_HAS_LAST_SIG_Y, COEFF_HAS_NONZERO, MV_HAS_LIST_INDEX, MV_HAS_LONG_TERM, MV_HAS_MV,
+    MV_HAS_MVD, MV_HAS_MVP, MV_HAS_POC, MV_LONG_TERM_VALUE, REF_HAS_MV, REF_HAS_MVD,
+    REF_HAS_PU_PART,
 };
 
 // Shared synthetic fixture writer (spec §2–§13) — tests/common/mod.rs.
 mod common;
 use common::{
-    block_record, build_catb, build_catb_with_syntax, encode_strings, frame_record, ref_record,
-    syntax_record, write_temp, BlockSpec, RefSpec,
+    block_record, build_catb, build_catb_full, build_catb_with_syntax, cabac_record,
+    encode_coeffs, encode_strings, frame_record, ref_record, syntax_record, tx_record,
+    write_temp, BlockSpec, RefSpec, TxSpec,
 };
 
 /// The Appendix A minimal file: 1 IDR frame, 1 intra 64×64 block. 713 bytes.
@@ -308,6 +311,202 @@ fn test_catb_syntax_for_block_roundtrip_and_guard() {
     assert!(catb.syntax_for_block(&hostile).expect("zero rows ok").is_empty());
 }
 
+/// TRANSFORM + coeffs + CABAC round-trip (M-B): presence-bit variants, the
+/// §11 indirect coefficient rule, and per-block CABAC rows.
+#[test]
+fn test_catb_tx_coeffs_cabac_roundtrip() {
+    let strings = encode_strings(&[
+        "",
+        "64x64",
+        "Intra",
+        "IDR",
+        "DCT-II",
+        "Y",
+        "decoded_transform_coeff_level",
+        "split_cu_flag",
+        "transform_skip",
+    ]);
+    let meta = br#"{"schema_version":1,"decoder":{"codec":"hevc"},"parameter_sets":[]}"#;
+    let frame = frame_record(0, 0, 3, 1, 0, 0, 0, 100, 20, 80, 0, 1, 0, 0);
+    let block = block_record(&BlockSpec {
+        w: 64,
+        h: 64,
+        qp: 32,
+        partition_id: 1,
+        prediction_mode_id: 2,
+        tx_off: 0,
+        tx_n: 3,
+        cabac_off: 0,
+        cabac_n: 2,
+        ..Default::default()
+    });
+    // TU 0: everything present (hevc fixture pattern, flags 61).
+    let full = TxSpec {
+        w: 16,
+        h: 16,
+        depth: 1,
+        type_id: 4,
+        cbf: 0b101, // luma + cr
+        bits: 96,
+        bit_offset: 28,
+        nonzero_coeff_count: 3,
+        last_sig_coeff_x: 5,
+        last_sig_coeff_y: 0,
+        coeff_abs_sum: 42,
+        coeff_flags: COEFF_HAS_DETAIL
+            | COEFF_HAS_NONZERO
+            | COEFF_HAS_LAST_SIG_X
+            | COEFF_HAS_LAST_SIG_Y
+            | COEFF_HAS_ABS_SUM,
+        coeff_count: 4,
+        coeff_group_width: 1,
+        coeff_group_height: 1,
+        coeff_group_count: 1,
+        coeff_component_id: 5,
+        coeff_level_kind_id: 6,
+        coeff_off: 2, // levels start after 2 padding elements
+        ..Default::default()
+    };
+    // TU 1: AVC-like — only nonzero present; value fields written non-zero
+    // with clear bits MUST come back absent (§9.1).
+    let avc_like = TxSpec {
+        x: 16,
+        w: 4,
+        h: 4,
+        type_id: 8,
+        cbf: 0,
+        coeff_flags: COEFF_HAS_NONZERO,
+        nonzero_coeff_count: 0,
+        last_sig_coeff_x: 7,
+        last_sig_coeff_y: 7,
+        coeff_abs_sum: 99,
+        coeff_count: 77, // meaningless without HAS_DETAIL
+        ..Default::default()
+    };
+    // TU 2: detail dropped alone (capture level below full, §11).
+    let dropped = TxSpec {
+        y: 16,
+        w: 8,
+        h: 8,
+        type_id: 4,
+        cbf: 1,
+        coeff_flags: COEFF_DETAIL_DROPPED,
+        ..Default::default()
+    };
+    let mut txs = tx_record(&full);
+    txs.extend(tx_record(&avc_like));
+    txs.extend(tx_record(&dropped));
+    // coeffs: 2 pad + levels[4] + scan[4] + group_flags[1].
+    let coeffs = encode_coeffs(&[7, 7, -203, 0, 5, -1, 0, -1, 3, 2, 2]);
+    let mut cabac = cabac_record(7, 2, 1, 28, 0);
+    cabac.extend(cabac_record(7, 2, 0, 29, 1));
+    let bytes = build_catb_full(
+        1, &strings, meta, &frame, &block, &[], &cabac, &txs, &[], &coeffs, &[],
+    );
+    let f = write_temp(&bytes);
+    let catb = CatbFile::open(f.path()).expect("open");
+    let b = &catb.blocks_for_frame(0).expect("blocks")[0];
+
+    let tx = catb.tx_for_block(b).expect("tx rows");
+    assert_eq!(tx.len(), 3);
+    let t0 = &tx[0];
+    assert_eq!((t0.x, t0.y, t0.w, t0.h, t0.depth), (0, 0, 16, 16, 1));
+    assert_eq!(t0.tx_type, "DCT-II");
+    assert!(t0.cbf_luma() && !t0.cbf_cb() && t0.cbf_cr() && t0.any_cbf());
+    assert_eq!((t0.bits, t0.bit_offset), (96, 28));
+    assert_eq!(t0.nonzero_coeff_count, Some(3));
+    assert_eq!(t0.last_sig_coeff_x, Some(5));
+    assert_eq!(t0.last_sig_coeff_y, Some(0));
+    assert_eq!(t0.coeff_abs_sum, Some(42));
+    assert!(t0.has_detail() && !t0.detail_dropped());
+    assert_eq!(t0.coeff_component, "Y");
+    assert_eq!(t0.coeff_level_kind, "decoded_transform_coeff_level");
+    let detail = catb.coeffs_for_tx(t0).expect("coeffs").expect("detail");
+    assert_eq!(detail.levels, vec![-203, 0, 5, -1]);
+    assert_eq!(detail.scan, vec![0, -1, 3, 2]);
+    assert_eq!(detail.group_flags, vec![2]);
+
+    let t1 = &tx[1];
+    assert_eq!(t1.tx_type, "transform_skip");
+    assert!(!t1.any_cbf());
+    assert_eq!(t1.nonzero_coeff_count, Some(0), "presence bit set, value 0");
+    assert_eq!(t1.last_sig_coeff_x, None, "clear bit → absent, not 7");
+    assert_eq!(t1.last_sig_coeff_y, None);
+    assert_eq!(t1.coeff_abs_sum, None);
+    assert!(!t1.has_detail());
+    assert_eq!(t1.coeff_component, "", "meaningless without detail");
+    assert!(catb.coeffs_for_tx(t1).expect("no detail ok").is_none());
+
+    let t2 = &tx[2];
+    assert!(!t2.has_detail() && t2.detail_dropped());
+    assert!(catb.coeffs_for_tx(t2).expect("dropped ok").is_none());
+
+    // Aggregate (M-B fills): only present scalars contribute.
+    assert_eq!(catb.tx_aggregate_for_block(b).expect("agg"), (42, 3));
+
+    // CABAC rows.
+    let bins = catb.cabac_for_block(b).expect("cabac rows");
+    assert_eq!(bins.len(), 2);
+    assert_eq!(
+        (bins[0].name.as_str(), bins[0].ctx, bins[0].bin, bins[0].bit_offset, bins[0].bits),
+        ("split_cu_flag", 2, 1, 28, 0)
+    );
+    assert_eq!((bins[1].bin, bins[1].bits), (0, 1));
+}
+
+/// OOM guards (0.12.1 F1 pattern): hostile tx_n / cabac_n / coeff spans
+/// must error before allocating.
+#[test]
+fn test_catb_tx_cabac_coeff_oom_guards() {
+    let strings = encode_strings(&["", "IDR"]);
+    let meta = br#"{"schema_version":1,"decoder":{"codec":"hevc"},"parameter_sets":[]}"#;
+    let frame = frame_record(0, 0, 1, 1, 0, 0, 0, 100, 20, 80, 0, 1, 0, 0);
+    let block = block_record(&BlockSpec {
+        w: 64,
+        h: 64,
+        tx_n: 1,
+        ..Default::default()
+    });
+    let txs = tx_record(&TxSpec {
+        w: 8,
+        h: 8,
+        coeff_flags: COEFF_HAS_DETAIL,
+        coeff_count: i32::MAX, // coeffs section cannot back this
+        coeff_group_count: 1,
+        ..Default::default()
+    });
+    let coeffs = encode_coeffs(&[1, 2, 3]);
+    let bytes = build_catb_full(
+        1, &strings, meta, &frame, &block, &[], &[], &txs, &[], &coeffs, &[],
+    );
+    let f = write_temp(&bytes);
+    let catb = CatbFile::open(f.path()).expect("open");
+    let b = catb.blocks_for_frame(0).expect("blocks")[0].clone();
+
+    // Hostile tx_n larger than the TRANSFORMS section.
+    let mut hostile = b.clone();
+    hostile.tx_n = i32::MAX;
+    let err = catb.tx_for_block(&hostile).expect_err("must reject tx_n");
+    assert!(err.contains("TRANSFORMS section"), "unexpected: {err}");
+    let err = catb
+        .tx_aggregate_for_block(&hostile)
+        .expect_err("aggregate must reject tx_n too");
+    assert!(err.contains("TRANSFORMS section"), "unexpected: {err}");
+
+    // Hostile cabac_n against an empty CABAC section.
+    hostile.tx_n = 0;
+    hostile.cabac_n = i32::MAX;
+    let err = catb.cabac_for_block(&hostile).expect_err("must reject cabac_n");
+    assert!(err.contains("CABAC section"), "unexpected: {err}");
+    hostile.cabac_n = 0;
+    assert!(catb.cabac_for_block(&hostile).expect("zero ok").is_empty());
+
+    // Hostile coeff_count: parses as a TX row but the coeffs lookup errors.
+    let tx = catb.tx_for_block(&b).expect("tx rows");
+    let err = catb.coeffs_for_tx(&tx[0]).expect_err("must reject span");
+    assert!(err.contains("coeffs section"), "unexpected: {err}");
+}
+
 // ===========================================================================
 // Error cases
 // ===========================================================================
@@ -494,6 +693,88 @@ fn test_catb_differential_blocks() {
                 // Reference summary label ("" = absent).
                 let oref = ob["reference"].as_str().unwrap_or("");
                 assert_eq!(b.reference.as_deref().unwrap_or(""), oref, "{ctx} reference");
+            }
+        }
+    }
+}
+
+/// Differential test — transforms (M-B): every block's parsed TX row count
+/// must equal the oracle's per-block `transform_count`, every TX row must
+/// parse (with detail resolvable when flagged), and the per-frame sums must
+/// match the oracle frames' `transform_count`.
+#[test]
+fn test_catb_differential_transform_counts() {
+    for &(dir, name, _) in FIXTURES {
+        let catb = open_fixture(dir, name);
+        let oracle = load_oracle(dir, name, "blocks");
+        let oracle = oracle.as_array().expect("oracle blocks array");
+        let mut per_frame: Vec<Vec<&serde_json::Value>> = vec![Vec::new(); catb.frames.len()];
+        for ob in oracle {
+            let fi = ob["frame"].as_u64().expect("block frame idx") as usize;
+            per_frame[fi].push(ob);
+        }
+        for (fi, oracle_blocks) in per_frame.iter().enumerate() {
+            let blocks = catb.blocks_for_frame(fi).expect("blocks");
+            for (bi, (b, ob)) in blocks.iter().zip(oracle_blocks.iter()).enumerate() {
+                let ctx = format!("{dir} f{fi} b{bi}");
+                let expected = ob["transform_count"].as_u64().unwrap_or(0);
+                let tx = catb.tx_for_block(b).unwrap_or_else(|e| panic!("{ctx}: {e}"));
+                assert_eq!(tx.len() as u64, expected, "{ctx} transform_count");
+                for (ti, t) in tx.iter().enumerate() {
+                    if t.has_detail() {
+                        let d = catb
+                            .coeffs_for_tx(t)
+                            .unwrap_or_else(|e| panic!("{ctx} tx{ti}: {e}"))
+                            .expect("detail flagged → present");
+                        assert_eq!(d.levels.len(), t.coeff_count.max(0) as usize);
+                        assert_eq!(d.scan.len(), d.levels.len());
+                        assert_eq!(d.group_flags.len(), t.coeff_group_count.max(0) as usize);
+                        // §9.1: HAS_DETAIL means all three arrays were
+                        // carried; the fixture nonzero count must agree
+                        // with the levels array.
+                        if let Some(nz) = t.nonzero_coeff_count {
+                            let actual = d.levels.iter().filter(|&&v| v != 0).count();
+                            assert_eq!(actual as i32, nz, "{ctx} tx{ti} nonzero");
+                        }
+                        if let Some(sum) = t.coeff_abs_sum {
+                            let actual: i64 =
+                                d.levels.iter().map(|&v| (v as i64).abs()).sum();
+                            assert_eq!(actual, sum, "{ctx} tx{ti} abs_sum");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Differential test — per-frame row counts (M-B Stats tab base): the sums
+/// of block syntax_n / cabac_n / tx_n must equal the oracle frames'
+/// syntax_count / cabac_count / transform_count.
+#[test]
+fn test_catb_differential_frame_row_counts() {
+    for &(dir, name, _) in FIXTURES {
+        let catb = open_fixture(dir, name);
+        let oracle = load_oracle(dir, name, "frames");
+        let oracle = oracle.as_array().expect("oracle frames array");
+        for of in oracle {
+            let fi = of["decode_order"].as_u64().unwrap() as usize;
+            let blocks = catb.blocks_for_frame(fi).expect("blocks");
+            let ctx = format!("{dir} decode#{fi}");
+            let syn: i64 = blocks.iter().map(|b| b.syntax_n.max(0) as i64).sum();
+            let cab: i64 = blocks.iter().map(|b| b.cabac_n.max(0) as i64).sum();
+            let txn: i64 = blocks.iter().map(|b| b.tx_n.max(0) as i64).sum();
+            assert_eq!(syn, of["syntax_count"].as_i64().unwrap(), "{ctx} syntax_count");
+            assert_eq!(cab, of["cabac_count"].as_i64().unwrap(), "{ctx} cabac_count");
+            assert_eq!(
+                txn,
+                of["transform_count"].as_i64().unwrap(),
+                "{ctx} transform_count"
+            );
+            // Every claimed CABAC row must actually parse.
+            for b in blocks.iter() {
+                let rows = catb.cabac_for_block(b).expect("cabac rows");
+                assert_eq!(rows.len(), b.cabac_n.max(0) as usize);
             }
         }
     }
@@ -718,6 +999,44 @@ fn test_catb_frame_summary_and_block_cache() {
     assert!(std::sync::Arc::ptr_eq(&a, &b));
     assert_eq!(a.len(), 16);
     assert!(bs.blocks_display(99).is_err());
+}
+
+/// M-B Stats tab data over a real fixture: summary counts match the block
+/// sums (oracle-verified elsewhere), the aggregate includes "(slice)" rows,
+/// and the B-frame MV scatter carries both lists.
+#[test]
+fn test_catb_frame_stats_bslice() {
+    let bs = open_bitstream("hevc_bslice", "hevc_bslice");
+    // Display frame 1 = decode 2 (B, POC 1): inter frame with L0+L1.
+    let stats = video_viewer::analysis::bitstream_stats::compute_frame_stats(&bs, 1)
+        .expect("frame stats");
+    let blocks = bs.blocks_display(1).expect("blocks");
+    assert_eq!(stats.blocks, blocks.len());
+    let syn: usize = blocks.iter().map(|b| b.syntax_n.max(0) as usize).sum();
+    let cab: usize = blocks.iter().map(|b| b.cabac_n.max(0) as usize).sum();
+    let tus: usize = blocks.iter().map(|b| b.tx_n.max(0) as usize).sum();
+    assert_eq!(stats.syntax_rows, syn);
+    assert_eq!(stats.cabac_bins, cab);
+    assert_eq!(stats.tus, tus);
+    // Aggregate count sum equals block rows + slice-header rows.
+    let agg_count: usize = stats.syntax.iter().map(|r| r.count).sum();
+    assert!(agg_count >= syn, "aggregate covers all block rows");
+    assert!(
+        stats.syntax.iter().any(|r| r.name.starts_with("(slice) ")),
+        "slice-header rows folded in with the (slice) prefix"
+    );
+    // Bits sorted descending.
+    assert!(stats.syntax.windows(2).all(|w| w[0].bits >= w[1].bits));
+    // CABAC summary present (full-capture fixture) and bins add up.
+    let bins: usize = stats.cabac.iter().map(|r| r.bins).sum();
+    assert_eq!(bins, cab);
+    // B frame: MV points exist and both lists appear.
+    assert!(!stats.mv_points.is_empty());
+    assert!(stats.mv_points.iter().any(|p| p.list == 0));
+    assert!(stats.mv_points.iter().any(|p| p.list == 1));
+    // total_bits = frame data_bits (present in the fixture).
+    let decode = bs.decode_idx(1).unwrap();
+    assert_eq!(Some(stats.total_bits), bs.catb.frames[decode].data_bits);
 }
 
 /// A malformed/hostile `block_n` (e.g. i32::MAX) must fail with an error —
