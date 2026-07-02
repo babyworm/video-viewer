@@ -21,6 +21,12 @@ use crate::core::catb::{BsBlock, CatbFile};
 /// How many frames' block lists to keep parsed in memory.
 const BLOCK_CACHE_FRAMES: usize = 32;
 
+/// Sanity ceiling for the resolved stream dimensions. Malformed/hostile
+/// files can carry arbitrary u32 SPS sizes or block coordinates; anything
+/// beyond this (double 8K) is rejected instead of feeding `rasterize_blocks`
+/// / `refresh_derived` a cols×rows allocation in the 10^17 range.
+const MAX_STREAM_DIMENSION: u32 = 16384;
+
 /// Where the reported resolution came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolutionSource {
@@ -196,7 +202,7 @@ fn resolution_from_parameter_sets(catb: &CatbFile) -> Option<(u32, u32)> {
         let dim = |names: &[&str]| -> Option<u32> {
             for name in names {
                 if let Some(v) = fields.get(*name).and_then(|x| x.as_u64()) {
-                    if v > 0 {
+                    if v > 0 && v <= MAX_STREAM_DIMENSION as u64 {
                         return u32::try_from(v).ok();
                     }
                 }
@@ -518,6 +524,13 @@ fn resolution_from_block_extent(catb: &CatbFile) -> Result<Option<(u32, u32)>, S
     }
     if max_w == 0 || max_h == 0 {
         Ok(None)
+    } else if max_w > MAX_STREAM_DIMENSION || max_h > MAX_STREAM_DIMENSION {
+        // Malformed block coordinates — refuse rather than derive a
+        // resolution that makes every grid allocation explode.
+        Err(format!(
+            "catb: block extent {max_w}x{max_h} exceeds the sane maximum \
+             ({MAX_STREAM_DIMENSION})"
+        ))
     } else {
         Ok(Some((max_w, max_h)))
     }

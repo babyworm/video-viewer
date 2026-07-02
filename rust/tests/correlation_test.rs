@@ -254,6 +254,7 @@ fn test_m3_per_frame_r_sequence_through_scan_result() {
             g: 16,
             x: XMetric::Variance,
             y: YMetric::Bpp,
+            offset: 0,
         },
         vec![(0, p0), (1, p1)],
         None,

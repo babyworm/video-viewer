@@ -357,6 +357,16 @@ impl CatbFile {
             .ok_or_else(|| format!("catb: frame index {frame_idx} out of range"))?;
         let blocks_bytes = self.section_bytes(SEC_BLOCKS);
         let n = frame.block_n.max(0) as usize;
+        // Reject counts a malformed/hostile file cannot back with actual
+        // section bytes *before* allocating — an unchecked
+        // `Vec::with_capacity(2^31)` of ~200 B records would abort on OOM.
+        let max_records = blocks_bytes.len() / BLOCK_RECORD_SIZE;
+        if n > max_records {
+            return Err(format!(
+                "catb: frame {frame_idx} claims {n} blocks but the BLOCK \
+                 section only holds {max_records} records"
+            ));
+        }
         let mut out = Vec::with_capacity(n);
         for j in 0..n {
             let rec_idx = (frame.block_off as usize)
@@ -374,6 +384,15 @@ impl CatbFile {
     pub fn refs_for_block(&self, block: &BsBlock) -> Result<Vec<BsRef>, String> {
         let refs_bytes = self.section_bytes(SEC_REFS);
         let n = block.ref_n.max(0) as usize;
+        // Same OOM guard as `blocks_for_frame`: never allocate more record
+        // slots than the REF section can physically contain.
+        let max_records = refs_bytes.len() / REF_RECORD_SIZE;
+        if n > max_records {
+            return Err(format!(
+                "catb: block claims {n} refs but the REF section only holds \
+                 {max_records} records"
+            ));
+        }
         let mut out = Vec::with_capacity(n);
         for j in 0..n {
             let rec_idx = (block.ref_off as usize)

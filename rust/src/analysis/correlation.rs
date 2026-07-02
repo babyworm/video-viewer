@@ -764,8 +764,24 @@ pub fn compute_analysis_grids(
     width: u32,
     height: u32,
 ) -> AnalysisFrameGrids {
+    compute_analysis_grids_for(rgb, prev_rgb, width, height, None)
+}
+
+/// Like [`compute_analysis_grids`], but when a single X metric is known in
+/// advance (range-scan thread) the metrics it does not need are skipped —
+/// the orientation Sobel pass alone is a full-frame f64 luma plane, so
+/// computing it for a variance scan doubles the per-frame cost for nothing.
+pub fn compute_analysis_grids_for(
+    rgb: &[u8],
+    prev_rgb: Option<&[u8]>,
+    width: u32,
+    height: u32,
+    only: Option<XMetric>,
+) -> AnalysisFrameGrids {
+    let need_motion = only.is_none_or(|x| x.needs_previous_frame());
+    let need_orientation = only.is_none_or(|x| x == XMetric::Orientation);
     let block = compute_block_stats(rgb, width, height, ANALYSIS_BLOCK, BlockMetric::Y);
-    let motion = prev_rgb.and_then(|prev| {
+    let motion = prev_rgb.filter(|_| need_motion).and_then(|prev| {
         if prev.len() == rgb.len() {
             let m = compute_motion_stats(
                 prev,
@@ -782,7 +798,11 @@ pub fn compute_analysis_grids(
             None
         }
     });
-    let orientation = compute_orientation_stats(rgb, width, height, ANALYSIS_BLOCK);
+    let orientation = if need_orientation {
+        compute_orientation_stats(rgb, width, height, ANALYSIS_BLOCK)
+    } else {
+        OrientationStats::empty()
+    };
     AnalysisFrameGrids {
         width,
         height,
@@ -844,6 +864,10 @@ pub struct CorrScanRequest {
     pub g: u32,
     pub x: XMetric,
     pub y: YMetric,
+    /// Viewer↔catb frame offset the scan was aligned with. Kept in the
+    /// request so a later offset change marks the result stale instead of
+    /// silently presenting pairs built on the old mapping.
+    pub offset: i32,
 }
 
 /// Per-frame correlation statistics accumulated during a range scan
@@ -1479,6 +1503,7 @@ mod tests {
                 g: 16,
                 x: XMetric::Variance,
                 y: YMetric::Bpp,
+                offset: 0,
             },
             vec![(3, f0), (4, f1), (5, f2)],
             None,

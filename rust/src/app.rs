@@ -1418,6 +1418,15 @@ impl VideoViewerApp {
         path: &str,
         file: Arc<crate::analysis::bitstream_stats::BitstreamFile>,
     ) {
+        // Loading over an already-loaded .catb must behave like
+        // unload-then-load: cancel any in-flight correlation scan (its
+        // results describe the old file), reset the frame offset, and drop
+        // every window-side cache/selection derived from the old file.
+        // Without this, a scan started on file A keeps publishing A's
+        // r-timeline/scatter/CSV while B is displayed.
+        self.corr_scan_active_job.store(0, Ordering::Release);
+        self.bitstream_offset = 0;
+        self.bitstream_window.reset_file_state();
         self.bitstream_file = Some(Arc::clone(&file));
         self.bitstream_path = Some(path.to_string());
         self.bitstream_error = None;
@@ -1427,8 +1436,16 @@ impl VideoViewerApp {
             s.file_name = std::path::Path::new(path)
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned());
+            s.offset = 0;
             s.frame_graph = None;
             s.frame_graph_scanning = true;
+            // Correlation state of the previous file (see above).
+            s.corr_analysis = None;
+            s.corr_scan = None;
+            s.corr_scan_request = None;
+            s.corr_scanning = false;
+            s.corr_scan_progress = (0, 0);
+            s.corr_hover_cell = None;
         }
         // Background per-frame bits / avg-QP scan for the Frame Graph tab.
         let shared = Arc::clone(&self.bitstream_window.shared);
@@ -1464,6 +1481,8 @@ impl VideoViewerApp {
         self.bitstream_path = None;
         self.bitstream_error = None;
         self.bitstream_offset = 0;
+        // Window-side caches/selection pointing into the unloaded file.
+        self.bitstream_window.reset_file_state();
         let mut s = self.bitstream_window.shared.lock();
         s.file = None;
         s.file_name = None;
@@ -1515,10 +1534,12 @@ impl VideoViewerApp {
                 shared.scene_changes = self.scene_changes.clone();
             }
             if let (Some(rgb), Some(r)) = (&self.current_rgb, &self.reader) {
-                shared.frame_image = Some(egui::ColorImage::from_rgb(
+                // Arc: the child viewport shares this image instead of
+                // cloning ~8 MB of pixels per 1080p frame during playback.
+                shared.frame_image = Some(Arc::new(egui::ColorImage::from_rgb(
                     [r.width() as usize, r.height() as usize],
                     rgb,
-                ));
+                )));
                 shared.generation += 1;
             }
         }
@@ -1589,7 +1610,9 @@ impl VideoViewerApp {
         let h = reader.height();
         let fmt = reader.format_name().to_string();
         let color_matrix = reader.color_matrix.clone();
-        let offset = self.bitstream_offset;
+        // The request carries the offset it was built with — keeping it in
+        // the result lets the window detect offset-change staleness.
+        let offset = req.offset;
         let start = req.start.min(total - 1);
         let end = req.end.min(total - 1).max(start);
 
@@ -1651,8 +1674,16 @@ impl VideoViewerApp {
                         break;
                     }
                 };
-                let grids =
-                    corr::compute_analysis_grids(&rgb, prev_rgb.as_deref(), w, h);
+                // Only the requested X metric is computed — the orientation
+                // Sobel pass in particular is a full-frame f64 plane that a
+                // variance/motion scan never reads.
+                let grids = corr::compute_analysis_grids_for(
+                    &rgb,
+                    prev_rgb.as_deref(),
+                    w,
+                    h,
+                    Some(req.x),
+                );
                 prev_rgb = Some(rgb);
                 let Some(xg) = corr::x_grid(&grids, req.x, req.g) else {
                     continue; // e.g. motion metric at the very first frame

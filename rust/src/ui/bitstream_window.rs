@@ -299,7 +299,18 @@ pub struct FrameFillStats {
     pub qp_min: f32,
     pub qp_max: f32,
     pub bpp_max: f32,
+    /// Max L1-norm |MV| in **pixels** (quarter-pel / 4) — the one unit every
+    /// consumer shares (L1 grid, LOD grid, labels, loupe, legend).
     pub mv_max: f32,
+}
+
+/// L1-norm MV magnitude of a block in **pixels** (quarter-pel `|x|+|y|` / 4)
+/// — same unit as `BitstreamGrid::mv_mag`, so the L0 rect path and the
+/// L1/LOD grid path colour and label identically.
+pub fn block_mv_px(b: &BsBlock) -> f32 {
+    b.mv
+        .map(|(x, y)| (x.abs() + y.abs()) as f32 / 4.0)
+        .unwrap_or(0.0)
 }
 
 /// Compute fill statistics over a frame's L0 block list.
@@ -316,9 +327,7 @@ pub fn frame_fill_stats(blocks: &[BsBlock]) -> FrameFillStats {
         s.qp_max = s.qp_max.max(qp);
         let area = (b.w as f32 * b.h as f32).max(1.0);
         s.bpp_max = s.bpp_max.max(b.bits.max(0) as f32 / area);
-        if let Some((x, y)) = b.mv {
-            s.mv_max = s.mv_max.max((x.abs() + y.abs()) as f32);
-        }
+        s.mv_max = s.mv_max.max(block_mv_px(b));
     }
     if !s.qp_min.is_finite() {
         s.qp_min = 0.0;
@@ -437,7 +446,9 @@ pub struct BitstreamShared {
     /// Basename of the loaded .catb for the window title (§1 mockup).
     pub file_name: Option<String>,
     /// Current viewer frame as RGB (TextureHandle can't cross viewports).
-    pub frame_image: Option<egui::ColorImage>,
+    /// `Arc` so the child's snapshot shares it instead of cloning ~8 MB of
+    /// pixels per 1080p frame during playback.
+    pub frame_image: Option<Arc<egui::ColorImage>>,
     /// Bumped whenever `frame_image` changes (texture re-upload gate).
     pub generation: u64,
     pub viewer_frame: usize,
@@ -544,8 +555,11 @@ struct Selection {
     block_idx: usize,
 }
 
-/// Per-frame derived render data, cached by catb display index.
+/// Per-frame derived render data, cached by catb display index **and** file
+/// identity — a `.catb` loaded over another one must not reuse the old
+/// file's blocks for the same display index.
 struct FrameDerived {
+    file_ptr: usize,
     display_idx: usize,
     blocks: Arc<Vec<BsBlock>>,
     stats: FrameFillStats,
@@ -560,7 +574,7 @@ struct FrameDerived {
 /// root update — re-locking under a held lock would deadlock).
 struct Snapshot {
     file: Option<Arc<BitstreamFile>>,
-    image: Option<egui::ColorImage>,
+    image: Option<Arc<egui::ColorImage>>,
     generation: u64,
     viewer_frame: usize,
     viewer_total: usize,
@@ -627,6 +641,20 @@ pub struct BitstreamWindow {
     /// Stream-px point to centre the canvas on (Top-N [Jump], V22) — applied
     /// on the next canvas pass where the effective zoom is known.
     pending_center: Option<egui::Pos2>,
+
+    /// Filmstrip frame-type classes, cached per (file, offset, total) — the
+    /// strip repaints every frame during playback and recomputing a
+    /// `frame_summary` (String clone) per cell per repaint is O(total)
+    /// allocations at 30 fps.
+    filmstrip_cache: Option<FilmstripCache>,
+}
+
+/// Cached per-viewer-frame filmstrip classes (see field docs above).
+struct FilmstripCache {
+    file_ptr: usize,
+    offset: i32,
+    total: usize,
+    classes: Vec<Option<FrameTypeClass>>,
 }
 
 /// Opportunity grid derived from the current frame's aligned pair (M3).
@@ -640,8 +668,10 @@ struct OppData {
     zmax: f32,
 }
 
-/// Cached current-frame correlation data, keyed on everything that feeds it.
+/// Cached current-frame correlation data, keyed on everything that feeds it
+/// (including the file identity — see [`FrameDerived`]).
 struct CorrDerived {
+    file_ptr: usize,
     frame_idx: usize,
     display_idx: usize,
     g: u32,
@@ -711,6 +741,7 @@ impl BitstreamWindow {
             corr_hover_cell: None,
             opp_focus: None,
             pending_center: None,
+            filmstrip_cache: None,
         }
     }
 
@@ -719,6 +750,21 @@ impl BitstreamWindow {
         self.view = ViewConfig::from_settings(s);
         self.show_loupe = s.show_loupe;
         self.inspector_collapsed = s.inspector_collapsed;
+    }
+
+    /// Drop every piece of window state derived from (or pointing into) the
+    /// loaded `.catb`. The root calls this when the file is unloaded **or
+    /// replaced** — a selection/opp-focus/derived cache from file A must not
+    /// be interpreted against file B.
+    pub fn reset_file_state(&mut self) {
+        self.selection = None;
+        self.opp_focus = None;
+        self.corr_hover_cell = None;
+        self.pending_center = None;
+        self.derived = None;
+        self.corr_derived = None;
+        self.corr_scan_derived = None;
+        self.filmstrip_cache = None;
     }
 
     fn set_hint(&mut self, ctx: &egui::Context, text: &str) {
@@ -802,8 +848,11 @@ impl BitstreamWindow {
                 // Frame Graph doesn't leave `texture_gen` behind and force
                 // a multi-MB ColorImage clone on every repaint.
                 if let Some(img) = snap.image.take() {
-                    self.texture =
-                        Some(ctx.load_texture("bs_frame", img, egui::TextureOptions::NEAREST));
+                    self.texture = Some(ctx.load_texture(
+                        "bs_frame",
+                        egui::ImageData::Color(img),
+                        egui::TextureOptions::NEAREST,
+                    ));
                     self.texture_gen = snap.generation;
                 }
 
@@ -1140,6 +1189,7 @@ impl BitstreamWindow {
             self.derived = None;
             return;
         };
+        let file_ptr = Arc::as_ptr(file) as usize;
         let Some(display_idx) = viewer_to_catb_display(snap.viewer_frame, snap.offset) else {
             self.derived = None;
             return;
@@ -1151,7 +1201,7 @@ impl BitstreamWindow {
         if self
             .derived
             .as_ref()
-            .map(|d| d.display_idx == display_idx)
+            .map(|d| d.display_idx == display_idx && d.file_ptr == file_ptr)
             .unwrap_or(false)
         {
             return; // still current
@@ -1166,6 +1216,7 @@ impl BitstreamWindow {
         let lod = lod_cell_size(&file.catb.meta.codec);
         let grid_lod = rasterize_blocks(&blocks, w, h, lod);
         self.derived = Some(FrameDerived {
+            file_ptr,
             display_idx,
             blocks,
             stats,
@@ -1370,10 +1421,7 @@ impl BitstreamWindow {
                     for b in d.blocks.iter() {
                         let area = (b.w as f32 * b.h as f32).max(1.0);
                         let bpp = b.bits.max(0) as f32 / area;
-                        let mv = b
-                            .mv
-                            .map(|(x, y)| (x.abs() + y.abs()) as f32)
-                            .unwrap_or(0.0);
+                        let mv = block_mv_px(b);
                         if let Some(color) = fill_color(
                             self.view.fill,
                             b.qp as f32,
@@ -1433,16 +1481,12 @@ impl BitstreamWindow {
                     }
                     let area = (b.w as f32 * b.h as f32).max(1.0);
                     let bpp = b.bits.max(0) as f32 / area;
-                    let mv = b
-                        .mv
-                        .map(|(x, y)| (x.abs() + y.abs()) as f32)
-                        .unwrap_or(0.0);
                     let txt = fill_value_text(
                         self.view.fill,
                         b.qp as f32,
                         bpp,
                         ModeClass::from_label(&b.prediction_mode),
-                        mv,
+                        block_mv_px(b),
                     );
                     let font_size = (rect.height() * 0.4).clamp(8.0, 14.0);
                     painter.text(
@@ -1562,11 +1606,7 @@ impl BitstreamWindow {
                         // QP/bpp/mode are already in the summary; MV-heat
                         // needs its |MV| (in pixels) prepended.
                         if self.view.fill == FillMode::MvHeat {
-                            let mv = b
-                                .mv
-                                .map(|(x, y)| (x.abs() + y.abs()) as f32)
-                                .unwrap_or(0.0);
-                            text = format!("|MV| {:.1}px · {text}", mv / 4.0);
+                            text = format!("|MV| {:.1}px · {text}", block_mv_px(b));
                         }
                         response.clone().on_hover_text(text);
                     }
@@ -1849,19 +1889,51 @@ impl BitstreamWindow {
                             egui::Sense::click(),
                         );
                         let painter = ui.painter_at(rect);
-                        for i in 0..total {
+                        // Frame-type classes are computed once per
+                        // (file, offset, total) — the strip repaints every
+                        // frame during playback, and a per-cell
+                        // `frame_summary()` (String clone) per repaint is
+                        // O(total) allocations at playback rate.
+                        let file_ptr = snap
+                            .file
+                            .as_ref()
+                            .map(|f| Arc::as_ptr(f) as usize)
+                            .unwrap_or(0);
+                        let cache_ok = self.filmstrip_cache.as_ref().is_some_and(|c| {
+                            c.file_ptr == file_ptr
+                                && c.offset == snap.offset
+                                && c.total == total
+                        });
+                        if !cache_ok {
+                            let classes = (0..total)
+                                .map(|i| {
+                                    snap.file.as_ref().and_then(|f| {
+                                        viewer_to_catb_display(i, snap.offset)
+                                            .and_then(|d| f.frame_summary(d))
+                                            .map(|s| FrameTypeClass::from_label(&s.frame_type))
+                                    })
+                                })
+                                .collect();
+                            self.filmstrip_cache = Some(FilmstripCache {
+                                file_ptr,
+                                offset: snap.offset,
+                                total,
+                                classes,
+                            });
+                        }
+                        let classes = &self.filmstrip_cache.as_ref().expect("just built").classes;
+                        // Only paint the cells inside the visible scroll clip.
+                        let clip = painter.clip_rect();
+                        let first = (((clip.min.x - rect.min.x) / cell_w).floor().max(0.0)) as usize;
+                        let last =
+                            ((((clip.max.x - rect.min.x) / cell_w).ceil() as usize) + 1).min(total);
+                        for i in first..last {
                             let x0 = rect.min.x + i as f32 * cell_w;
                             let cell = egui::Rect::from_min_size(
                                 egui::pos2(x0, rect.min.y + 2.0),
                                 egui::vec2((cell_w - 1.0).max(1.0), h - 4.0),
                             );
-                            let summary = snap.file.as_ref().and_then(|f| {
-                                viewer_to_catb_display(i, snap.offset)
-                                    .and_then(|d| f.frame_summary(d))
-                            });
-                            let class = summary
-                                .as_ref()
-                                .map(|s| FrameTypeClass::from_label(&s.frame_type));
+                            let class = classes.get(i).copied().flatten();
                             painter.rect_filled(cell, 1.0, filmstrip_color(class));
                             if i == snap.viewer_frame {
                                 painter.rect_stroke(
@@ -2003,6 +2075,7 @@ impl BitstreamWindow {
             self.corr_derived = None;
             return;
         };
+        let file_ptr = Arc::as_ptr(file) as usize;
         let Some(display_idx) = viewer_to_catb_display(snap.viewer_frame, snap.offset) else {
             self.corr_derived = None;
             return;
@@ -2021,7 +2094,8 @@ impl BitstreamWindow {
             return;
         };
         let current = self.corr_derived.as_ref().is_some_and(|d| {
-            d.frame_idx == snap.viewer_frame
+            d.file_ptr == file_ptr
+                && d.frame_idx == snap.viewer_frame
                 && d.display_idx == display_idx
                 && d.g == self.corr_g
                 && d.x == self.corr_x
@@ -2067,6 +2141,7 @@ impl BitstreamWindow {
             }
         });
         self.corr_derived = Some(CorrDerived {
+            file_ptr,
             frame_idx: snap.viewer_frame,
             display_idx,
             g: self.corr_g,
@@ -2082,12 +2157,15 @@ impl BitstreamWindow {
     }
 
     /// True when the stored scan was produced with different X/Y/G settings
-    /// than the combos currently show — its numbers must not be presented
-    /// next to the current labels.
-    fn corr_scan_stale(&self, scan: &CorrScanResult) -> bool {
+    /// — or a different viewer↔catb frame offset — than the window currently
+    /// shows. Its numbers must not be presented next to the current labels:
+    /// an offset change re-maps every (viewer, catb) pair the scan was
+    /// built on.
+    fn corr_scan_stale(&self, scan: &CorrScanResult, offset: i32) -> bool {
         scan.request.g != self.corr_g
             || scan.request.x != self.corr_x
             || scan.request.y != self.corr_y
+            || scan.request.offset != offset
     }
 
     /// Refresh the cached range-scan derivation (statistics + scatter
@@ -2136,7 +2214,7 @@ impl BitstreamWindow {
             match snap.corr_scan.as_ref() {
                 // §6: never pair the current combo labels with a previous
                 // scan's numbers — flag staleness right in the readout.
-                Some(scan) if self.corr_scan_stale(scan) => {
+                Some(scan) if self.corr_scan_stale(scan, snap.offset) => {
                     return "r=– ρ=– N=– (stale scan — press Scan)".to_string();
                 }
                 Some(_) => match self.corr_scan_derived.as_ref() {
@@ -2254,6 +2332,7 @@ impl BitstreamWindow {
                             g: self.corr_g,
                             x: self.corr_x,
                             y: self.corr_y,
+                            offset: snap.offset,
                         });
                         ctx.request_repaint_of(egui::ViewportId::ROOT);
                     }
@@ -2445,7 +2524,7 @@ impl BitstreamWindow {
             if self.corr_range_mode {
                 match snap.corr_scan.as_ref() {
                     Some(scan) => {
-                        if self.corr_scan_stale(scan) {
+                        if self.corr_scan_stale(scan, snap.offset) {
                             note = Some(
                                 "Scan result is for different settings — press Scan again."
                                     .to_string(),
@@ -2597,7 +2676,7 @@ impl BitstreamWindow {
                 let scan = snap
                     .corr_scan
                     .as_ref()
-                    .filter(|s| !self.corr_scan_stale(s));
+                    .filter(|s| !self.corr_scan_stale(s, snap.offset));
                 let Some(scan) = scan else {
                     ui.weak("Per-frame r timeline — run a range Scan to populate.");
                     return;
@@ -2656,7 +2735,7 @@ impl BitstreamWindow {
         let csv = if self.corr_range_mode {
             match snap.corr_scan.as_ref() {
                 Some(scan) => {
-                    if self.corr_scan_stale(scan) {
+                    if self.corr_scan_stale(scan, snap.offset) {
                         return "scan is stale (settings changed) — press Scan again".to_string();
                     }
                     let frames: Vec<(usize, &AlignedPair)> =
@@ -2834,7 +2913,7 @@ fn draw_legend(
                     if fill == FillMode::Qp { v } else { 0.0 },
                     if fill == FillMode::Bpp { v } else { 0.0 },
                     ModeClass::Unknown,
-                    if fill == FillMode::MvHeat { v * 4.0 } else { 0.0 },
+                    if fill == FillMode::MvHeat { v } else { 0.0 },
                     stats,
                     1.0,
                 )

@@ -563,3 +563,85 @@ fn test_catb_frame_summary_and_block_cache() {
     assert_eq!(a.len(), 16);
     assert!(bs.blocks_display(99).is_err());
 }
+
+/// A malformed/hostile `block_n` (e.g. i32::MAX) must fail with an error —
+/// never reach `Vec::with_capacity` and abort on OOM.
+#[test]
+fn test_catb_block_count_exceeding_section_errors() {
+    let strings = encode_strings(&["", "IDR"]);
+    let meta = br#"{"schema_version":1,"decoder":{"codec":"hevc"},"parameter_sets":[]}"#;
+    // One frame claiming i32::MAX blocks; the BLOCK section holds exactly one.
+    let frames = frame_record(0, 0, 1, 1, 0, 0, 0, 100, 20, 80, 0, i32::MAX, 0, 0);
+    let blocks = block_record(&BlockSpec {
+        w: 64,
+        h: 64,
+        qp: 32,
+        ..Default::default()
+    });
+    let bytes = build_catb(1, &strings, meta, &frames, &blocks, &[], &[]);
+    let f = write_temp(&bytes);
+    let catb = CatbFile::open(f.path()).expect("header/frames still parse");
+    let err = catb.blocks_for_frame(0).expect_err("must reject block_n");
+    assert!(err.contains("BLOCK section"), "unexpected error: {err}");
+    // Same guard on the REF side: a block claiming refs an empty REF
+    // section cannot back.
+    let mut b = video_viewer::core::catb::BsBlock {
+        x: 0,
+        y: 0,
+        w: 64,
+        h: 64,
+        ctu_address: 0,
+        qp: 32,
+        partition: String::new(),
+        prediction_mode: String::new(),
+        bits: 0,
+        bit_offset: 0,
+        exactness_flags: 0,
+        syntax_off: 0,
+        syntax_n: 0,
+        cabac_off: 0,
+        cabac_n: 0,
+        tx_off: 0,
+        tx_n: 0,
+        ref_off: 0,
+        ref_n: i32::MAX,
+        mv_flags: 0,
+        mvp: None,
+        mvd: None,
+        mv: None,
+        reference: None,
+        reference_list: None,
+        reference_label: None,
+        reference_list_index: None,
+        reference_poc: None,
+        reference_frame: None,
+        reference_long_term: None,
+    };
+    let err = catb.refs_for_block(&b).expect_err("must reject ref_n");
+    assert!(err.contains("REF section"), "unexpected error: {err}");
+    b.ref_n = 0;
+    assert!(catb.refs_for_block(&b).expect("zero refs ok").is_empty());
+}
+
+/// Malformed block coordinates must not derive an absurd resolution that
+/// makes every downstream grid allocation explode: `BitstreamFile::open`
+/// rejects extents beyond the sanity ceiling.
+#[test]
+fn test_catb_insane_block_extent_rejected() {
+    let strings = encode_strings(&["", "IDR"]);
+    // No parameter_sets → resolution falls back to the block extent.
+    let meta = br#"{"schema_version":1,"decoder":{"codec":"hevc"},"parameter_sets":[]}"#;
+    let frames = frame_record(0, 0, 1, 1, 0, 0, 0, 100, 20, 80, 0, 1, 0, 0);
+    let blocks = block_record(&BlockSpec {
+        x: 1 << 30,
+        y: 1 << 30,
+        w: 64,
+        h: 64,
+        qp: 32,
+        ..Default::default()
+    });
+    let bytes = build_catb(1, &strings, meta, &frames, &blocks, &[], &[]);
+    let f = write_temp(&bytes);
+    let err = BitstreamFile::open(f.path()).expect_err("must reject extent");
+    assert!(err.contains("exceeds"), "unexpected error: {err}");
+}

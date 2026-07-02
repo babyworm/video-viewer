@@ -43,7 +43,8 @@ impl Default for GeneralSettings {
 /// settings.toml files without `[bitstream]` parse via `serde(default)`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BitstreamViewSettings {
-    /// Fill layer name: "None" / "QP" / "bpp" / "Mode" / "MV-heat".
+    /// Fill layer name: "None" / "QP" / "bpp" / "Mode" / "MV-heat" /
+    /// "Opportunity".
     pub fill: String,
     pub layer_mv: bool,
     pub layer_part: bool,

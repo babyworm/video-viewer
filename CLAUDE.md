@@ -79,11 +79,11 @@
 | `tests/colorspace_test.rs` | RGB/YUV color conversion sanity checks (12 tests) |
 | `tests/formats_test.rs` | Format lookup, frame_size, categories (21 tests) |
 | `tests/formats_extra_test.rs` | RGB16/32, semi-planar, packed frame sizes (9 tests) |
-| `tests/reader_test.rs` | VideoReader open, seek, Y4M, RGB convert, channels (6 tests) |
+| `tests/reader_test.rs` | VideoReader open, seek, Y4M, RGB convert, channels (8 tests) |
 | `tests/pixel_test.rs` | Pixel info: I420, YV12, NV12, NV21, RGB24, BGR24, Grey (12 tests) |
 | `tests/pixel_packed_test.rs` | Pixel info: YUYV, UYVY, NV16 packed formats (5 tests) |
-| `tests/highbit_test.rs` | 10/12/16-bit YUV/Grey/Bayer format, reader, pixel, and Y4M coverage (49 tests) |
-| `tests/hints_test.rs` | Filename hint parsing and file-size resolution guessing (22 tests) |
+| `tests/highbit_test.rs` | 10/12/16-bit YUV/Grey/Bayer format, reader, pixel, and Y4M coverage (50 tests) |
+| `tests/hints_test.rs` | Filename hint parsing and file-size resolution guessing (44 tests) |
 | `tests/image_test.rs` | Image/PPM/Y4M stills, image sequences, and interlace metadata (27 tests) |
 | `tests/y4m_test.rs` | Y4M header parsing, frame offsets (8 tests) |
 | `tests/cache_test.rs` | LRU cache operations (6 tests) |
@@ -93,15 +93,17 @@
 | `tests/waveform_test.rs` | Waveform luma/R/G/B, edge cases (6 tests) |
 | `tests/vectorscope_test.rs` | Vectorscope neutral/red/blue, subsampling (5 tests) |
 | `tests/metrics_test.rs` | PSNR, SSIM, frame difference, MS metrics, spatial metric maps, empty images (12 tests) |
-| `tests/block_stats_test.rs` | Per-block luma/MS mean & variance grid, edge/partial blocks (12 tests) |
-| `tests/motion_test.rs` | Per-block motion classification: pixel-diff vs avg·std, 4-class bands, localized motion, 8px grid, edge cases (12 tests) |
+| `tests/block_stats_test.rs` | Per-block luma/MS mean & variance grid, edge/partial blocks (10 tests) |
+| `tests/motion_test.rs` | Per-block motion classification: pixel-diff vs avg·std, 4-class bands, localized motion, 8px grid, edge cases (14 tests) |
 | `tests/scene_test.rs` | Scene detection algorithms, thresholds, save/load (12 tests) |
 | `tests/sideband_test.rs` | Sideband binary parsing, extended header, signed fields, display (20 tests) |
-| `tests/catb_test.rs` | `.catb` v4 bitstream metadata: header/directory validation, frame/block/ref records, sentinels, oracle differential, display_map; fixture writer lives in `tests/common/mod.rs` (16 tests) |
+| `tests/catb_test.rs` | `.catb` v4 bitstream metadata: header/directory validation, frame/block/ref records, sentinels, malformed block/ref-count and block-extent guards, oracle differential, display_map; fixture writer lives in `tests/common/mod.rs` (18 tests) |
 | `tests/bitstream_ui_test.rs` | M1 window pure logic: settings backward compat (old settings.toml), preset apply/custom/cycle, offset mapping, rasterization bpp/coverage, LOD, min-area hit test, filmstrip colors (10 tests) |
 | `tests/correlation_test.rs` | M2 V19/V20: flat/noise synthetic pipeline r > 0.8, partial-block masking, motion↔bits + class table, CSV rows/flags/r re-computation, real hevc_bslice end-to-end smoke; M3 V21: opportunity Top-N concentrates on the flat+high-bpp half (z_b−z_a design), per-frame r sequence through `CorrScanResult` (7 tests) |
 | `tests/common/mod.rs` | Shared synthetic `.catb` v4 fixture writer (used by catb_test + correlation_test; no tests itself) |
-| `tests/ppm_test.rs` | PPM parsing, writing, reading, and conversion (10 tests) |
+| `tests/ppm_test.rs` | PPM parsing, writing, reading, and conversion (12 tests) |
+| `tests/diff_stats_test.rs` | Video Diff spatial statistics (9 tests) |
+| `tests/e2e_hm_test.rs` | End-to-end HM B-pyramid stream vs codec-analyzer oracle differential; skips unless `E2E_CATB`/`E2E_ORACLE` are set (1 test) |
 | `tests/integration_test.rs` | Real Y4M file (conditional) (1 test) |
 
 ## Filename Hint Reference

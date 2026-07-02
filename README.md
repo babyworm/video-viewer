@@ -213,6 +213,26 @@ PPM (P6), PNG, JPEG, BMP, GIF, TIFF, WebP
 
 All dependencies are compatible with the MIT license.
 
+## Third-Party Tools & Formats
+
+The Bitstream Analysis window (`--catb` CLI option) reads `.catb` telemetry
+files produced by [codec-analyzer](https://github.com/btree-ip/codec-analyzer):
+
+- **codec-analyzer is an optional, separately installed external tool.** It is
+  licensed under **GPL-3.0-or-later** and is *not* bundled with, linked into,
+  or distributed as part of video-viewer. video-viewer never invokes it; it
+  only reads `.catb` files you generate with it yourself.
+- **The `.catb` reader in this repository is an independent implementation**
+  written from the CC0-1.0 (public domain) format specification
+  (`docs/catb-v4-format.md` in the codec-analyzer repository). No GPL code
+  was consulted or copied; the reader is covered by this project's MIT
+  license.
+- **`test_data/bitstream/` fixtures are the output of a GPL program**
+  (codec-analyzer's instrumented FFmpeg). The GPL does not extend to a
+  program's output, so these data files are not GPL-covered. See
+  [test_data/bitstream/README.md](test_data/bitstream/README.md) for
+  provenance, checksums, and regeneration steps.
+
 ## Development
 
 ```bash
