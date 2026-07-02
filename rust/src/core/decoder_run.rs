@@ -107,6 +107,104 @@ pub fn expand_command(template: &str, input: &Path, workdir: &Path) -> ExpandedC
     }
 }
 
+// ---------------------------------------------------------------------------
+// Zero-config auto-detection of a codec-analyzer installation (0.16.0)
+// ---------------------------------------------------------------------------
+
+/// Shared argument tail of every auto-detected command template.
+const DETECT_ARGS: &str = "decoder-run {input} --decoder-workdir {workdir} \
+                           --telemetry-level block --yuv-output {yuv}";
+
+/// Launcher script name inside an exe-adjacent `codec-analyzer/` bundle.
+#[cfg(windows)]
+const BUNDLED_LAUNCHER: &str = "codec-analyzer.cmd";
+#[cfg(not(windows))]
+const BUNDLED_LAUNCHER: &str = "codec-analyzer.sh";
+
+/// Executable names that count as a PATH hit for probe 3.
+#[cfg(windows)]
+const PATH_CANDIDATES: &[&str] = &["codec-analyzer.exe", "codec-analyzer.cmd", "codec-analyzer.bat"];
+#[cfg(not(windows))]
+const PATH_CANDIDATES: &[&str] = &["codec-analyzer"];
+
+/// Probe well-known locations for a codec-analyzer installation, first hit
+/// wins. Returns `(command template, human-readable source)`.
+///
+/// Pure over its inputs (base dirs + PATH string) so tests can point it at
+/// temp directories; the environment-reading wrapper is
+/// [`detect_decoder_command`]. Probe order:
+///
+/// 1. **Exe-adjacent bundle** — `<exe_dir>/codec-analyzer/codec-analyzer.cmd`
+///    (Windows bundle layout; `.sh` at the same spot on Unix).
+/// 2. **`~/work/codec-analyzer` dev checkout** (Unix) — needs both
+///    `.venv/bin/python` and `.local/bin/ffmpeg`; the command pins the
+///    bundled ffmpeg via `CODEC_ANALYZER_FFMPEG`.
+/// 3. **`codec-analyzer` on PATH** — bare command; ffmpeg discovery is left
+///    to the CLI's own auto-search.
+pub fn probe_paths(
+    exe_dir: Option<&Path>,
+    home_dir: Option<&Path>,
+    path_env: Option<&str>,
+) -> Option<(String, String)> {
+    // 1. Bundle next to the viewer executable.
+    if let Some(dir) = exe_dir {
+        let launcher = dir.join("codec-analyzer").join(BUNDLED_LAUNCHER);
+        if launcher.is_file() {
+            return Some((
+                format!("{} {DETECT_ARGS}", quote_path(&launcher)),
+                format!("bundled launcher {}", launcher.display()),
+            ));
+        }
+    }
+    // 2. Development checkout (Unix: env-prefix syntax is shell-specific).
+    #[cfg(unix)]
+    if let Some(home) = home_dir {
+        let root = home.join("work").join("codec-analyzer");
+        let python = root.join(".venv").join("bin").join("python");
+        let ffmpeg = root.join(".local").join("bin").join("ffmpeg");
+        if python.is_file() && ffmpeg.is_file() {
+            return Some((
+                format!(
+                    "CODEC_ANALYZER_FFMPEG={} {} -m codec_analyzer {DETECT_ARGS}",
+                    shell_escape_unix(&ffmpeg.to_string_lossy()),
+                    shell_escape_unix(&python.to_string_lossy()),
+                ),
+                format!("development checkout {}", root.display()),
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = home_dir;
+    // 3. codec-analyzer on PATH.
+    if let Some(path_env) = path_env {
+        for dir in std::env::split_paths(path_env) {
+            for name in PATH_CANDIDATES {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return Some((
+                        format!("codec-analyzer {DETECT_ARGS}"),
+                        format!("codec-analyzer on PATH ({})", candidate.display()),
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Environment-reading wrapper around [`probe_paths`]: exe dir from
+/// `current_exe()`, home from `HOME`/`USERPROFILE`, plus `PATH`.
+pub fn detect_decoder_command() -> Option<(String, String)> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    let path_env = std::env::var("PATH").ok();
+    probe_paths(exe_dir.as_deref(), home.as_deref(), path_env.as_deref())
+}
+
 /// Locate the telemetry file after a successful run.
 ///
 /// The fixed `{workdir}/telemetry.catb` path (`expected`) wins when it
@@ -407,6 +505,108 @@ mod tests {
         std::fs::File::open(&old).unwrap().set_modified(past).unwrap();
         std::fs::write(&new, b"y").unwrap();
         assert_eq!(resolve_telemetry(&expected), Some(new));
+    }
+
+    /// Build an exe-adjacent bundle layout inside `dir`, return the exe dir.
+    fn make_bundle(dir: &Path) -> PathBuf {
+        let sub = dir.join("codec-analyzer");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(BUNDLED_LAUNCHER), b"#!x").unwrap();
+        dir.to_path_buf()
+    }
+
+    /// Build a `work/codec-analyzer` dev checkout inside `home`.
+    fn make_checkout(home: &Path) {
+        let root = home.join("work").join("codec-analyzer");
+        std::fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        std::fs::create_dir_all(root.join(".local/bin")).unwrap();
+        std::fs::write(root.join(".venv/bin/python"), b"#!x").unwrap();
+        std::fs::write(root.join(".local/bin/ffmpeg"), b"#!x").unwrap();
+    }
+
+    #[test]
+    fn detect_probe1_bundled_launcher_wins() {
+        let exe = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let exe_dir = make_bundle(exe.path());
+        make_checkout(home.path()); // present, but the bundle must win
+        let (cmd, source) =
+            probe_paths(Some(&exe_dir), Some(home.path()), None).expect("bundle hit");
+        assert!(source.contains("bundled launcher"), "{source}");
+        assert!(source.contains(BUNDLED_LAUNCHER), "{source}");
+        assert!(cmd.contains(BUNDLED_LAUNCHER), "{cmd}");
+        assert!(cmd.contains("decoder-run {input} --decoder-workdir {workdir}"), "{cmd}");
+        assert!(cmd.contains("--telemetry-level block --yuv-output {yuv}"), "{cmd}");
+        // Launcher path is quoted (spaces in install dirs survive the shell).
+        #[cfg(unix)]
+        assert!(cmd.starts_with('\''), "{cmd}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_probe2_dev_checkout() {
+        let home = tempfile::tempdir().unwrap();
+        make_checkout(home.path());
+        let (cmd, source) = probe_paths(None, Some(home.path()), None).expect("checkout hit");
+        assert!(source.contains("development checkout"), "{source}");
+        assert!(cmd.starts_with("CODEC_ANALYZER_FFMPEG='"), "{cmd}");
+        assert!(cmd.contains(".local/bin/ffmpeg'"), "{cmd}");
+        assert!(cmd.contains(".venv/bin/python' -m codec_analyzer decoder-run {input}"), "{cmd}");
+        assert!(cmd.ends_with("--telemetry-level block --yuv-output {yuv}"), "{cmd}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_probe2_needs_both_python_and_ffmpeg() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("work").join("codec-analyzer");
+        std::fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        std::fs::write(root.join(".venv/bin/python"), b"#!x").unwrap();
+        // ffmpeg missing → probe 2 must not fire.
+        assert_eq!(probe_paths(None, Some(home.path()), None), None);
+    }
+
+    #[test]
+    fn detect_probe3_path_lookup() {
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::write(bin.path().join(PATH_CANDIDATES[0]), b"#!x").unwrap();
+        let path_env = std::env::join_paths([bin.path()])
+            .unwrap()
+            .into_string()
+            .unwrap();
+        let (cmd, source) = probe_paths(None, None, Some(&path_env)).expect("PATH hit");
+        assert!(source.contains("on PATH"), "{source}");
+        assert_eq!(
+            cmd,
+            "codec-analyzer decoder-run {input} --decoder-workdir {workdir} \
+             --telemetry-level block --yuv-output {yuv}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_checkout_beats_path() {
+        let home = tempfile::tempdir().unwrap();
+        make_checkout(home.path());
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::write(bin.path().join("codec-analyzer"), b"#!x").unwrap();
+        let path_env = bin.path().to_string_lossy().into_owned();
+        let (_, source) =
+            probe_paths(None, Some(home.path()), Some(&path_env)).expect("some hit");
+        assert!(source.contains("development checkout"), "{source}");
+    }
+
+    #[test]
+    fn detect_none_when_nothing_installed() {
+        let empty1 = tempfile::tempdir().unwrap();
+        let empty2 = tempfile::tempdir().unwrap();
+        let empty3 = tempfile::tempdir().unwrap();
+        let path_env = empty3.path().to_string_lossy().into_owned();
+        assert_eq!(
+            probe_paths(Some(empty1.path()), Some(empty2.path()), Some(&path_env)),
+            None
+        );
+        assert_eq!(probe_paths(None, None, None), None);
     }
 
     #[test]

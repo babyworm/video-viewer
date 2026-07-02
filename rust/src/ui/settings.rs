@@ -99,7 +99,9 @@ pub struct DecoderSettings {
     /// Shell command template. Placeholders: `{input}` (bitstream path),
     /// `{workdir}` (per-bitstream work dir), `{telemetry}`
     /// (`{workdir}/telemetry.catb`), `{yuv}` (`{workdir}/decoded.yuv`).
-    /// Empty = feature disabled (Open Bitstream… only shows guidance).
+    /// Empty = use the auto-detected codec-analyzer install when one is
+    /// found (0.16.0, `decoder_run::detect_decoder_command`); otherwise the
+    /// feature is disabled and Open Bitstream… only shows guidance.
     #[serde(default)]
     pub run_command: String,
 }

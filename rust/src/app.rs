@@ -252,6 +252,10 @@ pub struct VideoViewerApp {
     decoder_run_dialog: Option<dialogs::DecoderRunDialog>,
     /// Whether a decoder run is in flight (drives the panel spinner).
     decoder_run_running: bool,
+    /// Session cache of [`decoder_run::detect_decoder_command`] (0.16.0):
+    /// outer `None` = not probed yet, `Some(None)` = probed and nothing
+    /// found. Invalidated when Settings are saved.
+    detected_decoder: Option<Option<(String, String)>>,
     /// Tagged result slot (scene-detect publish pattern).
     decoder_run_output: DecoderRunOutput,
     /// Monotonic job counter — stale completions are discarded.
@@ -390,6 +394,7 @@ impl VideoViewerApp {
             bs_window_open_delay: 0,
             decoder_run_dialog: None,
             decoder_run_running: false,
+            detected_decoder: None,
             decoder_run_output: Arc::new(std::sync::Mutex::new(None)),
             decoder_run_job_id: 0,
             decoder_run_active_job: Arc::new(AtomicUsize::new(0)),
@@ -1582,7 +1587,7 @@ impl VideoViewerApp {
                 }
             }
             DroppedKind::Bitstream => {
-                if self.settings.decoder.run_command.trim().is_empty() {
+                if self.effective_decoder_command().is_none() {
                     let initial_dir = std::path::Path::new(&path)
                         .parent()
                         .and_then(|p| p.to_str())
@@ -1604,19 +1609,38 @@ impl VideoViewerApp {
         }
     }
 
-    /// M5: launch the user-configured external decoder command for
-    /// `input` in a background thread (arm's-length: nothing is bundled —
-    /// the viewer only consumes the files the command produces). Any
-    /// in-flight run is cancelled first (job-id gate + kill).
+    /// 0.16.0: the decoder command actually used by Open Bitstream.
+    /// Explicitly configured Settings template wins; an empty setting falls
+    /// back to [`decoder_run::detect_decoder_command`] (auto-detected
+    /// codec-analyzer). Returns `(template, Some(detection source))` — the
+    /// source is `None` for a configured command. Detection is probed once
+    /// per session (cached); saving Settings invalidates the cache.
+    fn effective_decoder_command(&mut self) -> Option<(String, Option<String>)> {
+        let configured = self.settings.decoder.run_command.trim();
+        if !configured.is_empty() {
+            return Some((configured.to_string(), None));
+        }
+        self.detected_decoder
+            .get_or_insert_with(crate::core::decoder_run::detect_decoder_command)
+            .clone()
+            .map(|(cmd, source)| (cmd, Some(source)))
+    }
+
+    /// M5: launch the external decoder command for `input` in a background
+    /// thread (arm's-length: nothing is bundled — the viewer only consumes
+    /// the files the command produces). The command is the configured
+    /// Settings template or, when empty, the auto-detected codec-analyzer
+    /// (0.16.0). Any in-flight run is cancelled first (job-id gate + kill).
     fn start_decoder_run(&mut self, ctx: &egui::Context, input: &str) {
         use crate::core::decoder_run;
-        let template = self.settings.decoder.run_command.trim().to_string();
-        if template.is_empty() {
+        let Some((template, detected)) = self.effective_decoder_command() else {
             // The dialog gates on this, but keep a belt-and-braces message.
-            self.status_error =
-                Some("Set the decoder command in Settings first".to_string());
+            self.status_error = Some(
+                "No decoder found — set the decoder command in Settings first"
+                    .to_string(),
+            );
             return;
-        }
+        };
         let input_path = std::path::PathBuf::from(input);
         if !input_path.is_file() {
             self.status_error = Some(format!("Bitstream not found: {input}"));
@@ -1651,7 +1675,12 @@ impl VideoViewerApp {
         self.decoder_run_started = Some(Instant::now());
         self.decoder_run_running = true;
         self.status_error = None;
-        self.status_info = Some(format!("Decoder run started: {}", exp.command));
+        self.status_info = Some(match detected {
+            Some(source) => {
+                format!("Decoder run started (auto-detected {source}): {}", exp.command)
+            }
+            None => format!("Decoder run started: {}", exp.command),
+        });
 
         let output = Arc::clone(&self.decoder_run_output);
         let active_job = Arc::clone(&self.decoder_run_active_job);
@@ -3758,12 +3787,14 @@ impl VideoViewerApp {
             }
         }
 
-        // Decoder-run bitstream dialog (M5)
+        // Decoder-run bitstream dialog (M5; 0.16.0 auto-detect fallback)
         if self.dialog_state == DialogState::DecoderRun {
+            let effective = self.effective_decoder_command();
             if let Some(ref mut dlg) = self.decoder_run_dialog {
-                let command_set =
-                    !self.settings.decoder.run_command.trim().is_empty();
-                if let Some(result) = dlg.show(ctx, command_set) {
+                let command_set = effective.is_some();
+                let detected_source =
+                    effective.as_ref().and_then(|(_, src)| src.as_deref());
+                if let Some(result) = dlg.show(ctx, command_set, detected_source) {
                     if let Some(path) = result {
                         self.start_decoder_run(ctx, &path);
                     }
@@ -3914,6 +3945,9 @@ impl VideoViewerApp {
                         self.settings.general.max_recent_files = dlg.max_recent_files.max(1);
                         self.settings.decoder.run_command =
                             dlg.decoder_run_command.trim().to_string();
+                        // Re-probe decoder auto-detection next time it is
+                        // needed (the command field may have been cleared).
+                        self.detected_decoder = None;
                         // Apply the new cap retroactively to the existing list
                         // so a shrink takes effect immediately.
                         let cap = self.settings.general.max_recent_files;

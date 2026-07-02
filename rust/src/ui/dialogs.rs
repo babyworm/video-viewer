@@ -919,6 +919,22 @@ impl BatchConvertDialog {
 // Settings Dialog
 // ---------------------------------------------------------------------------
 
+/// Middle-ellipsis truncation for one-line command previews: keeps the head
+/// and tail of `s`, replacing the middle with `…` when longer than `max`
+/// characters.
+fn truncate_middle(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max || max < 2 {
+        return s.to_string();
+    }
+    let head = max / 2;
+    let tail = max - head - 1; // one slot for the ellipsis
+    let mut out: String = chars[..head].iter().collect();
+    out.push('…');
+    out.extend(&chars[chars.len() - tail..]);
+    out
+}
+
 pub struct SettingsDialog {
     pub max_memory_mb: u32,
     pub zoom_min: f32,
@@ -931,11 +947,16 @@ pub struct SettingsDialog {
     pub max_recent_files: usize,
     /// M5: external decoder-run command template (empty = disabled).
     pub decoder_run_command: String,
+    /// 0.16.0: auto-detected codec-analyzer `(command, source)`, probed once
+    /// when the dialog opens. Shown as a hint (+ "Use detected" button)
+    /// while the command field is empty.
+    detected_decoder: Option<(String, String)>,
 }
 
 impl SettingsDialog {
     pub fn new(settings: &super::settings::Settings) -> Self {
         Self {
+            detected_decoder: crate::core::decoder_run::detect_decoder_command(),
             max_memory_mb: settings.cache.max_memory_mb,
             zoom_min: settings.display.zoom_min,
             zoom_max: settings.display.zoom_max,
@@ -1025,16 +1046,48 @@ impl SettingsDialog {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.decoder_run_command)
                         .desired_width(440.0)
-                        .hint_text("empty = disabled"),
+                        .hint_text(if self.detected_decoder.is_some() {
+                            "empty = use auto-detected codec-analyzer"
+                        } else {
+                            "empty = disabled"
+                        }),
                 );
                 ui.weak(
                     "Placeholders: {input}=bitstream path · {workdir}=work dir · \
                      {telemetry}=workdir/telemetry.catb · {yuv}=workdir/decoded.yuv",
                 );
-                ui.weak(
-                    "Example: python -m codec_analyzer decoder-run {input} \
-                     --decoder-workdir {workdir} --telemetry-level block --yuv-output {yuv}",
-                );
+                // 0.16.0: empty field + a detected install → offer it. An
+                // empty field already *uses* the detected command at run
+                // time; the button just makes the choice explicit/editable.
+                let mut showed_detected = false;
+                if self.decoder_run_command.trim().is_empty() {
+                    if let Some((cmd, source)) = self.detected_decoder.clone() {
+                        showed_detected = true;
+                        ui.horizontal(|ui| {
+                            ui.weak(format!(
+                                "Detected ({source}): {}",
+                                truncate_middle(&cmd, 72)
+                            ))
+                            .on_hover_text(&cmd);
+                            if ui
+                                .button("Use detected")
+                                .on_hover_text(
+                                    "Fill the field with the auto-detected \
+                                     command (empty already uses it)",
+                                )
+                                .clicked()
+                            {
+                                self.decoder_run_command = cmd;
+                            }
+                        });
+                    }
+                }
+                if !showed_detected {
+                    ui.weak(
+                        "Example: python -m codec_analyzer decoder-run {input} \
+                         --decoder-workdir {workdir} --telemetry-level block --yuv-output {yuv}",
+                    );
+                }
 
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -1745,8 +1798,15 @@ impl DecoderRunDialog {
     }
 
     /// Returns Some(Some(path)) on Run, Some(None) on cancel, None while open.
-    /// `command_set` gates the Run button (decoder template configured?).
-    pub fn show(&mut self, ctx: &egui::Context, command_set: bool) -> Option<Option<String>> {
+    /// `command_set` gates the Run button (decoder template configured or
+    /// auto-detected); `detected_source` is the auto-detection provenance to
+    /// display when no explicit command is configured (0.16.0).
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        command_set: bool,
+        detected_source: Option<&str>,
+    ) -> Option<Option<String>> {
         let mut result = None;
         let mut open = true;
 
@@ -1795,11 +1855,14 @@ impl DecoderRunDialog {
                     }
                 }
 
-                if !command_set {
+                if let Some(source) = detected_source {
+                    ui.weak(format!("Auto-detected: {source}"));
+                } else if !command_set {
                     ui.separator();
                     ui.colored_label(
                         egui::Color32::YELLOW,
-                        "Set the decoder command in Settings first \
+                        "No codec-analyzer auto-detected — set the decoder \
+                         command in Settings first \
                          (Edit → Settings → Bitstream Decoder).",
                     );
                 }
@@ -1896,4 +1959,25 @@ pub fn show_about_dialog(ctx: &egui::Context) -> bool {
             ui.label("Built with egui, rayon");
         });
     open
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_middle;
+
+    #[test]
+    fn truncate_middle_short_unchanged() {
+        assert_eq!(truncate_middle("abc", 10), "abc");
+        assert_eq!(truncate_middle("", 10), "");
+    }
+
+    #[test]
+    fn truncate_middle_keeps_head_and_tail() {
+        let s = "0123456789abcdefghij";
+        let t = truncate_middle(s, 9);
+        assert_eq!(t.chars().count(), 9);
+        assert!(t.starts_with("0123"));
+        assert!(t.ends_with("ghij"));
+        assert!(t.contains('…'));
+    }
 }
