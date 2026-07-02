@@ -89,6 +89,21 @@ impl Default for BitstreamViewSettings {
     }
 }
 
+/// M5 external decoder-run launcher (arm's-length: the viewer only executes
+/// a user-provided command template and consumes its output files — no
+/// decoder is bundled or linked). Separate from [`BitstreamViewSettings`]
+/// because that struct is rebuilt wholesale from the analysis window's
+/// ViewConfig on every view change, which would wipe fields it doesn't know.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DecoderSettings {
+    /// Shell command template. Placeholders: `{input}` (bitstream path),
+    /// `{workdir}` (per-bitstream work dir), `{telemetry}`
+    /// (`{workdir}/telemetry.catb`), `{yuv}` (`{workdir}/decoded.yuv`).
+    /// Empty = feature disabled (Open Bitstream… only shows guidance).
+    #[serde(default)]
+    pub run_command: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
     pub cache: CacheSettings,
@@ -98,6 +113,8 @@ pub struct Settings {
     pub general: GeneralSettings,
     #[serde(default)]
     pub bitstream: BitstreamViewSettings,
+    #[serde(default)]
+    pub decoder: DecoderSettings,
     #[serde(default)]
     pub recent_files: Vec<String>,
 }

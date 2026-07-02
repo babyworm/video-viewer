@@ -19,6 +19,8 @@ pub enum BitstreamAction {
     SetOffset(i32),
     /// M4: toggle the main-canvas overlay (mirrors the window's ViewConfig).
     SetOverlayOnCanvas(bool),
+    /// M5: kill the in-flight external decoder run.
+    CancelDecode,
 }
 
 /// Read-only + mutable context handed to the panel each frame.
@@ -38,6 +40,9 @@ pub struct BitstreamPanelContext<'a> {
     pub window_open: bool,
     /// M4: main-canvas overlay toggle state (app-owned, session only).
     pub overlay_on_canvas: bool,
+    /// M5: seconds since the external decoder run started
+    /// (None = no run in flight).
+    pub decoding_elapsed: Option<f64>,
 }
 
 pub struct BitstreamPanel;
@@ -63,6 +68,19 @@ impl BitstreamPanel {
 
         ui.heading("Bitstream (.catb)");
         ui.separator();
+
+        // M5: external decoder-run progress — shown regardless of whether a
+        // telemetry file is already loaded (the run may replace it).
+        if let Some(secs) = ctx.decoding_elapsed {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!("Decoding… {}s", secs.max(0.0) as u64));
+                if ui.button("Cancel").clicked() {
+                    action = Some(BitstreamAction::CancelDecode);
+                }
+            });
+            ui.separator();
+        }
 
         let Some(bs) = ctx.bitstream else {
             if ui.button("Load .catb…").clicked() {

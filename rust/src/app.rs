@@ -17,6 +17,17 @@ use crate::ui::toolbar::{Toolbar, ToolbarAction, colorize_channel};
 /// Tagged scene detection output: (job_id, Ok(changes) | Err(message)).
 type SceneDetectOutput = Arc<std::sync::Mutex<Option<(usize, Result<Vec<usize>, String>)>>>;
 
+/// Tagged decoder-run output: (job_id, Ok(()) | Err(message)) — M5.
+type DecoderRunOutput = Arc<std::sync::Mutex<Option<(usize, Result<(), String>)>>>;
+
+/// Output paths of the in-flight decoder run, consumed on success (M5).
+struct PendingDecode {
+    telemetry: std::path::PathBuf,
+    yuv: std::path::PathBuf,
+    /// The template referenced `{yuv}` — only then consider auto-opening it.
+    wants_yuv: bool,
+}
+
 const ZOOM_PRESETS: &[(f32, &str)] = &[
     (0.5, "50%"),
     (1.0, "100%"),
@@ -236,6 +247,24 @@ pub struct VideoViewerApp {
     /// WSLg (observed: broken pipe + winit Exit Failure), so the auto-open
     /// is deferred a few paints until the root surface is settled.
     bs_window_open_delay: u8,
+    // --- M5: external decoder-run launcher (Tools → Open Bitstream…) ---
+    /// Path picker dialog for the bitstream to decode.
+    decoder_run_dialog: Option<dialogs::DecoderRunDialog>,
+    /// Whether a decoder run is in flight (drives the panel spinner).
+    decoder_run_running: bool,
+    /// Tagged result slot (scene-detect publish pattern).
+    decoder_run_output: DecoderRunOutput,
+    /// Monotonic job counter — stale completions are discarded.
+    decoder_run_job_id: usize,
+    /// The job ID the worker must match to publish (shared with the thread).
+    decoder_run_active_job: Arc<AtomicUsize>,
+    /// The spawned shell child, parked so Cancel can `kill()` it.
+    decoder_run_child: Arc<std::sync::Mutex<Option<std::process::Child>>>,
+    /// Start instant for the "Decoding… Ns" elapsed readout.
+    decoder_run_started: Option<Instant>,
+    /// Output paths of the in-flight run (telemetry/yuv), used on success.
+    decoder_run_pending: Option<PendingDecode>,
+
     /// Active "Guess with hint" dialog (View → Video Size → Guess with hint…).
     guess_size_dialog: Option<dialogs::GuessSizeDialog>,
     /// Pointer position captured while a file drag is in progress
@@ -359,6 +388,14 @@ impl VideoViewerApp {
             startup_catb: catb,
             startup_catb_window: catb_window,
             bs_window_open_delay: 0,
+            decoder_run_dialog: None,
+            decoder_run_running: false,
+            decoder_run_output: Arc::new(std::sync::Mutex::new(None)),
+            decoder_run_job_id: 0,
+            decoder_run_active_job: Arc::new(AtomicUsize::new(0)),
+            decoder_run_child: Arc::new(std::sync::Mutex::new(None)),
+            decoder_run_started: None,
+            decoder_run_pending: None,
             guess_size_dialog: None,
             last_drop_target_pos: None,
             interlace_view: InterlaceViewMode::Progressive,
@@ -1517,6 +1554,173 @@ impl VideoViewerApp {
         self.corr_scan_active_job.store(0, Ordering::Release);
     }
 
+    /// M5: launch the user-configured external decoder command for
+    /// `input` in a background thread (arm's-length: nothing is bundled —
+    /// the viewer only consumes the files the command produces). Any
+    /// in-flight run is cancelled first (job-id gate + kill).
+    fn start_decoder_run(&mut self, ctx: &egui::Context, input: &str) {
+        use crate::core::decoder_run;
+        let template = self.settings.decoder.run_command.trim().to_string();
+        if template.is_empty() {
+            // The dialog gates on this, but keep a belt-and-braces message.
+            self.status_error =
+                Some("Set the decoder command in Settings first".to_string());
+            return;
+        }
+        let input_path = std::path::PathBuf::from(input);
+        if !input_path.is_file() {
+            self.status_error = Some(format!("Bitstream not found: {input}"));
+            return;
+        }
+        // Cancel any in-flight run silently (re-run replaces it).
+        self.decoder_run_active_job.store(0, Ordering::Release);
+        if let Some(child) = self.decoder_run_child.lock().unwrap().as_mut() {
+            let _ = child.kill(); // worker loop reaps it
+        }
+        // Workdir: sibling <name>.catb-run/ (reused when it already exists).
+        let workdir = decoder_run::derive_workdir(&input_path);
+        if let Err(e) = std::fs::create_dir_all(&workdir) {
+            self.status_error =
+                Some(format!("Cannot create workdir {}: {e}", workdir.display()));
+            return;
+        }
+        let exp = decoder_run::expand_command(&template, &input_path, &workdir);
+        self.decoder_run_job_id += 1;
+        let job_id = self.decoder_run_job_id;
+        {
+            // Store under the output lock so an in-flight publisher can't
+            // race the new active_job value (scene-detect pattern).
+            let _lock = self.decoder_run_output.lock().unwrap();
+            self.decoder_run_active_job.store(job_id, Ordering::Release);
+        }
+        self.decoder_run_pending = Some(PendingDecode {
+            telemetry: exp.telemetry.clone(),
+            yuv: exp.yuv.clone(),
+            wants_yuv: exp.wants_yuv,
+        });
+        self.decoder_run_started = Some(Instant::now());
+        self.decoder_run_running = true;
+        self.status_error = None;
+        self.status_info = Some(format!("Decoder run started: {}", exp.command));
+
+        let output = Arc::clone(&self.decoder_run_output);
+        let active_job = Arc::clone(&self.decoder_run_active_job);
+        // Fresh per-job child slot: a superseded worker keeps its *own* Arc
+        // (it can still reap its own killed child) but can never take/kill
+        // the new job's child. Sharing one slot let the old worker wake from
+        // its poll sleep and kill the replacement run's decoder.
+        self.decoder_run_child = Arc::new(std::sync::Mutex::new(None));
+        let child_slot = Arc::clone(&self.decoder_run_child);
+        let ctx2 = ctx.clone();
+        let command = exp.command;
+        let stdout_log = workdir.join(decoder_run::STDOUT_LOG);
+        let stderr_log = workdir.join(decoder_run::STDERR_LOG);
+        std::thread::spawn(move || {
+            let result = decoder_run::run_shell_command(
+                &command,
+                &stdout_log,
+                &stderr_log,
+                job_id,
+                &active_job,
+                &child_slot,
+            );
+            // Publish only if still the active job (check inside the lock).
+            let mut slot = output.lock().unwrap();
+            if active_job.load(Ordering::Acquire) == job_id {
+                *slot = Some((job_id, result));
+                drop(slot);
+                ctx2.request_repaint();
+            }
+        });
+    }
+
+    /// M5: user-initiated cancel — invalidate the job and kill the child.
+    fn cancel_decoder_run(&mut self) {
+        self.decoder_run_active_job.store(0, Ordering::Release);
+        if let Some(child) = self.decoder_run_child.lock().unwrap().as_mut() {
+            let _ = child.kill(); // worker loop reaps it
+        }
+        self.decoder_run_running = false;
+        self.decoder_run_started = None;
+        self.decoder_run_pending = None;
+        self.status_info = Some("Decoder run cancelled".to_string());
+    }
+
+    /// M5 completion (exit 0): load the produced telemetry, auto-open the
+    /// analysis window, and — only when no video is currently open — open
+    /// the decoded YUV (I420, resolution from the .catb, frame count
+    /// validated against the file size).
+    fn finish_decoder_run(&mut self, ctx: &egui::Context, pending: PendingDecode) {
+        use crate::core::decoder_run;
+        if !pending.telemetry.is_file() {
+            let msg = format!(
+                "Decoder finished but produced no telemetry at {}",
+                pending.telemetry.display()
+            );
+            self.bitstream_error = Some(msg.clone());
+            self.status_error = Some(msg);
+            return;
+        }
+        let tele_str = pending.telemetry.to_string_lossy().into_owned();
+        // Parse once; the YUV auto-open needs the stream resolution *before*
+        // open_file (which unloads any loaded telemetry), so the commit is
+        // sequenced manually instead of going through load_bitstream.
+        let file = match crate::analysis::bitstream_stats::BitstreamFile::open(&tele_str) {
+            Ok(f) => Arc::new(f),
+            Err(e) => {
+                self.bitstream_error = Some(e.clone());
+                self.status_error = Some(format!("Decoder telemetry load failed: {e}"));
+                return;
+            }
+        };
+        // Decoded YUV: only when the template asked for it AND no video is
+        // open. An already-open video is kept (status message only).
+        if pending.wants_yuv {
+            let yuv_size = std::fs::metadata(&pending.yuv).ok().map(|m| m.len());
+            if self.reader.is_some() {
+                if yuv_size.is_some() {
+                    self.status_info = Some(format!(
+                        "Decoded YUV written to {} (current video kept)",
+                        pending.yuv.display()
+                    ));
+                }
+            } else {
+                match decoder_run::plan_yuv_open(yuv_size, file.width, file.height) {
+                    Ok(frames) => {
+                        let yuv_str = pending.yuv.to_string_lossy().into_owned();
+                        // open_file calls unload_bitstream — fine, the new
+                        // telemetry is committed right after this.
+                        self.open_file(ctx, yuv_str, file.width, file.height, "I420");
+                        // open_file reports its own status_error on failure —
+                        // only claim success when the reader actually opened.
+                        if self.reader.is_some() {
+                            self.status_info = Some(format!(
+                                "Opened decoded YUV ({}x{} I420, {frames} frames)",
+                                file.width, file.height
+                            ));
+                        }
+                    }
+                    Err(reason) => {
+                        self.status_info = Some(format!("Decoded YUV skipped: {reason}"));
+                    }
+                }
+            }
+        }
+        // Commit the telemetry — same mismatch parking as load_bitstream.
+        let mismatch = self.reader.as_ref().is_some_and(|r| {
+            file.width > 0
+                && file.height > 0
+                && (file.width != r.width() || file.height != r.height())
+        });
+        if mismatch {
+            self.pending_catb = Some((tele_str, file));
+        } else {
+            self.finalize_bitstream_load(ctx, &tele_str, file);
+            // §B: analysis window auto-opens on a successful decoder run.
+            self.open_bitstream_window(ctx);
+        }
+    }
+
     /// Open (or re-focus) the Bitstream Analysis window and push fresh data.
     fn open_bitstream_window(&mut self, ctx: &egui::Context) {
         let was_open = self.bitstream_window.open;
@@ -1742,6 +1946,16 @@ impl eframe::App for VideoViewerApp {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         let c = visuals.extreme_bg_color;
         [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0]
+    }
+
+    /// M5: closing the app must not leave an external decoder run orphaned —
+    /// invalidate the job, kill the child, and reap it before shutdown.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.decoder_run_active_job.store(0, Ordering::Release);
+        if let Some(mut child) = self.decoder_run_child.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -2335,6 +2549,23 @@ impl eframe::App for VideoViewerApp {
                     // --- Bitstream telemetry (.catb) entry point ---
                     // Separate feature from the core viewer: decoder telemetry
                     // produced externally by codec-analyzer decoder-run.
+                    // M5: run the external decoder command on a raw bitstream
+                    // and consume its outputs (arm's-length launcher).
+                    if ui.button("Open Bitstream…")
+                        .on_hover_text(
+                            "Decode .h265/.h264 with the external decoder \
+                             command from Settings, then load its telemetry",
+                        )
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        let initial_dir = self.current_file.as_ref()
+                            .and_then(|f| std::path::Path::new(f).parent())
+                            .and_then(|p| p.to_str());
+                        self.decoder_run_dialog =
+                            Some(dialogs::DecoderRunDialog::new(initial_dir));
+                        self.dialog_state = DialogState::DecoderRun;
+                    }
                     if ui.button("Load Bitstream Telemetry (.catb)…").clicked() {
                         ui.close_menu();
                         let initial_dir = self.current_file.as_ref()
@@ -2757,8 +2988,14 @@ impl eframe::App for VideoViewerApp {
         let bs_overlay_main = self.bitstream_overlay_main;
         let bs_total_frames = self.total_frames();
         let bs_viewer_size = self.reader.as_ref().map(|r| (r.width(), r.height()));
+        let bs_decoding_elapsed = if self.decoder_run_running {
+            self.decoder_run_started.map(|t| t.elapsed().as_secs_f64())
+        } else {
+            None
+        };
         let mut bs_action: Option<crate::analysis::bitstream_panel::BitstreamAction> = None;
-        let show_bs_panel = bs_file_arc.is_some() || bs_error.is_some();
+        let show_bs_panel =
+            bs_file_arc.is_some() || bs_error.is_some() || self.decoder_run_running;
         // Three render modes for the right sidebar area:
         //   1. show_pixel_inspector || show_sb_panel → full sidebar
         //   2. neither shown                         → thin clickable
@@ -2803,6 +3040,7 @@ impl eframe::App for VideoViewerApp {
                                 viewer_size: bs_viewer_size,
                                 window_open: bs_window_open,
                                 overlay_on_canvas: bs_overlay_main,
+                                decoding_elapsed: bs_decoding_elapsed,
                             },
                         );
                     }
@@ -2933,6 +3171,9 @@ impl eframe::App for VideoViewerApp {
                 }
                 BitstreamAction::SetOverlayOnCanvas(on) => {
                     self.bitstream_overlay_main = on;
+                }
+                BitstreamAction::CancelDecode => {
+                    self.cancel_decoder_run();
                 }
             }
         }
@@ -3447,6 +3688,21 @@ impl VideoViewerApp {
             }
         }
 
+        // Decoder-run bitstream dialog (M5)
+        if self.dialog_state == DialogState::DecoderRun {
+            if let Some(ref mut dlg) = self.decoder_run_dialog {
+                let command_set =
+                    !self.settings.decoder.run_command.trim().is_empty();
+                if let Some(result) = dlg.show(ctx, command_set) {
+                    if let Some(path) = result {
+                        self.start_decoder_run(ctx, &path);
+                    }
+                    self.dialog_state = DialogState::None;
+                    self.decoder_run_dialog = None;
+                }
+            }
+        }
+
         // Bitstream resolution-mismatch opt-in dialog (R5/V18): the parsed
         // .catb is parked in pending_catb until the user confirms or rejects.
         if let Some((path, file)) = self.pending_catb.take() {
@@ -3586,6 +3842,8 @@ impl VideoViewerApp {
                         self.settings.defaults.height = dlg.default_height;
                         self.settings.defaults.color_matrix = dlg.color_matrix.clone();
                         self.settings.general.max_recent_files = dlg.max_recent_files.max(1);
+                        self.settings.decoder.run_command =
+                            dlg.decoder_run_command.trim().to_string();
                         // Apply the new cap retroactively to the existing list
                         // so a shrink takes effect immediately.
                         let cap = self.settings.general.max_recent_files;
@@ -3771,6 +4029,36 @@ impl VideoViewerApp {
                     }
                 }
                 // else: stale job output — already consumed and discarded by take()
+            }
+        }
+
+        // Poll the decoder-run background result (M5, same tagged-job gate).
+        if self.decoder_run_running {
+            let taken = self.decoder_run_output.lock().unwrap().take();
+            if let Some((job_id, result)) = taken {
+                if job_id == self.decoder_run_active_job.load(Ordering::Acquire) {
+                    self.decoder_run_running = false;
+                    self.decoder_run_started = None;
+                    let pending = self.decoder_run_pending.take();
+                    match result {
+                        Ok(()) => {
+                            if let Some(p) = pending {
+                                self.finish_decoder_run(ctx, p);
+                            }
+                        }
+                        Err(e) => {
+                            // §B failure: red label in the sidebar panel
+                            // (bitstream_error renders red there) + status bar.
+                            let msg = format!("Decoder run failed: {e}");
+                            self.bitstream_error = Some(msg.clone());
+                            self.status_error = Some(msg);
+                        }
+                    }
+                }
+                // else: stale output from a superseded run — discarded.
+            } else {
+                // Keep the elapsed-time readout ticking while decoding.
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
             }
         }
     }

@@ -17,6 +17,7 @@ pub enum DialogState {
     BatchConvert,
     SidebandFile,
     CatbFile,
+    DecoderRun,
     GuessSize,
 }
 
@@ -928,6 +929,8 @@ pub struct SettingsDialog {
     pub default_height: u32,
     pub color_matrix: String,
     pub max_recent_files: usize,
+    /// M5: external decoder-run command template (empty = disabled).
+    pub decoder_run_command: String,
 }
 
 impl SettingsDialog {
@@ -942,6 +945,7 @@ impl SettingsDialog {
             default_height: settings.defaults.height,
             color_matrix: settings.defaults.color_matrix.clone(),
             max_recent_files: settings.general.max_recent_files,
+            decoder_run_command: settings.decoder.run_command.clone(),
         }
     }
 
@@ -1014,6 +1018,23 @@ impl SettingsDialog {
                         });
                     ui.end_row();
                 });
+
+                ui.separator();
+                ui.heading("Bitstream Decoder");
+                ui.label("Bitstream decoder command (external tool, run by Tools → Open Bitstream…):");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.decoder_run_command)
+                        .desired_width(440.0)
+                        .hint_text("empty = disabled"),
+                );
+                ui.weak(
+                    "Placeholders: {input}=bitstream path · {workdir}=work dir · \
+                     {telemetry}=workdir/telemetry.catb · {yuv}=workdir/decoded.yuv",
+                );
+                ui.weak(
+                    "Example: python -m codec_analyzer decoder-run {input} \
+                     --decoder-workdir {workdir} --telemetry-level block --yuv-output {yuv}",
+                );
 
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -1681,6 +1702,123 @@ impl CatbFileDialog {
                         .clicked()
                     {
                         result = Some(Some(self.path.clone()));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(None);
+                    }
+                });
+            });
+
+        if !open {
+            return Some(None);
+        }
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decoder-Run Bitstream Dialog (M5)
+// ---------------------------------------------------------------------------
+
+/// Path picker for Tools → "Open Bitstream…" — the external decoder-run
+/// launcher. Mirrors [`CatbFileDialog`]; extension hint .h265/.hevc/.h264/
+/// .264/.265. When no decoder command is configured in Settings the Run
+/// button is disabled and the dialog explains how to enable the feature.
+pub struct DecoderRunDialog {
+    pub path: String,
+    file_browser: Option<FileBrowser>,
+    initial_dir: PathBuf,
+}
+
+impl DecoderRunDialog {
+    pub fn new(initial_dir: Option<&str>) -> Self {
+        let initial_dir = initial_dir
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        Self {
+            path: String::new(),
+            file_browser: None,
+            initial_dir,
+        }
+    }
+
+    /// Returns Some(Some(path)) on Run, Some(None) on cancel, None while open.
+    /// `command_set` gates the Run button (decoder template configured?).
+    pub fn show(&mut self, ctx: &egui::Context, command_set: bool) -> Option<Option<String>> {
+        let mut result = None;
+        let mut open = true;
+
+        egui::Window::new("Open Bitstream (decoder-run)")
+            .open(&mut open)
+            .resizable(true)
+            .collapsible(false)
+            .min_width(500.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Bitstream:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.path)
+                            .desired_width(350.0)
+                            .hint_text("/path/to/stream.h265 (.hevc/.h264/.264/.265)"),
+                    );
+                    let browse_label = if self.file_browser.is_some() { "Close" } else { "Browse..." };
+                    if ui.button(browse_label).clicked() {
+                        if self.file_browser.is_some() {
+                            self.file_browser = None;
+                        } else {
+                            let start = if !self.path.is_empty() {
+                                Path::new(&self.path)
+                                    .parent()
+                                    .filter(|p| p.is_dir())
+                                    .map(|p| p.to_path_buf())
+                                    .unwrap_or_else(|| self.initial_dir.clone())
+                            } else {
+                                self.initial_dir.clone()
+                            };
+                            self.file_browser = Some(FileBrowser::new(start));
+                        }
+                    }
+                });
+                ui.weak(
+                    "Runs the external decoder command from Settings, then loads \
+                     the produced telemetry.catb (and decoded.yuv when no video is open).",
+                );
+
+                // Inline file browser
+                if let Some(ref mut fb) = self.file_browser {
+                    ui.separator();
+                    if let Some(selected) = fb.show(ui) {
+                        self.path = selected;
+                        self.file_browser = None;
+                    }
+                }
+
+                if !command_set {
+                    ui.separator();
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "Set the decoder command in Settings first \
+                         (Edit → Settings → Bitstream Decoder).",
+                    );
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            command_set && !self.path.trim().is_empty(),
+                            egui::Button::new("Run"),
+                        )
+                        .on_disabled_hover_text(if command_set {
+                            "Choose a bitstream file"
+                        } else {
+                            "Set the decoder command in Settings first"
+                        })
+                        .clicked()
+                    {
+                        result = Some(Some(self.path.trim().to_string()));
                     }
                     if ui.button("Cancel").clicked() {
                         result = Some(None);

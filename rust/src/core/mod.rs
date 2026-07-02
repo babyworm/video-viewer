@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod catb;
 pub mod colorspace;
+pub mod decoder_run;
 pub mod formats;
 pub mod hints;
 pub mod pixel;
