@@ -17,6 +17,9 @@ pub enum DialogState {
     BatchConvert,
     SidebandFile,
     CatbFile,
+    /// M-D: comparison `.catb` (B) picker — same dialog type, separate
+    /// state so a B pick can never land in the A slot.
+    CatbFileB,
     DecoderRun,
     GuessSize,
 }

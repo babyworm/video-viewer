@@ -235,9 +235,24 @@ pub struct VideoViewerApp {
     /// Successfully parsed .catb awaiting the user's resolution-mismatch
     /// opt-in (R5/V18): (path, parsed file).
     pending_catb: Option<(String, Arc<crate::analysis::bitstream_stats::BitstreamFile>)>,
+    // --- M-D: comparison stream (B) for the dual-.catb Δ view ---
+    /// Second telemetry of the same source (e.g. preprocessing on/off).
+    /// Loaded via the panel button only — drag & drop keeps routing to A.
+    pub bitstream_file_b: Option<Arc<crate::analysis::bitstream_stats::BitstreamFile>>,
+    pub bitstream_path_b: Option<String>,
+    /// Last B load error (resolution-mismatch rejection, parse failure).
+    pub bitstream_error_b: Option<String>,
+    /// B's own viewer↔catb frame offset (independent of A's).
+    pub bitstream_offset_b: i32,
+    /// Separate picker instance so a B pick can never land in the A slot.
+    catb_dialog_b: Option<dialogs::CatbFileDialog>,
     /// Correlation range-scan job guard (scene-detect job_id pattern).
     corr_scan_job_id: usize,
     corr_scan_active_job: Arc<AtomicUsize>,
+    /// Whether the active scan job computes a Δ (A−B) Y metric — those
+    /// results are bound to B's identity, so `unload_bitstream_b` must be
+    /// able to cancel exactly them (and leave A-only scans running).
+    corr_scan_job_delta: bool,
     /// CLI --catb path to auto-load on the first update pass.
     startup_catb: Option<String>,
     /// CLI --catb-window: open the analysis window once the load succeeds.
@@ -387,8 +402,14 @@ impl VideoViewerApp {
             bs_overlay_cache: crate::ui::bitstream_overlay::OverlayCache::default(),
             bitstream_panel: crate::analysis::bitstream_panel::BitstreamPanel::new(),
             corr_scan_job_id: 0,
+            corr_scan_job_delta: false,
             corr_scan_active_job: Arc::new(AtomicUsize::new(0)),
             pending_catb: None,
+            bitstream_file_b: None,
+            bitstream_path_b: None,
+            bitstream_error_b: None,
+            bitstream_offset_b: 0,
+            catb_dialog_b: None,
             startup_catb: catb,
             startup_catb_window: catb_window,
             bs_window_open_delay: 0,
@@ -1473,6 +1494,10 @@ impl VideoViewerApp {
         // every window-side cache/selection derived from the old file.
         // Without this, a scan started on file A keeps publishing A's
         // r-timeline/scatter/CSV while B is displayed.
+        // M-D: the comparison stream (B) is anchored on A — replacing A
+        // voids the pair (resolution gate, "same source" premise), so B
+        // unloads too (same rule as unload_bitstream).
+        self.unload_bitstream_b();
         self.corr_scan_active_job.store(0, Ordering::Release);
         self.bitstream_offset = 0;
         self.bitstream_window.reset_file_state();
@@ -1530,6 +1555,8 @@ impl VideoViewerApp {
     }
 
     pub fn unload_bitstream(&mut self) {
+        // M-D: B cannot outlive A (the Δ pair is anchored on A).
+        self.unload_bitstream_b();
         self.bitstream_file = None;
         self.bitstream_path = None;
         self.bitstream_error = None;
@@ -1557,6 +1584,100 @@ impl VideoViewerApp {
         s.corr_scan_progress = (0, 0);
         s.corr_hover_cell = None;
         self.corr_scan_active_job.store(0, Ordering::Release);
+    }
+
+    /// M-D: load the comparison `.catb` (B). Requires A (the Δ pair is
+    /// anchored on it) and an equal coded resolution — a mismatch is
+    /// rejected outright (unlike A's viewer-mismatch opt-in dialog: a Δ
+    /// over different geometries is meaningless, so there is nothing to
+    /// opt into). A frame-count mismatch is a panel warning only.
+    pub fn load_bitstream_b(&mut self, ctx: &egui::Context, path: &str) -> Result<(), String> {
+        let Some(file_a) = self.bitstream_file.clone() else {
+            return Err("load a primary .catb (A) first — B compares against it".to_string());
+        };
+        let file = Arc::new(crate::analysis::bitstream_stats::BitstreamFile::open(path)?);
+        crate::analysis::bitstream_diff::validate_b_resolution(
+            (file_a.width, file_a.height),
+            (file.width, file.height),
+        )?;
+        // Replacing an already-loaded B behaves like unload-then-load
+        // (0.12.1 convention: no stale Δ cache may survive the swap).
+        self.unload_bitstream_b();
+        self.bitstream_file_b = Some(Arc::clone(&file));
+        self.bitstream_path_b = Some(path.to_string());
+        self.bitstream_error_b = None;
+        {
+            let mut s = self.bitstream_window.shared.lock();
+            s.file_b = Some(Arc::clone(&file));
+            s.offset_b = 0;
+            s.frame_graph_b = None;
+            s.frame_graph_b_scanning = true;
+        }
+        // B's Frame Graph series — same background-scan pattern as A.
+        let shared = Arc::clone(&self.bitstream_window.shared);
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let points = crate::ui::bitstream_window::compute_frame_graph(&file);
+            let mut s = shared.lock();
+            let still_current = s
+                .file_b
+                .as_ref()
+                .map(|f| Arc::ptr_eq(f, &file))
+                .unwrap_or(false);
+            if still_current {
+                s.frame_graph_b = Some(Arc::new(points));
+                s.frame_graph_b_scanning = false;
+            }
+            drop(s);
+            ctx2.request_repaint();
+        });
+        self.update_bitstream_shared(ctx);
+        Ok(())
+    }
+
+    /// M-D: unload the comparison stream and every Δ-derived cache.
+    pub fn unload_bitstream_b(&mut self) {
+        self.bitstream_file_b = None;
+        self.bitstream_path_b = None;
+        self.bitstream_error_b = None;
+        self.bitstream_offset_b = 0;
+        self.bitstream_window.reset_b_state();
+        let mut s = self.bitstream_window.shared.lock();
+        s.file_b = None;
+        s.offset_b = 0;
+        s.frame_graph_b = None;
+        s.frame_graph_b_scanning = false;
+        // A Δ range scan is bound to B's identity, which `corr_scan_stale`
+        // does not track (it only compares g/x/y/offsets) — so B's
+        // unload/replace must invalidate Δ scan state here, exactly like
+        // A's unload/finalize paths do for A. A-only scans are untouched.
+        // 1. A completed Δ scan describes the departing B: drop it, or its
+        //    r-timeline/scatter/CSV would present B1's numbers as current
+        //    after a B2 swap (load_bitstream_b is unload-then-load).
+        if s
+            .corr_scan
+            .as_ref()
+            .is_some_and(|scan| scan.request.y.is_delta())
+        {
+            s.corr_scan = None;
+        }
+        // 2. A pending Δ request not yet picked up by the root would start
+        //    scanning against the new (or no) B with stale intent.
+        if s
+            .corr_scan_request
+            .as_ref()
+            .is_some_and(|req| req.y.is_delta())
+        {
+            s.corr_scan_request = None;
+        }
+        // 3. An in-flight Δ scan keeps reading the old B Arc and would
+        //    publish its results after the swap: cancel the job (0 is
+        //    never a live job id — publish-if-current then discards it).
+        if s.corr_scanning && self.corr_scan_job_delta {
+            self.corr_scan_active_job.store(0, Ordering::Release);
+            s.corr_scanning = false;
+            s.corr_scan_progress = (0, 0);
+        }
     }
 
     /// Route a dropped file by its [`DroppedKind`] (0.15.0). Called for
@@ -1852,6 +1973,7 @@ impl VideoViewerApp {
             shared.viewer_total = self.total_frames();
             shared.viewer_size = self.reader.as_ref().map(|r| (r.width(), r.height()));
             shared.offset = self.bitstream_offset;
+            shared.offset_b = self.bitstream_offset_b;
             shared.is_playing = self.is_playing;
             // M3: scene-change markers for the r timeline — existing results
             // only, never triggers a detection run.
@@ -1951,14 +2073,35 @@ impl VideoViewerApp {
             s.corr_scanning = false;
             return;
         }
+        // M-D: delta Y metrics need the comparison stream (B) pinned at
+        // request time — fail up front with the reason otherwise.
+        let file_b = if req.y.is_delta() {
+            match self.bitstream_file_b.clone() {
+                Some(f) => Some(f),
+                None => {
+                    let mut s = self.bitstream_window.shared.lock();
+                    s.corr_scan = Some(Arc::new(corr::CorrScanResult::new(
+                        req,
+                        Vec::new(),
+                        Some("comparison .catb (B) not loaded".to_string()),
+                    )));
+                    s.corr_scanning = false;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         // The request carries the offset it was built with — keeping it in
         // the result lets the window detect offset-change staleness.
         let offset = req.offset;
+        let offset_b = req.offset_b;
         let start = req.start.min(total - 1);
         let end = req.end.min(total - 1).max(start);
 
         self.corr_scan_job_id += 1;
         let job_id = self.corr_scan_job_id;
+        self.corr_scan_job_delta = req.y.is_delta();
         self.corr_scan_active_job.store(job_id, Ordering::Release);
         let active_job = Arc::clone(&self.corr_scan_active_job);
         let shared = Arc::clone(&self.bitstream_window.shared);
@@ -2092,6 +2235,30 @@ impl VideoViewerApp {
                         bs_g.psnr =
                             crate::analysis::stage::psnr_to_g(vl, &recon_luma, sw, sh, req.g);
                     }
+                }
+                // M-D: delta metrics — subtract B's G aggregate for the
+                // same viewer frame (B's own offset). Frames B does not
+                // cover are skipped, not pushed, so the per-frame timeline
+                // stays sorted and gap-free (ReconPsnr precedent).
+                if let Some(fb) = file_b.as_ref() {
+                    let display_b = crate::analysis::bitstream_stats::viewer_to_catb_display(
+                        i, offset_b,
+                    )
+                    .filter(|&db| db < fb.frame_count());
+                    let Some(display_b) = display_b else {
+                        continue;
+                    };
+                    let Some(decode_b) = fb.decode_idx(display_b) else {
+                        continue;
+                    };
+                    let Ok(blocks_b) = fb.catb.blocks_for_frame(decode_b) else {
+                        continue;
+                    };
+                    let b_l1 = crate::analysis::bitstream_stats::rasterize_blocks_tx(
+                        &blocks_b, None, sw, sh, 8,
+                    );
+                    let bs_b = corr::aggregate_bitstream_to_g(&b_l1, sw, sh, req.g);
+                    corr::subtract_bitstream_g(&mut bs_g, &bs_b);
                 }
                 frames.push((i, corr::align(&xg, &bs_g, req.y)));
                 {
@@ -3164,6 +3331,10 @@ impl eframe::App for VideoViewerApp {
         let bs_path = self.bitstream_path.clone();
         let bs_error = self.bitstream_error.clone();
         let bs_offset = self.bitstream_offset;
+        let bs_file_b_arc = self.bitstream_file_b.clone();
+        let bs_path_b = self.bitstream_path_b.clone();
+        let bs_error_b = self.bitstream_error_b.clone();
+        let bs_offset_b = self.bitstream_offset_b;
         let bs_window_open = self.bitstream_window.open;
         let bs_overlay_main = self.bitstream_overlay_main;
         let bs_total_frames = self.total_frames();
@@ -3221,6 +3392,10 @@ impl eframe::App for VideoViewerApp {
                                 window_open: bs_window_open,
                                 overlay_on_canvas: bs_overlay_main,
                                 decoding_elapsed: bs_decoding_elapsed,
+                                bitstream_b: bs_file_b_arc.as_deref(),
+                                bitstream_path_b: bs_path_b.as_deref(),
+                                error_b: bs_error_b.as_deref(),
+                                offset_b: bs_offset_b,
                             },
                         );
                     }
@@ -3354,6 +3529,24 @@ impl eframe::App for VideoViewerApp {
                 }
                 BitstreamAction::CancelDecode => {
                     self.cancel_decoder_run();
+                }
+                // M-D: comparison stream (B) — explicit button path only.
+                BitstreamAction::LoadBRequested => {
+                    let initial_dir = self
+                        .bitstream_path
+                        .as_ref()
+                        .or(self.current_file.as_ref())
+                        .and_then(|f| std::path::Path::new(f).parent())
+                        .and_then(|p| p.to_str());
+                    self.catb_dialog_b = Some(dialogs::CatbFileDialog::new(initial_dir));
+                    self.dialog_state = DialogState::CatbFileB;
+                }
+                BitstreamAction::UnloadB => {
+                    self.unload_bitstream_b();
+                }
+                BitstreamAction::SetOffsetB(offset) => {
+                    self.bitstream_offset_b = offset;
+                    self.update_bitstream_shared(ctx);
                 }
             }
         }
@@ -3871,6 +4064,22 @@ impl VideoViewerApp {
                     }
                     self.dialog_state = DialogState::None;
                     self.catb_dialog = None;
+                }
+            }
+        }
+
+        // M-D: comparison .catb (B) file dialog — errors (resolution
+        // mismatch rejection etc.) surface in the panel's B section.
+        if self.dialog_state == DialogState::CatbFileB {
+            if let Some(ref mut dlg) = self.catb_dialog_b {
+                if let Some(result) = dlg.show(ctx) {
+                    if let Some(path) = result {
+                        if let Err(e) = self.load_bitstream_b(ctx, &path) {
+                            self.bitstream_error_b = Some(e);
+                        }
+                    }
+                    self.dialog_state = DialogState::None;
+                    self.catb_dialog_b = None;
                 }
             }
         }

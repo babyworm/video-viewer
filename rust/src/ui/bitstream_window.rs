@@ -17,6 +17,7 @@ use std::sync::Arc;
 use eframe::egui;
 use parking_lot::Mutex;
 
+use crate::analysis::bitstream_diff::{diff_grids, DiffGrid, DiffMetric};
 use crate::analysis::bitstream_panel::format_bits;
 use crate::analysis::bitstream_stats::{
     aggregate_block_tx, build_filmstrip_refs, compute_frame_stats, hit_test_min_area,
@@ -26,8 +27,9 @@ use crate::analysis::bitstream_stats::{
 };
 use crate::analysis::correlation::{
     aggregate_bitstream_to_g, align, class_table, classes_at_g, csv_dump, opportunity_grid,
-    pearson_r, spearman_rho, top_n_ranking, x_grid, AlignedPair, AnalysisFrameGrids, BitstreamG,
-    CorrScanRequest, CorrScanResult, XMetric, YMetric, G_SIZES, PRESET_PAIRS,
+    pearson_r, spearman_rho, subtract_bitstream_g, top_n_ranking, x_grid, AlignedPair,
+    AnalysisFrameGrids, BitstreamG, CorrScanRequest, CorrScanResult, XMetric, YMetric, G_SIZES,
+    PRESET_PAIRS,
 };
 use crate::analysis::motion::MotionClass;
 use crate::analysis::stage::{
@@ -122,6 +124,27 @@ impl FillMode {
     /// in their own pass (like Opportunity renders from the aligned pair).
     pub fn is_quality(&self) -> bool {
         matches!(self, FillMode::BlockPsnr | FillMode::BlockSsim)
+    }
+
+    /// M-D: fills the dual-`.catb` Δ mode can render. Scalar fills map to a
+    /// signed cell difference, Mode to the agreement mask. Opportunity and
+    /// the quality fills draw from A-only data paths (aligned pair /
+    /// BlockQuality) — no B counterpart exists, so the Δ toggle disables.
+    pub fn supports_diff(&self) -> bool {
+        self.diff_metric().is_some() || *self == FillMode::Mode
+    }
+
+    /// The [`DiffMetric`] a scalar fill diffs on (`None` for Mode and the
+    /// unsupported fills).
+    pub fn diff_metric(&self) -> Option<DiffMetric> {
+        match self {
+            FillMode::Qp => Some(DiffMetric::Qp),
+            FillMode::Bpp => Some(DiffMetric::Bpp),
+            FillMode::MvHeat => Some(DiffMetric::MvMag),
+            FillMode::CoeffEnergy => Some(DiffMetric::CoeffEnergy),
+            FillMode::NonzeroCoeffs => Some(DiffMetric::NzDensity),
+            _ => None,
+        }
     }
 }
 
@@ -722,6 +745,13 @@ pub struct BitstreamShared {
     /// Frame Graph series, filled by a background scan thread on load.
     pub frame_graph: Option<Arc<Vec<FrameGraphPoint>>>,
     pub frame_graph_scanning: bool,
+    /// M-D: the comparison stream (B) — root-published, never loaded here.
+    pub file_b: Option<Arc<BitstreamFile>>,
+    /// M-D: B's own viewer↔catb frame offset.
+    pub offset_b: i32,
+    /// M-D: B's Frame Graph series (own background scan on B load).
+    pub frame_graph_b: Option<Arc<Vec<FrameGraphPoint>>>,
+    pub frame_graph_b_scanning: bool,
     /// Child → root: the Correlation tab is visible, so the root computes
     /// analysis grids for the current frame (update_analysis convention).
     pub corr_active: bool,
@@ -777,6 +807,10 @@ impl BitstreamShared {
             drop_request: None,
             frame_graph: None,
             frame_graph_scanning: false,
+            file_b: None,
+            offset_b: 0,
+            frame_graph_b: None,
+            frame_graph_b_scanning: false,
             corr_active: false,
             corr_analysis: None,
             corr_scan_request: None,
@@ -865,6 +899,11 @@ struct Snapshot {
     is_playing: bool,
     frame_graph: Option<Arc<Vec<FrameGraphPoint>>>,
     frame_graph_scanning: bool,
+    /// M-D: comparison stream + its offset (None when not loaded).
+    file_b: Option<Arc<BitstreamFile>>,
+    offset_b: i32,
+    frame_graph_b: Option<Arc<Vec<FrameGraphPoint>>>,
+    frame_graph_b_scanning: bool,
     corr_analysis: Option<Arc<CorrAnalysisData>>,
     corr_scan: Option<Arc<CorrScanResult>>,
     corr_scanning: bool,
@@ -951,6 +990,32 @@ pub struct BitstreamWindow {
     stage_cache: StageCache,
     /// M-C: uploaded stage texture, keyed on (file, decode_idx, kind).
     stage_texture: Option<StageTexture>,
+    /// M-D: Δ mode — render the fill as the A−B cell difference (X key /
+    /// toolbar Δ toggle). Session-only and B-bound: forced off whenever no
+    /// comparison stream is loaded. Deliberately outside `ViewConfig`
+    /// (would break preset matching and has no meaning without B).
+    pub diff_mode: bool,
+    /// M-D: per-frame Δ derivation cache (A/B grids diffed at L1 + LOD).
+    diff: Option<DiffDerived>,
+}
+
+/// M-D: cached per-frame Δ data, keyed on both file identities, the viewer
+/// frame and both offsets (any of them re-maps the A/B pair).
+struct DiffDerived {
+    file_a_ptr: usize,
+    file_b_ptr: usize,
+    viewer_frame: usize,
+    offset: i32,
+    offset_b: i32,
+    /// B's blocks for the inspector's same-position hit test; `None` when B
+    /// has no frame mapped to this viewer index.
+    blocks_b: Option<Arc<Vec<BsBlock>>>,
+    /// Cell-wise Δ at the canonical L1 (8 px) grid.
+    grid_l1: Option<DiffGrid>,
+    /// Cell-wise Δ at the LOD aggregate size (A codec's CTU/4-MB cell).
+    grid_lod: Option<DiffGrid>,
+    /// Why there is no Δ for this frame (legend slot), e.g. B frame missing.
+    reason: Option<String>,
 }
 
 /// The stage image currently uploaded as a child-viewport texture (M-C).
@@ -992,6 +1057,9 @@ struct CorrDerived {
     g: u32,
     x: XMetric,
     y: YMetric,
+    /// M-D: (B file identity, B offset) the derivation used — (0, 0) for
+    /// non-delta Y metrics. Any B change re-derives a delta pair.
+    b_key: (usize, i32),
     /// `None` when the X metric needs a previous frame and there is none.
     pair: Option<AlignedPair>,
     /// Bitstream aggregate at G (drives the class table too).
@@ -1065,6 +1133,8 @@ impl BitstreamWindow {
             picture: PictureSource::Source,
             stage_cache: StageCache::new(),
             stage_texture: None,
+            diff_mode: false,
+            diff: None,
         }
     }
 
@@ -1095,6 +1165,20 @@ impl BitstreamWindow {
         self.picture = PictureSource::Source;
         self.stage_texture = None;
         self.stage_cache = StageCache::new();
+        // M-D: the Δ pair is anchored on A — an A change invalidates it.
+        self.reset_b_state();
+    }
+
+    /// M-D: drop every piece of state derived from the comparison stream
+    /// (B). Called when B is unloaded/replaced and from
+    /// [`Self::reset_file_state`] (0.12.1 cache-reset convention).
+    pub fn reset_b_state(&mut self) {
+        self.diff_mode = false;
+        self.diff = None;
+        // A freed B Arc's address can be reused by the next load, so the
+        // b_key pointer inside corr_derived cannot distinguish B1 from B2
+        // on its own (same rule as bs_overlay_cache in 0.12.1).
+        self.corr_derived = None;
     }
 
     /// Render the window. Returns the current view settings when they
@@ -1141,6 +1225,10 @@ impl BitstreamWindow {
                 is_playing: s.is_playing,
                 frame_graph: s.frame_graph.clone(),
                 frame_graph_scanning: s.frame_graph_scanning,
+                file_b: s.file_b.clone(),
+                offset_b: s.offset_b,
+                frame_graph_b: s.frame_graph_b.clone(),
+                frame_graph_b_scanning: s.frame_graph_b_scanning,
                 corr_analysis: s.corr_analysis.clone(),
                 corr_scan: s.corr_scan.clone(),
                 corr_scanning: s.corr_scanning,
@@ -1314,6 +1402,7 @@ impl BitstreamWindow {
             s: bool,
             tab: bool,
             i_key: bool,
+            x: bool,
             esc: bool,
         }
         let k = ctx.input_mut(|i| {
@@ -1348,6 +1437,7 @@ impl BitstreamWindow {
                 // Consume Tab so egui's focus traversal doesn't also react.
                 tab: i.consume_key(egui::Modifiers::NONE, egui::Key::Tab),
                 i_key: plain && i.key_pressed(egui::Key::I),
+                x: plain && i.key_pressed(egui::Key::X),
                 esc: plain && i.key_pressed(egui::Key::Escape),
             }
         });
@@ -1419,6 +1509,11 @@ impl BitstreamWindow {
         }
         if k.i_key {
             self.inspector_collapsed = !self.inspector_collapsed;
+        }
+        // M-D: Δ toggle (X) — only when a comparison stream is loaded and
+        // the current fill has a Δ rendering.
+        if k.x && snap.file_b.is_some() && self.view.fill.supports_diff() {
+            self.diff_mode = !self.diff_mode;
         }
         if k.esc {
             self.selection = None;
@@ -1536,6 +1631,36 @@ impl BitstreamWindow {
                             ui.selectable_value(&mut self.view.fill, f, f.label());
                         }
                     });
+
+                // M-D: Δ toggle — visible only while a comparison .catb (B)
+                // is loaded; enabled only for fills with a Δ rendering.
+                if snap.file_b.is_some() {
+                    let supported = self.view.fill.supports_diff();
+                    if !supported {
+                        self.diff_mode = false;
+                    }
+                    let resp = ui.add_enabled(
+                        supported,
+                        egui::SelectableLabel::new(self.diff_mode, "Δ"),
+                    );
+                    let resp = resp.on_hover_text(
+                        "Δ mode (X): fill shows the A−B difference on the \
+                         8px comparison grid — scalar fills as signed \
+                         blue-white-red, Mode as grey (same) / A's colour \
+                         (different)",
+                    );
+                    if supported {
+                        if resp.clicked() {
+                            self.diff_mode = !self.diff_mode;
+                        }
+                    } else {
+                        resp.on_disabled_hover_text(
+                            "Δ is not defined for this fill (Opportunity / \
+                             quality fills have no B counterpart) — pick \
+                             QP, bpp, Mode, MV-heat or a coeff fill",
+                        );
+                    }
+                }
 
                 ui.separator();
                 // M4 layers: MV arrows / Partition outlines / Intra dirs.
@@ -1676,6 +1801,14 @@ impl BitstreamWindow {
         if self.view.fill == FillMode::Opportunity {
             self.refresh_corr_derived(snap);
         }
+        // M-D: Δ mode is B-bound — force off when B disappeared, refresh
+        // the A/B diff grids otherwise.
+        if snap.file_b.is_none() {
+            self.diff_mode = false;
+            self.diff = None;
+        } else if self.diff_mode {
+            self.refresh_diff(snap);
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             self.ui_canvas(ui, snap);
@@ -1727,6 +1860,78 @@ impl BitstreamWindow {
             tx: None,
             quality: None,
         });
+    }
+
+    /// M-D: refresh the per-frame Δ derivation. Both streams are rasterized
+    /// onto the same fixed-cell grids (L1 8 px + A-codec LOD) and diffed
+    /// cell-wise — CU partitions differ between the two encodes, so
+    /// per-rect comparison is impossible by design. Keyed on both file
+    /// identities, the viewer frame and both offsets.
+    fn refresh_diff(&mut self, snap: &Snapshot) {
+        let (Some(file_a), Some(file_b)) = (snap.file.as_ref(), snap.file_b.as_ref()) else {
+            self.diff = None;
+            return;
+        };
+        let key = (
+            Arc::as_ptr(file_a) as usize,
+            Arc::as_ptr(file_b) as usize,
+            snap.viewer_frame,
+            snap.offset,
+            snap.offset_b,
+        );
+        if self.diff.as_ref().is_some_and(|d| {
+            (d.file_a_ptr, d.file_b_ptr, d.viewer_frame, d.offset, d.offset_b) == key
+        }) {
+            return;
+        }
+        let mut out = DiffDerived {
+            file_a_ptr: key.0,
+            file_b_ptr: key.1,
+            viewer_frame: key.2,
+            offset: key.3,
+            offset_b: key.4,
+            blocks_b: None,
+            grid_l1: None,
+            grid_lod: None,
+            reason: None,
+        };
+        // A side: reuse the Viewer tab's per-frame grids (refresh_derived
+        // ran just before). Without A data there is nothing to diff.
+        let Some(d) = self.derived.as_ref() else {
+            out.reason = Some("no catb-A frame for this viewer frame".to_string());
+            self.diff = Some(out);
+            return;
+        };
+        // B side: viewer → B display map via B's own offset.
+        let display_b = viewer_to_catb_display(snap.viewer_frame, snap.offset_b)
+            .filter(|&db| db < file_b.frame_count());
+        let Some(display_b) = display_b else {
+            out.reason = Some(format!(
+                "no catb-B frame for viewer#{} (B offset {:+})",
+                snap.viewer_frame, snap.offset_b
+            ));
+            self.diff = Some(out);
+            return;
+        };
+        let Ok(blocks_b) = file_b.blocks_display(display_b) else {
+            out.reason = Some(format!("catb-B: failed to parse frame {display_b}"));
+            self.diff = Some(out);
+            return;
+        };
+        // Same grid geometry as A (resolution equality enforced at load;
+        // diff_grids re-checks and degrades to a reason, never misaligns).
+        let (sw, sh) = (file_a.width.max(1), file_a.height.max(1));
+        let tx_agg_b = aggregate_block_tx(file_b, &blocks_b);
+        let b_l1 = rasterize_blocks_tx(&blocks_b, Some(&tx_agg_b), sw, sh, 8);
+        let lod = lod_cell_size(&file_a.catb.meta.codec);
+        let b_lod = rasterize_blocks_tx(&blocks_b, Some(&tx_agg_b), sw, sh, lod);
+        out.grid_l1 = diff_grids(&d.grid_l1, &b_l1);
+        out.grid_lod = diff_grids(&d.grid_lod, &b_lod);
+        if out.grid_l1.is_none() {
+            out.reason = Some("A/B grid geometry mismatch — Δ unavailable".to_string());
+        }
+        out.blocks_b = Some(blocks_b);
+        self.diff = Some(out);
     }
 
     /// M-C: lazily compute per-block PSNR/SSIM (`final_recon` vs the viewer
@@ -1989,9 +2194,77 @@ impl BitstreamWindow {
         };
 
         let derived = self.derived.as_ref();
+        // M-D: Δ mode replaces the plain fill with the A−B cell difference.
+        let diff_active = self.diff_mode && self.view.fill.supports_diff();
         if let (Some(d), false) = (derived, peek) {
             let opacity = self.view.opacity;
             let lod_mode = use_lod(zoom);
+
+            // M-D Δ fill: cell-wise difference on the comparison grids
+            // (L1 8px canonical, LOD aggregate below 1.5x — the Opportunity
+            // paint-pass convention). Scalar fills → diverging
+            // blue-white-red on the symmetric ±max|Δ| scale; Mode → grey
+            // where both streams agree, A's mode colour where they differ
+            // (VQA Δ convention).
+            if diff_active {
+                let grid = self.diff.as_ref().and_then(|dd| {
+                    if lod_mode {
+                        dd.grid_lod.as_ref()
+                    } else {
+                        dd.grid_l1.as_ref()
+                    }
+                });
+                if let Some(g) = grid {
+                    // One colour scale for both LOD levels: the canonical
+                    // L1 max|Δ| (the legend shows the same number).
+                    let scale = self
+                        .diff
+                        .as_ref()
+                        .and_then(|dd| dd.grid_l1.as_ref())
+                        .unwrap_or(g);
+                    let metric = self.view.fill.diff_metric();
+                    let dmax = metric.map(|m| scale.max_abs(m)).unwrap_or(0.0);
+                    let cell = g.cell as f32;
+                    let same_grey = egui::Color32::from_rgba_unmultiplied(
+                        128,
+                        128,
+                        128,
+                        ((opacity * 0.45).clamp(0.0, 1.0) * 255.0) as u8,
+                    );
+                    for r in 0..g.rows {
+                        for c in 0..g.cols {
+                            let i = (r as usize) * (g.cols as usize) + c as usize;
+                            if !g.valid[i] {
+                                continue;
+                            }
+                            let color = match metric {
+                                Some(m) => {
+                                    opportunity_cell_color(g.values(m)[i], dmax, opacity)
+                                }
+                                None => {
+                                    // Mode agreement.
+                                    if g.mode_same(i) {
+                                        same_grey
+                                    } else {
+                                        let mc = mode_color(g.mode_a[i]);
+                                        egui::Color32::from_rgba_unmultiplied(
+                                            mc.r(),
+                                            mc.g(),
+                                            mc.b(),
+                                            (opacity.clamp(0.0, 1.0) * 255.0) as u8,
+                                        )
+                                    }
+                                }
+                            };
+                            let rect =
+                                block_rect(c as f32 * cell, r as f32 * cell, cell, cell);
+                            if rect.intersects(canvas_rect) {
+                                painter.rect_filled(rect, 0.0, color);
+                            }
+                        }
+                    }
+                }
+            }
 
             // Opportunity fill (M3): G-grid cells from the aligned pair —
             // the cell count is small, so no LOD is needed.
@@ -2051,7 +2324,8 @@ impl BitstreamWindow {
             }
 
             // Fill layer — LOD aggregate cells below 1.5x, per-CU rects above.
-            if !matches!(
+            // Suppressed in Δ mode: the Δ pass above owns the fill surface.
+            if !diff_active && !matches!(
                 self.view.fill,
                 FillMode::None | FillMode::Opportunity | FillMode::BlockPsnr | FillMode::BlockSsim
             ) {
@@ -2302,8 +2576,43 @@ impl BitstreamWindow {
                 let sx = (pos.x - origin.x) / zx;
                 let sy = (pos.y - origin.y) / zy;
                 if sx >= 0.0 && sy >= 0.0 && sx < sw && sy < sh {
+                    // M-D: Δ readout of the hovered L1 cell (A / B / Δ 병기,
+                    // tooltip + loupe alike).
+                    let diff_cell = (diff_active)
+                        .then(|| {
+                            let g = self.diff.as_ref()?.grid_l1.as_ref()?;
+                            let (c, r) = (sx as u32 / g.cell, sy as u32 / g.cell);
+                            if c >= g.cols || r >= g.rows {
+                                return None;
+                            }
+                            let i = (r as usize) * (g.cols as usize) + c as usize;
+                            g.valid[i].then_some((g, i))
+                        })
+                        .flatten();
                     if self.show_loupe {
-                        draw_l1_loupe(ui, pos, &d.grid_l1, self.view.fill, sx as u32, sy as u32);
+                        if diff_active {
+                            if let Some(g) =
+                                self.diff.as_ref().and_then(|dd| dd.grid_l1.as_ref())
+                            {
+                                draw_diff_loupe(
+                                    ui,
+                                    pos,
+                                    g,
+                                    self.view.fill,
+                                    sx as u32,
+                                    sy as u32,
+                                );
+                            }
+                        } else {
+                            draw_l1_loupe(
+                                ui,
+                                pos,
+                                &d.grid_l1,
+                                self.view.fill,
+                                sx as u32,
+                                sy as u32,
+                            );
+                        }
                     } else if let Some(bi) = hit_test_min_area(&d.blocks, sx as u32, sy as u32) {
                         let b = &d.blocks[bi];
                         let area = (b.w as f32 * b.h as f32).max(1.0);
@@ -2344,6 +2653,36 @@ impl BitstreamWindow {
                                 );
                             }
                         }
+                        // M-D: lead with the hovered comparison cell's
+                        // A / B / Δ (§ tooltip 병기). The A value comes from
+                        // A's own L1 grid at the same cell; B = A − Δ.
+                        if let Some((g, i)) = diff_cell {
+                            match self.view.fill.diff_metric() {
+                                Some(m) => {
+                                    let a_s = FillSample::from_grid(&d.grid_l1, i);
+                                    let av = match m {
+                                        DiffMetric::Qp => a_s.qp,
+                                        DiffMetric::Bpp => a_s.bpp,
+                                        DiffMetric::MvMag => a_s.mv,
+                                        DiffMetric::CoeffEnergy => a_s.coeff,
+                                        DiffMetric::NzDensity => a_s.nz,
+                                    };
+                                    let dv = g.values(m)[i];
+                                    text = format!(
+                                        "Δ {dv:+.2} (A {av:.2} / B {:.2}) · {text}",
+                                        av - dv,
+                                    );
+                                }
+                                None => {
+                                    text = format!(
+                                        "mode A {} / B {} ({}) · {text}",
+                                        g.mode_a[i].label(),
+                                        g.mode_b[i].label(),
+                                        if g.mode_same(i) { "=" } else { "≠" },
+                                    );
+                                }
+                            }
+                        }
                         response.clone().on_hover_text(text);
                     }
                 }
@@ -2353,7 +2692,42 @@ impl BitstreamWindow {
         // Legend — always visible, bottom-left (§5): min/max re-normalize per
         // frame, so hiding it would make colours incomparable.
         if !peek {
-            if self.view.fill == FillMode::Opportunity {
+            if diff_active {
+                // M-D: symmetric ±max|Δ| legend (or the reason there is no
+                // Δ for this frame — e.g. B carries no mapped frame).
+                match self.diff.as_ref() {
+                    Some(dd) => {
+                        if let Some(reason) = &dd.reason {
+                            draw_legend_note(&painter, canvas_rect, reason);
+                        } else if let Some(g) = dd.grid_l1.as_ref() {
+                            match self.view.fill.diff_metric() {
+                                Some(m) => {
+                                    let name = format!(
+                                        "Δ{} (A−B)",
+                                        self.view.fill.label()
+                                    );
+                                    draw_opportunity_legend(
+                                        &painter,
+                                        canvas_rect,
+                                        &name,
+                                        g.max_abs(m),
+                                    );
+                                }
+                                None => {
+                                    draw_legend_note(
+                                        &painter,
+                                        canvas_rect,
+                                        "ΔMode: grey = same · colour = A's mode where different",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        draw_legend_note(&painter, canvas_rect, "Δ: no comparison data");
+                    }
+                }
+            } else if self.view.fill == FillMode::Opportunity {
                 // No-data guard: like the other fills (whose legend hides
                 // when `derived` is None), skip the bar entirely instead of
                 // rendering a meaningless "−0.00 .. +0.00" scale.
@@ -2578,6 +2952,100 @@ impl BitstreamWindow {
                             ui.end_row();
                         }
                     });
+
+                // M-D: in Δ mode, the co-located B block (hit test at A's
+                // block centre — B's partition differs, so index-pairing is
+                // meaningless). Differing values are highlighted.
+                if self.diff_mode {
+                    let b_block = self
+                        .diff
+                        .as_ref()
+                        .filter(|dd| dd.viewer_frame == snap.viewer_frame)
+                        .and_then(|dd| dd.blocks_b.as_ref())
+                        .and_then(|blocks_b| {
+                            let cx = b.x + b.w / 2;
+                            let cy = b.y + b.h / 2;
+                            hit_test_min_area(blocks_b, cx, cy)
+                                .and_then(|i| blocks_b.get(i).cloned())
+                        });
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("B (same position)").strong());
+                    match b_block {
+                        Some(bb) => {
+                            let hi = egui::Color32::from_rgb(255, 190, 90);
+                            let row = |ui: &mut egui::Ui,
+                                       name: &str,
+                                       val: String,
+                                       differs: bool| {
+                                ui.label(name);
+                                if differs {
+                                    ui.colored_label(
+                                        hi,
+                                        egui::RichText::new(val).monospace(),
+                                    );
+                                } else {
+                                    ui.monospace(val);
+                                }
+                                ui.end_row();
+                            };
+                            egui::Grid::new("bs_inspector_b_grid")
+                                .spacing(egui::vec2(10.0, 3.0))
+                                .show(ui, |ui| {
+                                    row(
+                                        ui,
+                                        "block",
+                                        format!(
+                                            "{}×{}@({},{})",
+                                            bb.w, bb.h, bb.x, bb.y
+                                        ),
+                                        (bb.x, bb.y, bb.w, bb.h)
+                                            != (b.x, b.y, b.w, b.h),
+                                    );
+                                    row(
+                                        ui,
+                                        "QP",
+                                        format!("{} (Δ{:+})", bb.qp, b.qp - bb.qp),
+                                        bb.qp != b.qp,
+                                    );
+                                    row(
+                                        ui,
+                                        "bits",
+                                        format!(
+                                            "{} (Δ{:+})",
+                                            format_bits(bb.bits),
+                                            b.bits - bb.bits
+                                        ),
+                                        bb.bits != b.bits,
+                                    );
+                                    let mode_b = if bb.prediction_mode.is_empty() {
+                                        "-"
+                                    } else {
+                                        &bb.prediction_mode
+                                    };
+                                    row(
+                                        ui,
+                                        "mode",
+                                        mode_b.to_string(),
+                                        bb.prediction_mode != b.prediction_mode,
+                                    );
+                                    if bb.mv.is_some() || b.mv.is_some() {
+                                        row(
+                                            ui,
+                                            "MV",
+                                            bb.mv
+                                                .map(qpel)
+                                                .unwrap_or_else(|| "-".to_string()),
+                                            bb.mv != b.mv,
+                                        );
+                                    }
+                                });
+                            ui.weak("highlighted = differs from A");
+                        }
+                        None => {
+                            ui.weak("No B block at this position.");
+                        }
+                    }
+                }
 
                 // REF records: per-PU reference rows (§10 of the format).
                 if b.ref_n > 0 {
@@ -3112,6 +3580,11 @@ impl BitstreamWindow {
 
     /// Refresh the cached current-frame correlation derivation.
     fn refresh_corr_derived(&mut self, snap: &Snapshot) {
+        // M-D: delta Y metrics are B-bound — auto-revert to bpp when the
+        // comparison stream is gone (the combo hides them too).
+        if self.corr_y.is_delta() && snap.file_b.is_none() {
+            self.corr_y = YMetric::Bpp;
+        }
         let Some(file) = snap.file.as_ref() else {
             self.corr_derived = None;
             return;
@@ -3134,6 +3607,17 @@ impl BitstreamWindow {
             self.corr_derived = None;
             return;
         };
+        let b_key = if self.corr_y.is_delta() {
+            (
+                snap.file_b
+                    .as_ref()
+                    .map(|f| Arc::as_ptr(f) as usize)
+                    .unwrap_or(0),
+                snap.offset_b,
+            )
+        } else {
+            (0, 0)
+        };
         let current = self.corr_derived.as_ref().is_some_and(|d| {
             d.file_ptr == file_ptr
                 && d.frame_idx == snap.viewer_frame
@@ -3141,6 +3625,7 @@ impl BitstreamWindow {
                 && d.g == self.corr_g
                 && d.x == self.corr_x
                 && d.y == self.corr_y
+                && d.b_key == b_key
         });
         if current {
             return;
@@ -3171,6 +3656,29 @@ impl BitstreamWindow {
                     bs_g.psnr = psnr_to_g(&viewer_luma, &recon_luma, sw, sh, self.corr_g);
                 }
             }
+        }
+        // M-D delta metrics: subtract B's G aggregate (same grid geometry —
+        // B's resolution equals A's by the load gate). A viewer frame
+        // without a mapped B frame degrades to an all-invalid pair
+        // (empty B aggregate), never to a fake A−0 difference.
+        if self.corr_y.is_delta() {
+            let bs_b = snap
+                .file_b
+                .as_ref()
+                .and_then(|fb| {
+                    let db = viewer_to_catb_display(snap.viewer_frame, snap.offset_b)
+                        .filter(|&db| db < fb.frame_count())?;
+                    let blocks_b = fb.blocks_display(db).ok()?;
+                    let b_l1 = rasterize_blocks_tx(&blocks_b, None, sw, sh, 8);
+                    Some(aggregate_bitstream_to_g(&b_l1, sw, sh, self.corr_g))
+                })
+                .unwrap_or_else(|| aggregate_bitstream_to_g(
+                    &rasterize_blocks_tx(&[], None, sw, sh, 8),
+                    sw,
+                    sh,
+                    self.corr_g,
+                ));
+            subtract_bitstream_g(&mut bs_g, &bs_b);
         }
         let pair = x_grid(&analysis.grids, self.corr_x, self.corr_g)
             .map(|xg| align(&xg, &bs_g, self.corr_y));
@@ -3207,6 +3715,7 @@ impl BitstreamWindow {
             g: self.corr_g,
             x: self.corr_x,
             y: self.corr_y,
+            b_key,
             pair,
             bs_g,
             classes,
@@ -3221,11 +3730,14 @@ impl BitstreamWindow {
     /// shows. Its numbers must not be presented next to the current labels:
     /// an offset change re-maps every (viewer, catb) pair the scan was
     /// built on.
-    fn corr_scan_stale(&self, scan: &CorrScanResult, offset: i32) -> bool {
+    fn corr_scan_stale(&self, scan: &CorrScanResult, snap: &Snapshot) -> bool {
         scan.request.g != self.corr_g
             || scan.request.x != self.corr_x
             || scan.request.y != self.corr_y
-            || scan.request.offset != offset
+            || scan.request.offset != snap.offset
+            // M-D: delta scans are additionally bound to B's offset — a
+            // re-mapped B side invalidates every scanned pair too.
+            || (scan.request.y.is_delta() && scan.request.offset_b != snap.offset_b)
     }
 
     /// Refresh the cached range-scan derivation (statistics + scatter
@@ -3274,7 +3786,7 @@ impl BitstreamWindow {
             match snap.corr_scan.as_ref() {
                 // §6: never pair the current combo labels with a previous
                 // scan's numbers — flag staleness right in the readout.
-                Some(scan) if self.corr_scan_stale(scan, snap.offset) => {
+                Some(scan) if self.corr_scan_stale(scan, snap) => {
                     return "r=– ρ=– N=– (stale scan — press Scan)".to_string();
                 }
                 Some(_) => match self.corr_scan_derived.as_ref() {
@@ -3326,8 +3838,12 @@ impl BitstreamWindow {
                 egui::ComboBox::from_id_salt("bs_corr_x")
                     .selected_text(self.corr_x.label())
                     .show_ui(ui, |ui| {
-                        // Preset pairs above the separator (02 §2).
+                        // Preset pairs above the separator (02 §2). M-D
+                        // delta pairs only exist while B is loaded.
                         for (label, x, y) in PRESET_PAIRS {
+                            if y.is_delta() && snap.file_b.is_none() {
+                                continue;
+                            }
                             if ui.selectable_label(false, label).clicked() {
                                 self.corr_x = x;
                                 self.corr_y = y;
@@ -3343,6 +3859,10 @@ impl BitstreamWindow {
                     .selected_text(self.corr_y.label())
                     .show_ui(ui, |ui| {
                         for y in YMetric::ALL {
+                            // M-D: Δbpp/ΔQP need the comparison stream.
+                            if y.is_delta() && snap.file_b.is_none() {
+                                continue;
+                            }
                             ui.selectable_value(&mut self.corr_y, y, y.label());
                         }
                     });
@@ -3393,6 +3913,7 @@ impl BitstreamWindow {
                             x: self.corr_x,
                             y: self.corr_y,
                             offset: snap.offset,
+                            offset_b: snap.offset_b,
                         });
                         ctx.request_repaint_of(egui::ViewportId::ROOT);
                     }
@@ -3584,7 +4105,7 @@ impl BitstreamWindow {
             if self.corr_range_mode {
                 match snap.corr_scan.as_ref() {
                     Some(scan) => {
-                        if self.corr_scan_stale(scan, snap.offset) {
+                        if self.corr_scan_stale(scan, snap) {
                             note = Some(
                                 "Scan result is for different settings — press Scan again."
                                     .to_string(),
@@ -3736,7 +4257,7 @@ impl BitstreamWindow {
                 let scan = snap
                     .corr_scan
                     .as_ref()
-                    .filter(|s| !self.corr_scan_stale(s, snap.offset));
+                    .filter(|s| !self.corr_scan_stale(s, snap));
                 let Some(scan) = scan else {
                     ui.weak("Per-frame r timeline — run a range Scan to populate.");
                     return;
@@ -3795,7 +4316,7 @@ impl BitstreamWindow {
         let csv = if self.corr_range_mode {
             match snap.corr_scan.as_ref() {
                 Some(scan) => {
-                    if self.corr_scan_stale(scan, snap.offset) {
+                    if self.corr_scan_stale(scan, snap) {
                         return "scan is stale (settings changed) — press Scan again".to_string();
                     }
                     let frames: Vec<(usize, &AlignedPair)> =
@@ -4439,6 +4960,13 @@ impl BitstreamWindow {
                     ui.spinner();
                     ui.weak("scanning frames…");
                 }
+                if snap.frame_graph_b_scanning {
+                    ui.spinner();
+                    ui.weak("scanning B…");
+                }
+                if snap.file_b.is_some() && snap.frame_graph_b.is_some() {
+                    ui.weak("B = dashed");
+                }
             });
 
             let Some(points) = snap.frame_graph.as_ref() else {
@@ -4458,6 +4986,22 @@ impl BitstreamWindow {
                 .iter()
                 .map(|p| [p.display_idx as f64, p.avg_qp])
                 .collect();
+            // M-D: B's series (dashed, same hues) — plotted on B's own
+            // display index like A, so both x-axes mean "display order".
+            let (bits_b, qps_b): (Vec<[f64; 2]>, Vec<[f64; 2]>) = snap
+                .frame_graph_b
+                .as_ref()
+                .map(|pb| {
+                    (
+                        pb.iter()
+                            .map(|p| [p.display_idx as f64, p.bits])
+                            .collect(),
+                        pb.iter()
+                            .map(|p| [p.display_idx as f64, p.avg_qp])
+                            .collect(),
+                    )
+                })
+                .unwrap_or_default();
 
             Plot::new("bs_frame_graph")
                 .legend(Legend::default())
@@ -4466,19 +5010,40 @@ impl BitstreamWindow {
                 .allow_scroll(true)
                 .x_axis_label("display order")
                 .show(ui, |plot_ui| {
+                    use egui_plot::LineStyle;
+                    // The "(A)" suffix only means something once a
+                    // comparison stream exists — single-stream sessions
+                    // must look exactly as they did before M-D.
+                    let has_b = snap.file_b.is_some();
                     if self.graph_show_bits {
                         plot_ui.line(
                             Line::new(PlotPoints::new(bits))
-                                .name("frame bits")
+                                .name(if has_b { "frame bits (A)" } else { "frame bits" })
                                 .color(egui::Color32::from_rgb(255, 150, 20)),
                         );
+                        if !bits_b.is_empty() {
+                            plot_ui.line(
+                                Line::new(PlotPoints::new(bits_b))
+                                    .name("frame bits (B)")
+                                    .style(LineStyle::Dashed { length: 6.0 })
+                                    .color(egui::Color32::from_rgb(255, 195, 110)),
+                            );
+                        }
                     }
                     if self.graph_show_qp {
                         plot_ui.line(
                             Line::new(PlotPoints::new(qps))
-                                .name("avg QP")
+                                .name(if has_b { "avg QP (A)" } else { "avg QP" })
                                 .color(egui::Color32::from_rgb(225, 60, 60)),
                         );
+                        if !qps_b.is_empty() {
+                            plot_ui.line(
+                                Line::new(PlotPoints::new(qps_b))
+                                    .name("avg QP (B)")
+                                    .style(LineStyle::Dashed { length: 6.0 })
+                                    .color(egui::Color32::from_rgb(245, 130, 130)),
+                            );
+                        }
                     }
                     // Current frame marker (offset-mapped display slot).
                     if let Some(d) = viewer_to_catb_display(snap.viewer_frame, snap.offset)
@@ -4856,6 +5421,142 @@ fn draw_l1_loupe(
         }
     }
     // Centre (hovered) cell highlight.
+    let center_rect = egui::Rect::from_min_size(
+        egui::pos2(origin.x + HALF as f32 * CELL, origin.y + HALF as f32 * CELL),
+        egui::vec2(CELL, CELL),
+    );
+    painter.rect_stroke(
+        center_rect,
+        0.0,
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 220, 40)),
+        egui::StrokeKind::Inside,
+    );
+}
+
+/// One-line text in the legend slot (M-D: Δ reason / ΔMode key). Same
+/// geometry as the quality legend's unmet-precondition message.
+fn draw_legend_note(painter: &egui::Painter, canvas_rect: egui::Rect, msg: &str) {
+    let pad = 8.0;
+    let font = egui::FontId::monospace(11.0);
+    let bg = egui::Color32::from_black_alpha(170);
+    let w = 8.0 * msg.chars().count() as f32 + 12.0;
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(canvas_rect.min.x + pad, canvas_rect.max.y - pad - 22.0),
+        egui::vec2(w, 22.0),
+    );
+    painter.rect_filled(rect, 3.0, bg);
+    painter.text(
+        egui::pos2(rect.min.x + 6.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        msg,
+        font,
+        egui::Color32::from_rgb(235, 235, 235),
+    );
+}
+
+/// M-D value loupe: magnified L1 cells around the cursor showing the A−B
+/// difference — diverging colours on the frame's ±max|Δ| scale for scalar
+/// fills, `=` / A-mode label for the Mode agreement fill. Same 5×5 window
+/// geometry as [`draw_l1_loupe`].
+fn draw_diff_loupe(
+    ui: &egui::Ui,
+    cursor: egui::Pos2,
+    grid: &DiffGrid,
+    fill: FillMode,
+    stream_x: u32,
+    stream_y: u32,
+) {
+    if grid.is_empty() {
+        return;
+    }
+    let metric = fill.diff_metric();
+    let dmax = metric.map(|m| grid.max_abs(m)).unwrap_or(0.0);
+    let center_col = (stream_x / grid.cell.max(1)) as i32;
+    let center_row = (stream_y / grid.cell.max(1)) as i32;
+
+    const HALF: i32 = 2; // 5×5 window
+    const CELL: f32 = 34.0;
+    let span = (2 * HALF + 1) as f32;
+    let size = span * CELL;
+
+    let screen = ui.ctx().screen_rect();
+    let mut origin = egui::pos2(cursor.x + 24.0, cursor.y - size - 12.0);
+    origin.x = origin.x.clamp(screen.left() + 4.0, (screen.right() - size - 4.0).max(4.0));
+    origin.y = origin.y.clamp(screen.top() + 4.0, (screen.bottom() - size - 4.0).max(4.0));
+    let loupe_rect = egui::Rect::from_min_size(origin, egui::vec2(size, size));
+
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        ui.id().with("bs_diff_loupe"),
+    ));
+    painter.rect_filled(loupe_rect.expand(2.0), 3.0, egui::Color32::from_black_alpha(230));
+    painter.rect_stroke(
+        loupe_rect.expand(2.0),
+        3.0,
+        egui::Stroke::new(1.0, egui::Color32::GRAY),
+        egui::StrokeKind::Outside,
+    );
+
+    let font = egui::FontId::monospace(10.0);
+    let empty_fill = egui::Color32::from_rgb(20, 22, 28);
+    for dr in -HALF..=HALF {
+        for dc in -HALF..=HALF {
+            let col = center_col + dc;
+            let row = center_row + dr;
+            let cell_min = egui::pos2(
+                origin.x + (dc + HALF) as f32 * CELL,
+                origin.y + (dr + HALF) as f32 * CELL,
+            );
+            let cell_rect = egui::Rect::from_min_size(cell_min, egui::vec2(CELL, CELL));
+            let i = (row.max(0) as u32 * grid.cols + col.max(0) as u32) as usize;
+            let in_range = col >= 0
+                && row >= 0
+                && (col as u32) < grid.cols
+                && (row as u32) < grid.rows
+                && grid.valid.get(i).copied().unwrap_or(false);
+            if in_range {
+                let (color, txt) = match metric {
+                    Some(m) => {
+                        let dv = grid.values(m)[i];
+                        (
+                            opportunity_cell_color(dv, dmax, 1.0),
+                            format!("{dv:+.1}"),
+                        )
+                    }
+                    None => {
+                        if grid.mode_same(i) {
+                            (egui::Color32::from_rgb(90, 90, 90), "=".to_string())
+                        } else {
+                            (
+                                mode_color(grid.mode_a[i]),
+                                grid.mode_a[i].label().to_string(),
+                            )
+                        }
+                    }
+                };
+                painter.rect_filled(cell_rect.shrink(0.5), 0.0, color);
+                // Text contrast: black on the light (near-white) middle of
+                // the diverging ramp, white on the saturated ends.
+                let lum = 0.299 * color.r() as f32
+                    + 0.587 * color.g() as f32
+                    + 0.114 * color.b() as f32;
+                let text_color = if lum > 150.0 {
+                    egui::Color32::BLACK
+                } else {
+                    egui::Color32::WHITE
+                };
+                painter.text(
+                    cell_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    txt,
+                    font.clone(),
+                    text_color,
+                );
+            } else {
+                painter.rect_filled(cell_rect.shrink(0.5), 0.0, empty_fill);
+            }
+        }
+    }
     let center_rect = egui::Rect::from_min_size(
         egui::pos2(origin.x + HALF as f32 * CELL, origin.y + HALF as f32 * CELL),
         egui::vec2(CELL, CELL),

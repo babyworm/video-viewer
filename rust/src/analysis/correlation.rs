@@ -77,16 +77,25 @@ pub enum YMetric {
     /// Needs stage images and a resolution-matched source; cells are marked
     /// invalid when the grid is absent (see [`BitstreamG::psnr`]).
     ReconPsnr,
+    /// M-D: `bpp(A) − bpp(B)` of the dual-`.catb` pair — only offered while
+    /// a comparison stream (B) is loaded. The subtraction happens in
+    /// [`subtract_bitstream_g`] before [`align`], which then just reads the
+    /// `bpp` slot.
+    DeltaBpp,
+    /// M-D: `QP(A) − QP(B)`, same pipeline as [`YMetric::DeltaBpp`].
+    DeltaQp,
 }
 
 impl YMetric {
-    pub const ALL: [YMetric; 6] = [
+    pub const ALL: [YMetric; 8] = [
         YMetric::Qp,
         YMetric::Bpp,
         YMetric::MvMag,
         YMetric::IntraRatio,
         YMetric::CoeffEnergy,
         YMetric::ReconPsnr,
+        YMetric::DeltaBpp,
+        YMetric::DeltaQp,
     ];
 
     pub fn label(self) -> &'static str {
@@ -97,7 +106,15 @@ impl YMetric {
             YMetric::IntraRatio => "intra %",
             YMetric::CoeffEnergy => "coeff energy",
             YMetric::ReconPsnr => "recon PSNR",
+            YMetric::DeltaBpp => "Δbpp (A−B)",
+            YMetric::DeltaQp => "ΔQP (A−B)",
         }
+    }
+
+    /// True for the M-D dual-`.catb` difference metrics: they need the
+    /// comparison stream (B) and its own frame offset.
+    pub fn is_delta(self) -> bool {
+        matches!(self, YMetric::DeltaBpp | YMetric::DeltaQp)
     }
 }
 
@@ -105,13 +122,17 @@ impl YMetric {
 /// no skip-rate / intra-direction axis yet, so the two presets that need
 /// them (`motion_class↔skip률`, `orientation↔intra 방향`) are approximated
 /// with the closest available Y metric and revisited in M3/M4.
-pub const PRESET_PAIRS: [(&str, XMetric, YMetric); 6] = [
+pub const PRESET_PAIRS: [(&str, XMetric, YMetric); 7] = [
     ("variance ↔ bits", XMetric::Variance, YMetric::Bpp),
     ("variance ↔ QP", XMetric::Variance, YMetric::Qp),
     ("variance ↔ coeff energy", XMetric::Variance, YMetric::CoeffEnergy),
     ("motion ↔ |MV|", XMetric::MotionScore, YMetric::MvMag),
     ("motion ↔ bits", XMetric::MotionScore, YMetric::Bpp),
     ("orientation ↔ intra %", XMetric::Orientation, YMetric::IntraRatio),
+    // M-D research preset: which complexity does the A/B setting change
+    // spend/save bits on? Listed only while a comparison .catb is loaded
+    // (the combo filters delta pairs on B presence).
+    ("variance ↔ Δbpp", XMetric::Variance, YMetric::DeltaBpp),
 ];
 
 /// The G grid sizes offered by the Correlation tab.
@@ -520,6 +541,42 @@ pub fn aggregate_bitstream_to_g(l1: &BitstreamGrid, width: u32, height: u32, g: 
     }
 }
 
+/// M-D: turn `a` into the per-cell difference `A − B` for every scalar
+/// metric slot (qp, bpp, mv_mag, intra_ratio, coeff_energy), AND-combining
+/// the validity masks. Cells outside the dimension intersection — and every
+/// cell when the two aggregates disagree on `g` — become invalid; the
+/// values of invalidated cells are zeroed so no stale A-side value leaks
+/// into a CSV dump. `psnr` (image-derived, caller-filled) is cleared: a
+/// PSNR difference is not defined by this pipeline.
+pub fn subtract_bitstream_g(a: &mut BitstreamG, b: &BitstreamG) {
+    let cols = a.cols.min(b.cols) as usize;
+    let rows = a.rows.min(b.rows) as usize;
+    let mismatch = a.g != b.g;
+    for r in 0..a.rows as usize {
+        for c in 0..a.cols as usize {
+            let ai = r * a.cols as usize + c;
+            let inside = !mismatch && r < rows && c < cols;
+            let bi = r * b.cols as usize + c;
+            let ok = inside && a.valid[ai] && b.valid[bi];
+            if ok {
+                a.qp[ai] -= b.qp[bi];
+                a.bpp[ai] -= b.bpp[bi];
+                a.mv_mag[ai] -= b.mv_mag[bi];
+                a.intra_ratio[ai] -= b.intra_ratio[bi];
+                a.coeff_energy[ai] -= b.coeff_energy[bi];
+            } else {
+                a.qp[ai] = 0.0;
+                a.bpp[ai] = 0.0;
+                a.mv_mag[ai] = 0.0;
+                a.intra_ratio[ai] = 0.0;
+                a.coeff_energy[ai] = 0.0;
+            }
+            a.valid[ai] = ok;
+        }
+    }
+    a.psnr = Vec::new();
+}
+
 /// Combine an analysis G grid and a bitstream G aggregate into the L2
 /// [`AlignedPair`]. Grid dimensions may differ (R5 resolution mismatch);
 /// the intersection is used.
@@ -540,6 +597,10 @@ pub fn align(x: &GGrid, y: &BitstreamG, y_metric: YMetric) -> AlignedPair {
         // Image-derived, caller-filled — may legitimately be empty (no
         // stage image): every cell is then invalid, not a panic.
         YMetric::ReconPsnr => &y.psnr,
+        // M-D: [`subtract_bitstream_g`] already turned these slots into
+        // A − B, so the delta metrics read the plain arrays.
+        YMetric::DeltaBpp => &y.bpp,
+        YMetric::DeltaQp => &y.qp,
     };
     for r in 0..rows as usize {
         for c in 0..cols as usize {
@@ -909,6 +970,10 @@ pub struct CorrScanRequest {
     /// request so a later offset change marks the result stale instead of
     /// silently presenting pairs built on the old mapping.
     pub offset: i32,
+    /// M-D: the comparison (B) stream's frame offset at request time — only
+    /// meaningful for [`YMetric::is_delta`] scans, where an offset-B change
+    /// re-maps every (viewer, catb-B) pair and must stale the result.
+    pub offset_b: i32,
 }
 
 /// Per-frame correlation statistics accumulated during a range scan
@@ -1625,6 +1690,7 @@ mod tests {
                 x: XMetric::Variance,
                 y: YMetric::Bpp,
                 offset: 0,
+                offset_b: 0,
             },
             vec![(3, f0), (4, f1), (5, f2)],
             None,

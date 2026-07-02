@@ -21,6 +21,13 @@ pub enum BitstreamAction {
     SetOverlayOnCanvas(bool),
     /// M5: kill the in-flight external decoder run.
     CancelDecode,
+    /// M-D: load the comparison stream (B) — explicit button only, drops
+    /// keep routing to A (ambiguity guard).
+    LoadBRequested,
+    /// M-D: unload the comparison stream (B).
+    UnloadB,
+    /// M-D: set B's own frame offset (catb-B display = viewer + offset_b).
+    SetOffsetB(i32),
 }
 
 /// Read-only + mutable context handed to the panel each frame.
@@ -43,6 +50,13 @@ pub struct BitstreamPanelContext<'a> {
     /// M5: seconds since the external decoder run started
     /// (None = no run in flight).
     pub decoding_elapsed: Option<f64>,
+    /// M-D: the comparison stream (B), if loaded.
+    pub bitstream_b: Option<&'a BitstreamFile>,
+    pub bitstream_path_b: Option<&'a str>,
+    /// Last B load error (resolution-mismatch rejection etc.).
+    pub error_b: Option<&'a str>,
+    /// B's own frame offset (independent of A's).
+    pub offset_b: i32,
 }
 
 pub struct BitstreamPanel;
@@ -217,6 +231,81 @@ impl BitstreamPanel {
             }
         }
         if let Some(err) = ctx.error {
+            ui.colored_label(egui::Color32::RED, err);
+        }
+
+        // -- M-D: comparison stream (B) — only offered once A is loaded
+        // (a Δ needs both sides; loading B first would anchor nothing).
+        ui.separator();
+        ui.label(egui::RichText::new("Comparison (.catb B)").strong());
+        match ctx.bitstream_b {
+            None => {
+                if ui
+                    .button("Load .catb B…")
+                    .on_hover_text(
+                        "Second telemetry of the same source (e.g. \
+                         preprocessing on/off) — enables the Δ fill, the \
+                         Frame Graph B series and the Δbpp/ΔQP metrics. \
+                         Same resolution as A required. Load via this \
+                         button only — drag & drop always loads A.",
+                    )
+                    .clicked()
+                {
+                    action = Some(BitstreamAction::LoadBRequested);
+                }
+            }
+            Some(b) => {
+                ui.horizontal(|ui| {
+                    let name = ctx
+                        .bitstream_path_b
+                        .map(|p| p.rsplit('/').next().unwrap_or(p))
+                        .unwrap_or("(unnamed)");
+                    ui.label(name)
+                        .on_hover_text(ctx.bitstream_path_b.unwrap_or(""));
+                    if ui.button("Unload B").clicked() {
+                        action = Some(BitstreamAction::UnloadB);
+                    }
+                });
+                let codec_b = if b.catb.meta.codec.is_empty() {
+                    "?".to_string()
+                } else {
+                    b.catb.meta.codec.to_uppercase()
+                };
+                ui.label(format!(
+                    "codec {} · {} frames · {}×{}",
+                    codec_b,
+                    b.frame_count(),
+                    b.width,
+                    b.height,
+                ));
+                let mut offset_b = ctx.offset_b;
+                ui.horizontal(|ui| {
+                    ui.label("B frame offset:");
+                    ui.add(egui::DragValue::new(&mut offset_b).speed(0.05))
+                        .on_hover_text(
+                            "catb-B display frame = viewer frame + offset \
+                             (independent of A's offset)",
+                        );
+                });
+                if offset_b != ctx.offset_b {
+                    action = Some(BitstreamAction::SetOffsetB(offset_b));
+                }
+                // Frame-count mismatch vs A is a warning only (Δ still
+                // renders on the overlapping frames); resolution mismatch
+                // was rejected at load.
+                if b.frame_count() != bs.frame_count() {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        format!(
+                            "⚠ B {} frames ≠ A {} — Δ limited to the overlap",
+                            b.frame_count(),
+                            bs.frame_count(),
+                        ),
+                    );
+                }
+            }
+        }
+        if let Some(err) = ctx.error_b {
             ui.colored_label(egui::Color32::RED, err);
         }
 
