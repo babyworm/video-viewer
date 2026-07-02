@@ -16,6 +16,7 @@ pub enum DialogState {
     Settings,
     BatchConvert,
     SidebandFile,
+    CatbFile,
     GuessSize,
 }
 
@@ -1553,6 +1554,97 @@ impl SidebandFileDialog {
                         egui::TextEdit::singleline(&mut self.path)
                             .desired_width(350.0)
                             .hint_text("/path/to/sideband.bin"),
+                    );
+                    let browse_label = if self.file_browser.is_some() { "Close" } else { "Browse..." };
+                    if ui.button(browse_label).clicked() {
+                        if self.file_browser.is_some() {
+                            self.file_browser = None;
+                        } else {
+                            let start = if !self.path.is_empty() {
+                                Path::new(&self.path)
+                                    .parent()
+                                    .filter(|p| p.is_dir())
+                                    .map(|p| p.to_path_buf())
+                                    .unwrap_or_else(|| self.initial_dir.clone())
+                            } else {
+                                self.initial_dir.clone()
+                            };
+                            self.file_browser = Some(FileBrowser::new(start));
+                        }
+                    }
+                });
+
+                // Inline file browser
+                if let Some(ref mut fb) = self.file_browser {
+                    ui.separator();
+                    if let Some(selected) = fb.show(ui) {
+                        self.path = selected;
+                        self.file_browser = None;
+                    }
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!self.path.is_empty(), egui::Button::new("Open"))
+                        .clicked()
+                    {
+                        result = Some(Some(self.path.clone()));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(None);
+                    }
+                });
+            });
+
+        if !open {
+            return Some(None);
+        }
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bitstream Telemetry (.catb) File Dialog
+// ---------------------------------------------------------------------------
+
+pub struct CatbFileDialog {
+    pub path: String,
+    file_browser: Option<FileBrowser>,
+    initial_dir: PathBuf,
+}
+
+impl CatbFileDialog {
+    pub fn new(initial_dir: Option<&str>) -> Self {
+        let initial_dir = initial_dir
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        Self {
+            path: String::new(),
+            file_browser: None,
+            initial_dir,
+        }
+    }
+
+    /// Returns Some(Some(path)) on Open, Some(None) on cancel, None while open.
+    pub fn show(&mut self, ctx: &egui::Context) -> Option<Option<String>> {
+        let mut result = None;
+        let mut open = true;
+
+        egui::Window::new("Load Bitstream Telemetry (.catb)")
+            .open(&mut open)
+            .resizable(true)
+            .collapsible(false)
+            .min_width(500.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("File:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.path)
+                            .desired_width(350.0)
+                            .hint_text("/path/to/telemetry.catb"),
                     );
                     let browse_label = if self.file_browser.is_some() { "Close" } else { "Browse..." };
                     if ui.button(browse_label).clicked() {

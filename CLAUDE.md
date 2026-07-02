@@ -91,6 +91,7 @@
 | `tests/motion_test.rs` | Per-block motion classification: pixel-diff vs avg·std, 4-class bands, localized motion, 8px grid, edge cases (12 tests) |
 | `tests/scene_test.rs` | Scene detection algorithms, thresholds, save/load (12 tests) |
 | `tests/sideband_test.rs` | Sideband binary parsing, extended header, signed fields, display (20 tests) |
+| `tests/catb_test.rs` | `.catb` v4 bitstream metadata: header/directory validation, frame/block/ref records, sentinels, oracle differential, display_map (16 tests) |
 | `tests/ppm_test.rs` | PPM parsing, writing, reading, and conversion (10 tests) |
 | `tests/integration_test.rs` | Real Y4M file (conditional) (1 test) |
 

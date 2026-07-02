@@ -1,3 +1,4 @@
+pub mod bitstream_stats;
 pub mod block_stats;
 pub mod histogram;
 pub mod isp_sideband;

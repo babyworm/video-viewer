@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod catb;
 pub mod colorspace;
 pub mod formats;
 pub mod hints;

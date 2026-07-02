@@ -202,6 +202,13 @@ pub struct VideoViewerApp {
     /// Whether the ISP sideband side panel is visible.
     /// Default false: hidden until the user invokes Tools → "Load ISP sideband info…".
     show_sideband_panel: bool,
+
+    // Bitstream telemetry (.catb) state — M0: load/unload + status-bar readout.
+    pub bitstream_file: Option<crate::analysis::bitstream_stats::BitstreamFile>,
+    pub bitstream_path: Option<String>,
+    /// Last .catb load error (shown in the status bar until a load succeeds).
+    pub bitstream_error: Option<String>,
+    catb_dialog: Option<dialogs::CatbFileDialog>,
     /// Active "Guess with hint" dialog (View → Video Size → Guess with hint…).
     guess_size_dialog: Option<dialogs::GuessSizeDialog>,
     /// Pointer position captured while a file drag is in progress
@@ -306,6 +313,10 @@ impl VideoViewerApp {
             sideband_panel: crate::analysis::isp_sideband::SidebandPanel::new(),
             sideband_dialog: None,
             show_sideband_panel: false,
+            bitstream_file: None,
+            bitstream_path: None,
+            bitstream_error: None,
+            catb_dialog: None,
             guess_size_dialog: None,
             last_drop_target_pos: None,
             interlace_view: InterlaceViewMode::Progressive,
@@ -377,6 +388,8 @@ impl VideoViewerApp {
                 self.playback_fps = 0.0;
                 // Clear sideband overlay from previous file.
                 self.unload_sideband();
+                // Clear bitstream telemetry from previous file.
+                self.unload_bitstream();
                 // Clear stale frame data to prevent cross-file metrics.
                 self.prev_rgb = None;
                 self.current_rgb = None;
@@ -1341,6 +1354,21 @@ impl VideoViewerApp {
         self.sideband_overlay_mode = SidebandOverlayMode::None;
     }
 
+    /// Load a `.catb` bitstream telemetry file (M0: status readout only).
+    pub fn load_bitstream(&mut self, path: &str) -> Result<(), String> {
+        let file = crate::analysis::bitstream_stats::BitstreamFile::open(path)?;
+        self.bitstream_file = Some(file);
+        self.bitstream_path = Some(path.to_string());
+        self.bitstream_error = None;
+        Ok(())
+    }
+
+    pub fn unload_bitstream(&mut self) {
+        self.bitstream_file = None;
+        self.bitstream_path = None;
+        self.bitstream_error = None;
+    }
+
     pub fn current_sideband_frame(&self) -> Option<&crate::core::sideband::SidebandFrame> {
         self.sideband_file.as_ref()?.frame(self.current_frame_idx)
     }
@@ -1928,6 +1956,23 @@ impl eframe::App for VideoViewerApp {
                         self.unload_sideband();
                         self.show_sideband_panel = false;
                     }
+                    // --- Bitstream telemetry (.catb) entry point ---
+                    // Separate feature from the core viewer: decoder telemetry
+                    // produced externally by codec-analyzer decoder-run.
+                    if ui.button("Load Bitstream Telemetry (.catb)…").clicked() {
+                        ui.close_menu();
+                        let initial_dir = self.current_file.as_ref()
+                            .and_then(|f| std::path::Path::new(f).parent())
+                            .and_then(|p| p.to_str());
+                        self.catb_dialog = Some(dialogs::CatbFileDialog::new(initial_dir));
+                        self.dialog_state = DialogState::CatbFile;
+                    }
+                    let bs_loaded = self.bitstream_file.is_some();
+                    if ui.add_enabled(bs_loaded, egui::Button::new("Unload Bitstream Telemetry"))
+                        .clicked() {
+                        ui.close_menu();
+                        self.unload_bitstream();
+                    }
                 });
                 ui.menu_button("Analysis", |ui| {
                     // Toggle the floating Frame Analysis viewport (histogram,
@@ -2211,6 +2256,32 @@ impl eframe::App for VideoViewerApp {
                     ));
                 } else if self.current_file.is_none() {
                     ui.label("No file loaded — drop a file or use File → Open");
+                }
+                // Bitstream telemetry readout: current frame POC/type/bits.
+                if let Some(ref bs) = self.bitstream_file {
+                    ui.separator();
+                    if let Some(s) = bs.frame_summary(self.current_frame_idx) {
+                        let bits = s
+                            .slice_bits
+                            .map(|b| b.to_string())
+                            .unwrap_or_else(|| "-".to_string());
+                        ui.label(format!(
+                            "catb: POC {} {} {} bits (dec#{}, {} blks)",
+                            s.poc, s.frame_type, bits, s.decode_idx, s.block_count,
+                        ))
+                        .on_hover_text(
+                            self.bitstream_path.as_deref().unwrap_or(""),
+                        );
+                    } else {
+                        ui.label(format!(
+                            "catb: no frame {} (telemetry has {} frames)",
+                            self.current_frame_idx,
+                            bs.frame_count(),
+                        ));
+                    }
+                } else if let Some(ref err) = self.bitstream_error {
+                    ui.separator();
+                    ui.colored_label(egui::Color32::RED, format!("catb: {err}"));
                 }
                 // Status messages: shown *in addition* to the readout, separated.
                 if let Some(ref err) = self.status_error {
@@ -2791,6 +2862,21 @@ impl VideoViewerApp {
                     }
                     self.dialog_state = DialogState::None;
                     self.sideband_dialog = None;
+                }
+            }
+        }
+
+        // Bitstream telemetry (.catb) file dialog
+        if self.dialog_state == DialogState::CatbFile {
+            if let Some(ref mut dlg) = self.catb_dialog {
+                if let Some(result) = dlg.show(ctx) {
+                    if let Some(path) = result {
+                        if let Err(e) = self.load_bitstream(&path) {
+                            self.bitstream_error = Some(e);
+                        }
+                    }
+                    self.dialog_state = DialogState::None;
+                    self.catb_dialog = None;
                 }
             }
         }
