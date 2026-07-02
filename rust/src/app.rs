@@ -1652,16 +1652,25 @@ impl VideoViewerApp {
     /// validated against the file size).
     fn finish_decoder_run(&mut self, ctx: &egui::Context, pending: PendingDecode) {
         use crate::core::decoder_run;
-        if !pending.telemetry.is_file() {
-            let msg = format!(
-                "Decoder finished but produced no telemetry at {}",
-                pending.telemetry.display()
-            );
-            self.bitstream_error = Some(msg.clone());
-            self.status_error = Some(msg);
-            return;
-        }
-        let tele_str = pending.telemetry.to_string_lossy().into_owned();
+        // Fixed name first, then any *.catb the decoder wrote into the
+        // workdir (codec-analyzer uses `codec-analyzer-telemetry.catb`).
+        let telemetry = match decoder_run::resolve_telemetry(&pending.telemetry) {
+            Some(p) => p,
+            None => {
+                let msg = format!(
+                    "Decoder finished but produced no telemetry (.catb) in {}",
+                    pending
+                        .telemetry
+                        .parent()
+                        .unwrap_or(&pending.telemetry)
+                        .display()
+                );
+                self.bitstream_error = Some(msg.clone());
+                self.status_error = Some(msg);
+                return;
+            }
+        };
+        let tele_str = telemetry.to_string_lossy().into_owned();
         // Parse once; the YUV auto-open needs the stream resolution *before*
         // open_file (which unloads any loaded telemetry), so the commit is
         // sequenced manually instead of going through load_bitstream.

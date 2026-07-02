@@ -5,8 +5,9 @@
 //! {input} --decoder-workdir {workdir} --telemetry-level block --yuv-output
 //! {yuv}`); this module expands the placeholders, runs the command through
 //! the platform shell in a background thread, and the app then consumes the
-//! produced files (`telemetry.catb`, optionally `decoded.yuv`). No template
-//! configured → the feature explains itself and does nothing.
+//! produced files (`telemetry.catb`, or any `*.catb` the decoder wrote into
+//! the workdir — see [`resolve_telemetry`] — plus optionally `decoded.yuv`).
+//! No template configured → the feature explains itself and does nothing.
 //!
 //! Placeholders (simple string substitution, values shell-quoted):
 //! - `{input}`     — the bitstream path the user picked
@@ -106,6 +107,38 @@ pub fn expand_command(template: &str, input: &Path, workdir: &Path) -> ExpandedC
     }
 }
 
+/// Locate the telemetry file after a successful run.
+///
+/// The fixed `{workdir}/telemetry.catb` path (`expected`) wins when it
+/// exists. Decoders with their own fixed output name (codec-analyzer writes
+/// `codec-analyzer-telemetry.catb` and offers no flag to rename it) are
+/// covered by a fallback scan of the workdir for `*.catb`; among several
+/// candidates the most recently modified wins. `None` → no telemetry at all.
+pub fn resolve_telemetry(expected: &Path) -> Option<PathBuf> {
+    if expected.is_file() {
+        return Some(expected.to_path_buf());
+    }
+    let dir = expected.parent()?;
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        let is_catb = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("catb"));
+        if !is_catb || !path.is_file() {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(t, _)| mtime >= *t) {
+            best = Some((mtime, path));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
 /// Last non-empty stderr line, for the one-line failure label.
 pub fn last_stderr_line(stderr: &str) -> Option<String> {
     stderr
@@ -138,6 +171,13 @@ pub fn plan_yuv_open(yuv_size: Option<u64>, width: u32, height: u32) -> Result<u
 }
 
 /// Build the platform shell invocation for a command line.
+///
+/// Windows: the command line must be passed to `cmd.exe` *verbatim* via
+/// `raw_arg`. Rust's `arg()` escapes embedded `"` as `\"` per the
+/// CommandLineToArgvW convention, but cmd.exe does not understand backslash
+/// escapes — any template using quoted placeholders (which `quote_path`
+/// always produces) would fail with "Can't recognize ..." / exit 9009.
+/// `/S` pins cmd's quote handling: strip only the outer quote pair.
 fn shell_command(command: &str) -> Command {
     #[cfg(unix)]
     {
@@ -147,8 +187,9 @@ fn shell_command(command: &str) -> Command {
     }
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         let mut c = Command::new("cmd");
-        c.arg("/C").arg(command);
+        c.raw_arg(format!("/S /C \"{command}\""));
         c
     }
 }
@@ -332,5 +373,49 @@ mod tests {
         assert!(plan_yuv_open(Some(0), 64, 64).is_err());
         assert!(plan_yuv_open(Some(6144 + 1), 64, 64).is_err());
         assert!(plan_yuv_open(Some(6144), 0, 0).is_err());
+    }
+
+    #[test]
+    fn resolve_telemetry_prefers_expected_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = dir.path().join(TELEMETRY_FILE);
+        std::fs::write(&expected, b"x").unwrap();
+        std::fs::write(dir.path().join("other.catb"), b"y").unwrap();
+        assert_eq!(resolve_telemetry(&expected), Some(expected));
+    }
+
+    #[test]
+    fn resolve_telemetry_falls_back_to_workdir_catb() {
+        // codec-analyzer writes its own fixed name; no telemetry.catb exists.
+        let dir = tempfile::tempdir().unwrap();
+        let expected = dir.path().join(TELEMETRY_FILE);
+        let actual = dir.path().join("codec-analyzer-telemetry.catb");
+        std::fs::write(&actual, b"x").unwrap();
+        std::fs::write(dir.path().join("decoded.yuv"), b"y").unwrap();
+        std::fs::write(dir.path().join("telemetry.json"), b"z").unwrap();
+        assert_eq!(resolve_telemetry(&expected), Some(actual));
+    }
+
+    #[test]
+    fn resolve_telemetry_picks_newest_of_several() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = dir.path().join(TELEMETRY_FILE);
+        let old = dir.path().join("old.catb");
+        let new = dir.path().join("new.catb");
+        std::fs::write(&old, b"x").unwrap();
+        let past = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::open(&old).unwrap().set_modified(past).unwrap();
+        std::fs::write(&new, b"y").unwrap();
+        assert_eq!(resolve_telemetry(&expected), Some(new));
+    }
+
+    #[test]
+    fn resolve_telemetry_none_when_no_catb() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = dir.path().join(TELEMETRY_FILE);
+        std::fs::write(dir.path().join("decoded.yuv"), b"y").unwrap();
+        assert_eq!(resolve_telemetry(&expected), None);
+        // Missing workdir entirely.
+        assert_eq!(resolve_telemetry(Path::new("/nonexistent/x/telemetry.catb")), None);
     }
 }
