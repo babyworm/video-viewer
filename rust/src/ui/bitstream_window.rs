@@ -29,6 +29,7 @@ use crate::analysis::correlation::{
 };
 use crate::analysis::motion::MotionClass;
 use crate::core::catb::{BsBlock, BsRef};
+use crate::core::dropped::{classify_dropped_file, DroppedKind};
 use crate::ui::bitstream_overlay::{
     build_intra, build_refs, draw_intra_layer, draw_mv_layer, draw_part_layer, LayerGeom,
     MvSource, MV_SOURCES,
@@ -485,6 +486,11 @@ pub struct BitstreamShared {
     pub offset_request: Option<i32>,
     /// Child → root: window was closed.
     pub close_requested: bool,
+    /// Child → root: a file was dropped on this window, pre-classified
+    /// (0.15.0). Processing is root-owned (seek_request pattern): the root
+    /// routes it exactly like a main-window drop — the child never loads
+    /// anything itself.
+    pub drop_request: Option<(std::path::PathBuf, DroppedKind)>,
     /// Frame Graph series, filled by a background scan thread on load.
     pub frame_graph: Option<Arc<Vec<FrameGraphPoint>>>,
     pub frame_graph_scanning: bool,
@@ -540,6 +546,7 @@ impl BitstreamShared {
             toggle_play_request: false,
             offset_request: None,
             close_requested: false,
+            drop_request: None,
             frame_graph: None,
             frame_graph_scanning: false,
             corr_active: false,
@@ -913,6 +920,55 @@ impl BitstreamWindow {
                         s.corr_hover_cell = self.corr_hover_cell;
                         ctx.request_repaint_of(egui::ViewportId::ROOT);
                     }
+                }
+
+                // --- Drag & drop onto this window (0.15.0) ---
+                // egui-winit routes DroppedFile/HoveredFile OS events by
+                // window, so drops on this viewport arrive in *this*
+                // viewport's RawInput. On backends that misroute them to
+                // the root input instead (see comparison.rs drop notes),
+                // the root's own drop handler classifies and routes the
+                // file identically — so no root-input fallback here:
+                // reading both would double-handle the same drop.
+                let (dropped_path, drag_hover) = ctx.input(|i| {
+                    (
+                        i.raw.dropped_files.iter().find_map(|f| f.path.clone()),
+                        !i.raw.hovered_files.is_empty(),
+                    )
+                });
+                if drag_hover {
+                    // Same hint style as the comparison panes
+                    // (comparison.rs show_pane): translucent blue fill,
+                    // border, centred label.
+                    let rect = ctx.screen_rect();
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::new("bs_drop_hint"),
+                    ));
+                    painter.rect_filled(
+                        rect,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(40, 110, 220, 50),
+                    );
+                    painter.rect_stroke(
+                        rect,
+                        0.0,
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(60, 140, 240)),
+                        egui::StrokeKind::Inside,
+                    );
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Drop .catb / bitstream to load",
+                        egui::FontId::proportional(16.0),
+                        egui::Color32::WHITE,
+                    );
+                }
+                if let Some(path) = dropped_path {
+                    let kind = classify_dropped_file(&path);
+                    shared.lock().drop_request = Some((path, kind));
+                    // The root polls drop_request on its next pass — wake it.
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
                 }
 
                 // Keep repainting while the root plays back (see sidebar.rs:

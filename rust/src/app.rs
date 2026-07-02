@@ -1554,6 +1554,56 @@ impl VideoViewerApp {
         self.corr_scan_active_job.store(0, Ordering::Release);
     }
 
+    /// Route a dropped file by its [`DroppedKind`] (0.15.0). Called for
+    /// main-window drops and for drops parked in the analysis window's
+    /// `drop_request` slot:
+    /// - Telemetry → `load_bitstream` + auto-open the analysis window
+    ///   (reuses the `--catb-window` deferred-open machinery, which also
+    ///   survives the resolution-mismatch confirm dialog and the WSLg
+    ///   child-viewport-creation deferral),
+    /// - Bitstream → start the external decoder run immediately when a
+    ///   command is configured, else open the launcher dialog prefilled
+    ///   (its built-in notice explains how to configure the command),
+    /// - Other → the pre-0.15.0 video-open path, unchanged.
+    fn route_dropped_file(
+        &mut self,
+        ctx: &egui::Context,
+        path: String,
+        kind: crate::core::dropped::DroppedKind,
+    ) {
+        use crate::core::dropped::DroppedKind;
+        match kind {
+            DroppedKind::Telemetry => {
+                self.startup_catb_window = true;
+                if let Err(e) = self.load_bitstream(ctx, &path) {
+                    self.startup_catb_window = false;
+                    eprintln!("catb: failed to load {path}: {e}");
+                    self.bitstream_error = Some(e);
+                }
+            }
+            DroppedKind::Bitstream => {
+                if self.settings.decoder.run_command.trim().is_empty() {
+                    let initial_dir = std::path::Path::new(&path)
+                        .parent()
+                        .and_then(|p| p.to_str())
+                        .map(str::to_string);
+                    let mut dlg =
+                        dialogs::DecoderRunDialog::new(initial_dir.as_deref());
+                    dlg.path = path;
+                    self.decoder_run_dialog = Some(dlg);
+                    self.dialog_state = DialogState::DecoderRun;
+                } else {
+                    self.start_decoder_run(ctx, &path);
+                }
+            }
+            DroppedKind::Other => {
+                let (w, h, fmt, info) = self.resolve_raw_open_params(&path);
+                self.open_file(ctx, path, w, h, &fmt);
+                self.status_info = info;
+            }
+        }
+    }
+
     /// M5: launch the user-configured external decoder command for
     /// `input` in a background thread (arm's-length: nothing is bundled —
     /// the viewer only consumes the files the command produces). Any
@@ -2081,9 +2131,13 @@ impl eframe::App for VideoViewerApp {
             // context's input, so we don't want to "load as current" here
             // and steal the drop the user intended for the Reference pane.
             if !self.comparison.is_open {
-                let (w, h, fmt, info) = self.resolve_raw_open_params(&path);
-                self.open_file(ctx, path, w, h, &fmt);
-                self.status_info = info;
+                // 0.15.0: classify before opening — .catb telemetry and raw
+                // bitstreams get their own routes; everything else follows
+                // the unchanged video-open path (DroppedKind::Other).
+                let kind = crate::core::dropped::classify_dropped_file(
+                    std::path::Path::new(&path),
+                );
+                self.route_dropped_file(ctx, path, kind);
             }
         }
 
@@ -3189,14 +3243,21 @@ impl eframe::App for VideoViewerApp {
         // Poll requests written by the window (one-way pull model: the child
         // never seeks by itself).
         {
-            let (seek, toggle_play, offset_req) = {
+            let (seek, toggle_play, offset_req, drop_req) = {
                 let mut s = self.bitstream_window.shared.lock();
                 (
                     s.seek_request.take(),
                     std::mem::take(&mut s.toggle_play_request),
                     s.offset_request.take(),
+                    s.drop_request.take(),
                 )
             };
+            // 0.15.0: file dropped on the analysis window — the child only
+            // classified and parked it; routing is root-owned and identical
+            // to a main-window drop (Other = load as current video).
+            if let Some((path, kind)) = drop_req {
+                self.route_dropped_file(ctx, path.display().to_string(), kind);
+            }
             if let Some(offset) = offset_req {
                 self.bitstream_offset = offset;
                 self.update_bitstream_shared(ctx);
