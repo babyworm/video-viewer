@@ -219,6 +219,9 @@ pub struct VideoViewerApp {
     /// Successfully parsed .catb awaiting the user's resolution-mismatch
     /// opt-in (R5/V18): (path, parsed file).
     pending_catb: Option<(String, Arc<crate::analysis::bitstream_stats::BitstreamFile>)>,
+    /// Correlation range-scan job guard (scene-detect job_id pattern).
+    corr_scan_job_id: usize,
+    corr_scan_active_job: Arc<AtomicUsize>,
     /// CLI --catb path to auto-load on the first update pass.
     startup_catb: Option<String>,
     /// CLI --catb-window: open the analysis window once the load succeeds.
@@ -343,6 +346,8 @@ impl VideoViewerApp {
             bitstream_offset: 0,
             bitstream_window,
             bitstream_panel: crate::analysis::bitstream_panel::BitstreamPanel::new(),
+            corr_scan_job_id: 0,
+            corr_scan_active_job: Arc::new(AtomicUsize::new(0)),
             pending_catb: None,
             startup_catb: catb,
             startup_catb_window: catb_window,
@@ -1468,6 +1473,13 @@ impl VideoViewerApp {
         s.offset = 0;
         s.frame_graph = None;
         s.frame_graph_scanning = false;
+        // Drop correlation data and cancel any in-flight range scan.
+        s.corr_analysis = None;
+        s.corr_scan = None;
+        s.corr_scan_request = None;
+        s.corr_scanning = false;
+        s.corr_scan_progress = (0, 0);
+        self.corr_scan_active_job.store(0, Ordering::Release);
     }
 
     /// Open (or re-focus) the Bitstream Analysis window and push fresh data.
@@ -1505,6 +1517,172 @@ impl VideoViewerApp {
             }
         }
         ctx.request_repaint_of(egui::ViewportId::from_hash_of("bitstream_viewport"));
+    }
+
+    /// M2: feed the Correlation tab. Computes the current frame's
+    /// analysis-side grids when the tab is visible and the pushed data is
+    /// stale (update_analysis convention: only pay for visible views), and
+    /// polls the child's range-scan request.
+    fn update_bitstream_correlation(&mut self, ctx: &egui::Context) {
+        if !self.bitstream_window.open {
+            return;
+        }
+        let (active, stale, scan_request) = {
+            let mut s = self.bitstream_window.shared.lock();
+            let stale = s
+                .corr_analysis
+                .as_ref()
+                .map(|d| d.frame_idx != self.current_frame_idx)
+                .unwrap_or(true);
+            (s.corr_active, stale, s.corr_scan_request.take())
+        };
+        if active && stale {
+            if let (Some(rgb), Some(reader)) = (&self.current_rgb, &self.reader) {
+                let (w, h) = (reader.width(), reader.height());
+                let prev = self
+                    .prev_rgb
+                    .as_ref()
+                    .filter(|p| p.len() == rgb.len())
+                    .map(|p| p.as_slice());
+                let grids =
+                    crate::analysis::correlation::compute_analysis_grids(rgb, prev, w, h);
+                self.bitstream_window.shared.lock().corr_analysis = Some(Arc::new(
+                    crate::ui::bitstream_window::CorrAnalysisData {
+                        frame_idx: self.current_frame_idx,
+                        grids,
+                    },
+                ));
+                ctx.request_repaint_of(egui::ViewportId::from_hash_of("bitstream_viewport"));
+            }
+        }
+        if let Some(req) = scan_request {
+            self.run_correlation_scan(ctx, req);
+        }
+    }
+
+    /// Frame-range correlation scan on a background thread (scene-detect
+    /// job pattern: own VideoReader, job-id guard, publish-if-current).
+    fn run_correlation_scan(
+        &mut self,
+        ctx: &egui::Context,
+        req: crate::analysis::correlation::CorrScanRequest,
+    ) {
+        use crate::analysis::correlation as corr;
+
+        let Some(file) = self.bitstream_file.clone() else {
+            return;
+        };
+        let (Some(reader), Some(path)) = (self.reader.as_ref(), self.current_file.clone()) else {
+            return;
+        };
+        let total = reader.total_frames();
+        if total == 0 {
+            return;
+        }
+        let w = reader.width();
+        let h = reader.height();
+        let fmt = reader.format_name().to_string();
+        let color_matrix = reader.color_matrix.clone();
+        let offset = self.bitstream_offset;
+        let start = req.start.min(total - 1);
+        let end = req.end.min(total - 1).max(start);
+
+        self.corr_scan_job_id += 1;
+        let job_id = self.corr_scan_job_id;
+        self.corr_scan_active_job.store(job_id, Ordering::Release);
+        let active_job = Arc::clone(&self.corr_scan_active_job);
+        let shared = Arc::clone(&self.bitstream_window.shared);
+        {
+            let mut s = shared.lock();
+            s.corr_scanning = true;
+            s.corr_scan = None;
+            s.corr_scan_progress = (0, end - start + 1);
+        }
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let publish = |result: corr::CorrScanResult| {
+                let mut s = shared.lock();
+                if active_job.load(Ordering::Acquire) == job_id {
+                    s.corr_scan = Some(Arc::new(result));
+                    s.corr_scanning = false;
+                }
+                drop(s);
+                ctx2.request_repaint();
+            };
+            let mut bg_reader =
+                match crate::core::reader::VideoReader::open(&path, w, h, &fmt, &color_matrix) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        publish(corr::CorrScanResult {
+                            request: req,
+                            frames: Vec::new(),
+                            error: Some(format!("failed to open video: {e}")),
+                        });
+                        return;
+                    }
+                };
+            let read_rgb = |r: &mut crate::core::reader::VideoReader, i: usize| {
+                r.seek_frame(i).and_then(|raw| r.convert_to_rgb(&raw))
+            };
+            // Motion metrics need frame i−1: preload it when the range
+            // doesn't start at 0.
+            let mut prev_rgb: Option<Vec<u8>> = if req.x.needs_previous_frame() && start > 0 {
+                read_rgb(&mut bg_reader, start - 1).ok()
+            } else {
+                None
+            };
+            let (sw, sh) = (file.width.max(1), file.height.max(1));
+            let mut frames: Vec<(usize, corr::AlignedPair)> = Vec::new();
+            let mut error: Option<String> = None;
+            for i in start..=end {
+                if active_job.load(Ordering::Acquire) != job_id {
+                    return; // superseded
+                }
+                let rgb = match read_rgb(&mut bg_reader, i) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error = Some(format!("failed to read frame {i}: {e}"));
+                        break;
+                    }
+                };
+                let grids =
+                    corr::compute_analysis_grids(&rgb, prev_rgb.as_deref(), w, h);
+                prev_rgb = Some(rgb);
+                let Some(xg) = corr::x_grid(&grids, req.x, req.g) else {
+                    continue; // e.g. motion metric at the very first frame
+                };
+                let Some(display_idx) =
+                    crate::analysis::bitstream_stats::viewer_to_catb_display(i, offset)
+                else {
+                    continue;
+                };
+                let Some(decode_idx) = file.decode_idx(display_idx) else {
+                    continue;
+                };
+                // Direct parse — keeps the render-path LRU cache untouched
+                // (compute_frame_graph precedent).
+                let Ok(blocks) = file.catb.blocks_for_frame(decode_idx) else {
+                    continue;
+                };
+                let l1 =
+                    crate::analysis::bitstream_stats::rasterize_blocks(&blocks, sw, sh, 8);
+                let bs_g = corr::aggregate_bitstream_to_g(&l1, sw, sh, req.g);
+                frames.push((i, corr::align(&xg, &bs_g, req.y)));
+                {
+                    let mut s = shared.lock();
+                    if active_job.load(Ordering::Acquire) != job_id {
+                        return;
+                    }
+                    s.corr_scan_progress = (i - start + 1, end - start + 1);
+                }
+                ctx2.request_repaint();
+            }
+            publish(corr::CorrScanResult {
+                request: req,
+                frames,
+                error,
+            });
+        });
     }
 
     pub fn current_sideband_frame(&self) -> Option<&crate::core::sideband::SidebandFrame> {
@@ -2750,6 +2928,9 @@ impl eframe::App for VideoViewerApp {
             self.settings.bitstream = new_view_settings;
             self.settings.save();
         }
+        // M2: correlation grids + range-scan requests (after show so the
+        // child's corr_active / scan request from this pass are honoured).
+        self.update_bitstream_correlation(ctx);
 
         // --- Central panel (canvas / video diff) ---
         let mut comparison_action = None;

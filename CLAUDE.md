@@ -38,7 +38,7 @@
     - `comparison.rs` - ComparisonView (three-pane video diff, spatial metric labels, synchronized zoom/pan)
     - `settings.rs` - Settings persistence (toml, incl. `[bitstream]` view state with serde-default backward compat)
     - `sideband_overlay.rs` - Sideband CTU heatmap overlay rendering
-    - `bitstream_window.rs` - Bitstream Analysis separate OS window (immediate viewport, `BitstreamShared`, fill heatmaps QP/bpp/Mode/MV-heat with LOD, presets, Inspector dock, filmstrip, Frame Graph tab, §8 shortcuts)
+    - `bitstream_window.rs` - Bitstream Analysis separate OS window (immediate viewport, `BitstreamShared`, fill heatmaps QP/bpp/Mode/MV-heat with LOD, presets, Inspector dock, filmstrip, Frame Graph tab, §8 shortcuts; M2 Correlation tab: X/Y/G combos with preset pairs, scatter plot, r/ρ/N/valid% readout, class table, CSV export, current-frame vs background range-scan modes)
   - `src/analysis/` - Analysis tools
     - `histogram.rs` - RGB and luma histograms
     - `waveform.rs` - Waveform display
@@ -50,6 +50,8 @@
     - `isp_sideband.rs` - SidebandPanel UI (load/unload, overlay mode, opacity)
     - `bitstream_stats.rs` - `BitstreamFile` (CVS-aware display map, resolution, block LRU), L1 8px rasterization (`rasterize_blocks`, area-weighted qp/bpp/mv/mode/coverage), LOD rule (`use_lod`, `lod_cell_size`), min-area hit test, viewer↔catb offset mapping, frame-type classes
     - `bitstream_panel.rs` - Sidebar mini panel (§9): load/unload, summary, frame offset spinner, open/focus window, §7 error strings (`BitstreamAction`)
+    - `correlation.rs` - M2 correlation engine (pure, egui-free): analysis↔bitstream grid alignment onto G ∈ {8,16,32,64} (`resample_scalar_to_g`, `resample_variance_to_g` total-variance law, `resample_classes_to_g` majority vote, `resample_orientation_to_g` purity-weighted circular doubled-angle mean, `aggregate_bitstream_to_g` with coverage/partial-cell valid masks), `AlignedPair`, Pearson r / Spearman ρ (tie-average ranks), motion-class × bitstream table, CSV dump, `compute_analysis_grids` (8px L1-aligned), range-scan request/result types
+    - `orientation.rs` - Per-block dominant gradient orientation (02 §3): Sobel → magnitude-weighted 16-bin histogram → dominant edge angle [0,180) + purity; angle = perpendicular-to-gradient (intra prediction direction)
   - `src/conversion/` - Format conversion
     - `converter.rs` - VideoConverter, extract/pack YUV planes, chroma resampling
   - `tests/` - Integration tests
@@ -73,7 +75,7 @@
 
 | File | Scope |
 |------|-------|
-| `src/*` inline tests | App comparison sync, comparison viewport math, toolbar grid selector, sideband schema, bitstream L1 rasterization/LOD/hit-test/offset/classification, bitstream window presets/view math/fill normalization (76 tests) |
+| `src/*` inline tests | App comparison sync, comparison viewport math, toolbar grid selector, sideband schema, bitstream L1 rasterization/LOD/hit-test/offset/classification, bitstream window presets/view math/fill normalization, correlation resample/stats/CSV/class-table (incl. circular purity-gated orientation resample), orientation Sobel angles/purity (103 tests) |
 | `tests/colorspace_test.rs` | RGB/YUV color conversion sanity checks (12 tests) |
 | `tests/formats_test.rs` | Format lookup, frame_size, categories (21 tests) |
 | `tests/formats_extra_test.rs` | RGB16/32, semi-planar, packed frame sizes (9 tests) |
@@ -95,8 +97,10 @@
 | `tests/motion_test.rs` | Per-block motion classification: pixel-diff vs avg·std, 4-class bands, localized motion, 8px grid, edge cases (12 tests) |
 | `tests/scene_test.rs` | Scene detection algorithms, thresholds, save/load (12 tests) |
 | `tests/sideband_test.rs` | Sideband binary parsing, extended header, signed fields, display (20 tests) |
-| `tests/catb_test.rs` | `.catb` v4 bitstream metadata: header/directory validation, frame/block/ref records, sentinels, oracle differential, display_map (16 tests) |
+| `tests/catb_test.rs` | `.catb` v4 bitstream metadata: header/directory validation, frame/block/ref records, sentinels, oracle differential, display_map; fixture writer lives in `tests/common/mod.rs` (16 tests) |
 | `tests/bitstream_ui_test.rs` | M1 window pure logic: settings backward compat (old settings.toml), preset apply/custom/cycle, offset mapping, rasterization bpp/coverage, LOD, min-area hit test, filmstrip colors (10 tests) |
+| `tests/correlation_test.rs` | M2 V19/V20: flat/noise synthetic pipeline r > 0.8, partial-block masking, motion↔bits + class table, CSV rows/flags/r re-computation, real hevc_bslice end-to-end smoke (5 tests) |
+| `tests/common/mod.rs` | Shared synthetic `.catb` v4 fixture writer (used by catb_test + correlation_test; no tests itself) |
 | `tests/ppm_test.rs` | PPM parsing, writing, reading, and conversion (10 tests) |
 | `tests/integration_test.rs` | Real Y4M file (conditional) (1 test) |
 

@@ -22,6 +22,12 @@ use crate::analysis::bitstream_stats::{
     hit_test_min_area, lod_cell_size, rasterize_blocks, use_lod, viewer_to_catb_display,
     BitstreamFile, BitstreamGrid, FrameTypeClass, ModeClass,
 };
+use crate::analysis::correlation::{
+    aggregate_bitstream_to_g, align, class_table, classes_at_g, csv_dump, pearson_r,
+    spearman_rho, x_grid, AlignedPair, AnalysisFrameGrids, BitstreamG, CorrScanRequest,
+    CorrScanResult, XMetric, YMetric, G_SIZES, PRESET_PAIRS,
+};
+use crate::analysis::motion::MotionClass;
 use crate::core::catb::BsBlock;
 use crate::ui::settings::BitstreamViewSettings;
 
@@ -356,7 +362,7 @@ pub fn fill_value_text(fill: FillMode, qp: f32, bpp: f32, mode: ModeClass, mv: f
         FillMode::None | FillMode::Qp => format!("{qp:.0}"),
         FillMode::Bpp => format!("{bpp:.2}"),
         FillMode::Mode => mode.label().to_string(),
-        FillMode::MvHeat => format!("{:.1}", mv / 4.0),
+        FillMode::MvHeat => format!("{mv:.1}"),
     }
 }
 
@@ -406,6 +412,26 @@ pub struct BitstreamShared {
     /// Frame Graph series, filled by a background scan thread on load.
     pub frame_graph: Option<Arc<Vec<FrameGraphPoint>>>,
     pub frame_graph_scanning: bool,
+    /// Child → root: the Correlation tab is visible, so the root computes
+    /// analysis grids for the current frame (update_analysis convention).
+    pub corr_active: bool,
+    /// Root-pushed analysis-side grids (8 px) for `frame_idx`.
+    pub corr_analysis: Option<Arc<CorrAnalysisData>>,
+    /// Child → root: run a frame-range scan on a background thread.
+    pub corr_scan_request: Option<CorrScanRequest>,
+    /// Range-scan output (background thread, root-owned job).
+    pub corr_scan: Option<Arc<CorrScanResult>>,
+    pub corr_scanning: bool,
+    /// (frames done, frames total) while scanning.
+    pub corr_scan_progress: (usize, usize),
+}
+
+/// Analysis-side grids for one viewer frame, computed by the root
+/// (`app.rs`) — the child never touches the decoder.
+#[derive(Debug)]
+pub struct CorrAnalysisData {
+    pub frame_idx: usize,
+    pub grids: AnalysisFrameGrids,
 }
 
 impl Default for BitstreamShared {
@@ -432,6 +458,12 @@ impl BitstreamShared {
             close_requested: false,
             frame_graph: None,
             frame_graph_scanning: false,
+            corr_active: false,
+            corr_analysis: None,
+            corr_scan_request: None,
+            corr_scan: None,
+            corr_scanning: false,
+            corr_scan_progress: (0, 0),
         }
     }
 }
@@ -481,6 +513,10 @@ struct Snapshot {
     is_playing: bool,
     frame_graph: Option<Arc<Vec<FrameGraphPoint>>>,
     frame_graph_scanning: bool,
+    corr_analysis: Option<Arc<CorrAnalysisData>>,
+    corr_scan: Option<Arc<CorrScanResult>>,
+    corr_scanning: bool,
+    corr_scan_progress: (usize, usize),
 }
 
 pub struct BitstreamWindow {
@@ -507,6 +543,55 @@ pub struct BitstreamWindow {
     /// Show per-frame bits / avg-QP series in the Frame Graph tab.
     graph_show_bits: bool,
     graph_show_qp: bool,
+
+    // -- Correlation tab (M2) state --
+    corr_x: XMetric,
+    corr_y: YMetric,
+    corr_g: u32,
+    /// false = current frame, true = frame range.
+    corr_range_mode: bool,
+    corr_range: (usize, usize),
+    corr_csv_path: String,
+    /// Transient CSV save status line.
+    corr_csv_status: Option<String>,
+    /// Cached current-frame correlation derivation.
+    corr_derived: Option<CorrDerived>,
+    /// Cached range-scan statistics + scatter points (see
+    /// [`Self::refresh_corr_scan_derived`]).
+    corr_scan_derived: Option<CorrScanDerived>,
+}
+
+/// Cached current-frame correlation data, keyed on everything that feeds it.
+struct CorrDerived {
+    frame_idx: usize,
+    display_idx: usize,
+    g: u32,
+    x: XMetric,
+    y: YMetric,
+    /// `None` when the X metric needs a previous frame and there is none.
+    pair: Option<AlignedPair>,
+    /// Bitstream aggregate at G (drives the class table too).
+    bs_g: BitstreamG,
+    /// Motion classes at G (class table); `None` without a previous frame.
+    classes: Option<(Vec<MotionClass>, Vec<bool>, u32, u32)>,
+    r: Option<f64>,
+    rho: Option<f64>,
+}
+
+/// Cached statistics and valid scatter points of a range-scan result. The
+/// concat + Pearson + Spearman (rank sort!) over a long 8px scan is
+/// O(N log N) with N in the millions on 1080p content — recomputing it every
+/// repaint would stall playback, so it is keyed on the scan Arc identity
+/// (the published `CorrScanResult` is immutable).
+struct CorrScanDerived {
+    /// `Arc::as_ptr` of the snapshot's scan result.
+    scan_ptr: usize,
+    r: Option<f64>,
+    rho: Option<f64>,
+    n: usize,
+    frac: f32,
+    /// Valid (a, b) samples, ready for the scatter plot.
+    pts: Vec<[f64; 2]>,
 }
 
 impl Default for BitstreamWindow {
@@ -533,6 +618,15 @@ impl BitstreamWindow {
             hint: None,
             graph_show_bits: true,
             graph_show_qp: true,
+            corr_x: XMetric::Variance,
+            corr_y: YMetric::Bpp,
+            corr_g: 16,
+            corr_range_mode: false,
+            corr_range: (0, 0),
+            corr_csv_path: String::new(),
+            corr_csv_status: None,
+            corr_derived: None,
+            corr_scan_derived: None,
         }
     }
 
@@ -590,6 +684,10 @@ impl BitstreamWindow {
                 is_playing: s.is_playing,
                 frame_graph: s.frame_graph.clone(),
                 frame_graph_scanning: s.frame_graph_scanning,
+                corr_analysis: s.corr_analysis.clone(),
+                corr_scan: s.corr_scan.clone(),
+                corr_scanning: s.corr_scanning,
+                corr_scan_progress: s.corr_scan_progress,
             };
             (snap, title)
         };
@@ -629,14 +727,22 @@ impl BitstreamWindow {
                 self.ui_tab_bar(ctx, &snap);
                 match self.tab {
                     BsTab::Viewer => self.ui_viewer_tab(ctx, &snap),
-                    BsTab::Correlation => {
-                        egui::CentralPanel::default().show(ctx, |ui| {
-                            ui.centered_and_justified(|ui| {
-                                ui.label("Correlation analysis arrives in M2.");
-                            });
-                        });
-                    }
+                    BsTab::Correlation => self.ui_correlation_tab(ctx, &snap),
                     BsTab::FrameGraph => self.ui_frame_graph_tab(ctx, &snap),
+                }
+
+                // Tell the root whether it must keep computing analysis
+                // grids for the Correlation tab (update_analysis convention:
+                // only pay for visible views).
+                {
+                    let mut s = shared.lock();
+                    let active = self.tab == BsTab::Correlation;
+                    if active && !s.corr_active {
+                        // Freshly activated: the root computes on its next
+                        // pass — wake it up.
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    }
+                    s.corr_active = active;
                 }
 
                 // Keep repainting while the root plays back (see sidebar.rs:
@@ -1642,6 +1748,456 @@ impl BitstreamWindow {
         });
     }
 
+    // -- Correlation tab (M2, UX §6) --------------------------------------------
+
+    /// Refresh the cached current-frame correlation derivation.
+    fn refresh_corr_derived(&mut self, snap: &Snapshot) {
+        let Some(file) = snap.file.as_ref() else {
+            self.corr_derived = None;
+            return;
+        };
+        let Some(display_idx) = viewer_to_catb_display(snap.viewer_frame, snap.offset) else {
+            self.corr_derived = None;
+            return;
+        };
+        if display_idx >= file.frame_count() {
+            self.corr_derived = None;
+            return;
+        }
+        let analysis = snap
+            .corr_analysis
+            .as_ref()
+            .filter(|d| d.frame_idx == snap.viewer_frame);
+        let Some(analysis) = analysis else {
+            // Root hasn't pushed grids for this frame yet.
+            self.corr_derived = None;
+            return;
+        };
+        let current = self.corr_derived.as_ref().is_some_and(|d| {
+            d.frame_idx == snap.viewer_frame
+                && d.display_idx == display_idx
+                && d.g == self.corr_g
+                && d.x == self.corr_x
+                && d.y == self.corr_y
+        });
+        if current {
+            return;
+        }
+        // Bitstream side: reuse the Viewer tab's per-frame L1 grid.
+        self.refresh_derived(snap);
+        let Some(derived) = self.derived.as_ref() else {
+            self.corr_derived = None;
+            return;
+        };
+        let (sw, sh) = (file.width.max(1), file.height.max(1));
+        let bs_g = aggregate_bitstream_to_g(&derived.grid_l1, sw, sh, self.corr_g);
+        let pair = x_grid(&analysis.grids, self.corr_x, self.corr_g)
+            .map(|xg| align(&xg, &bs_g, self.corr_y));
+        let (r, rho) = pair
+            .as_ref()
+            .map(|p| {
+                (
+                    pearson_r(&p.a, &p.b, &p.valid),
+                    spearman_rho(&p.a, &p.b, &p.valid),
+                )
+            })
+            .unwrap_or((None, None));
+        let classes = classes_at_g(&analysis.grids, self.corr_g)
+            .map(|(classes, grid)| (classes, grid.valid, grid.cols, grid.rows));
+        self.corr_derived = Some(CorrDerived {
+            frame_idx: snap.viewer_frame,
+            display_idx,
+            g: self.corr_g,
+            x: self.corr_x,
+            y: self.corr_y,
+            pair,
+            bs_g,
+            classes,
+            r,
+            rho,
+        });
+    }
+
+    /// True when the stored scan was produced with different X/Y/G settings
+    /// than the combos currently show — its numbers must not be presented
+    /// next to the current labels.
+    fn corr_scan_stale(&self, scan: &CorrScanResult) -> bool {
+        scan.request.g != self.corr_g
+            || scan.request.x != self.corr_x
+            || scan.request.y != self.corr_y
+    }
+
+    /// Refresh the cached range-scan derivation (statistics + scatter
+    /// points). Keyed on the scan Arc identity, so the O(N log N) work runs
+    /// once per published scan instead of on every repaint.
+    fn refresh_corr_scan_derived(&mut self, snap: &Snapshot) {
+        let Some(scan) = snap.corr_scan.as_ref() else {
+            self.corr_scan_derived = None;
+            return;
+        };
+        let scan_ptr = Arc::as_ptr(scan) as usize;
+        if self
+            .corr_scan_derived
+            .as_ref()
+            .is_some_and(|d| d.scan_ptr == scan_ptr)
+        {
+            return;
+        }
+        let (a, b, valid) = scan.concat();
+        let n = valid.iter().filter(|v| **v).count();
+        let frac = if valid.is_empty() {
+            0.0
+        } else {
+            n as f32 / valid.len() as f32
+        };
+        let mut pts = Vec::with_capacity(n);
+        for i in 0..valid.len() {
+            if valid[i] {
+                pts.push([a[i] as f64, b[i] as f64]);
+            }
+        }
+        self.corr_scan_derived = Some(CorrScanDerived {
+            scan_ptr,
+            r: pearson_r(&a, &b, &valid),
+            rho: spearman_rho(&a, &b, &valid),
+            n,
+            frac,
+            pts,
+        });
+    }
+
+    /// Statistics readout source: scan result in range mode, else the
+    /// current-frame pair.
+    fn corr_stats_readout(&self, snap: &Snapshot) -> String {
+        let (r, rho, n, frac) = if self.corr_range_mode {
+            match snap.corr_scan.as_ref() {
+                // §6: never pair the current combo labels with a previous
+                // scan's numbers — flag staleness right in the readout.
+                Some(scan) if self.corr_scan_stale(scan) => {
+                    return "r=– ρ=– N=– (stale scan — press Scan)".to_string();
+                }
+                Some(_) => match self.corr_scan_derived.as_ref() {
+                    Some(d) => (d.r, d.rho, d.n, d.frac),
+                    None => (None, None, 0, 0.0),
+                },
+                None => (None, None, 0, 0.0),
+            }
+        } else {
+            match self.corr_derived.as_ref().and_then(|d| d.pair.as_ref()) {
+                Some(p) => (
+                    self.corr_derived.as_ref().and_then(|d| d.r),
+                    self.corr_derived.as_ref().and_then(|d| d.rho),
+                    p.n_valid(),
+                    p.valid_fraction(),
+                ),
+                None => (None, None, 0, 0.0),
+            }
+        };
+        let fmt = |v: Option<f64>| match v {
+            Some(v) => format!("{v:+.3}"),
+            None => "–".to_string(),
+        };
+        format!(
+            "r={} ρ={} N={} (valid {:.0}%)",
+            fmt(r),
+            fmt(rho),
+            n,
+            frac * 100.0
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn ui_correlation_tab(&mut self, ctx: &egui::Context, snap: &Snapshot) {
+        self.ui_transport_and_status(ctx, snap);
+        self.refresh_corr_derived(snap);
+        self.refresh_corr_scan_derived(snap);
+
+        let total = snap.viewer_total;
+        // Clamp the range to the shorter of the video / telemetry.
+        let max_frame = total.saturating_sub(1);
+
+        // -- controls strip (§6: everything in one line + live readout) --
+        egui::TopBottomPanel::top("bs_corr_controls").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("X:");
+                egui::ComboBox::from_id_salt("bs_corr_x")
+                    .selected_text(self.corr_x.label())
+                    .show_ui(ui, |ui| {
+                        // Preset pairs above the separator (02 §2).
+                        for (label, x, y) in PRESET_PAIRS {
+                            if ui.selectable_label(false, label).clicked() {
+                                self.corr_x = x;
+                                self.corr_y = y;
+                            }
+                        }
+                        ui.separator();
+                        for x in XMetric::ALL {
+                            ui.selectable_value(&mut self.corr_x, x, x.label());
+                        }
+                    });
+                ui.label("Y:");
+                egui::ComboBox::from_id_salt("bs_corr_y")
+                    .selected_text(self.corr_y.label())
+                    .show_ui(ui, |ui| {
+                        for y in YMetric::ALL {
+                            ui.selectable_value(&mut self.corr_y, y, y.label());
+                        }
+                    });
+                ui.label("G:");
+                egui::ComboBox::from_id_salt("bs_corr_g")
+                    .selected_text(format!("{}", self.corr_g))
+                    .show_ui(ui, |ui| {
+                        for g in G_SIZES {
+                            ui.selectable_value(&mut self.corr_g, g, format!("{g}"));
+                        }
+                    });
+
+                ui.separator();
+                ui.label("Frames:");
+                ui.radio_value(&mut self.corr_range_mode, false, "current");
+                ui.radio_value(&mut self.corr_range_mode, true, "range");
+                if self.corr_range_mode {
+                    let (mut s, mut e) = self.corr_range;
+                    ui.add(
+                        egui::DragValue::new(&mut s)
+                            .range(0..=max_frame)
+                            .prefix("from "),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut e)
+                            .range(0..=max_frame)
+                            .prefix("to "),
+                    );
+                    if e < s {
+                        e = s;
+                    }
+                    self.corr_range = (s, e);
+                    let can_scan =
+                        !snap.is_playing && !snap.corr_scanning && snap.file.is_some() && total > 0;
+                    let scan = ui
+                        .add_enabled(can_scan, egui::Button::new("Scan"))
+                        .on_hover_text("Accumulate the aligned pairs over the frame range on a background thread")
+                        .on_disabled_hover_text(if snap.is_playing {
+                            "Pause playback to scan a range"
+                        } else {
+                            "Scan unavailable"
+                        });
+                    if scan.clicked() {
+                        self.shared.lock().corr_scan_request = Some(CorrScanRequest {
+                            start: s,
+                            end: e,
+                            g: self.corr_g,
+                            x: self.corr_x,
+                            y: self.corr_y,
+                        });
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    }
+                    if snap.corr_scanning {
+                        ui.spinner();
+                        let (done, of) = snap.corr_scan_progress;
+                        ui.weak(format!("{done}/{of}"));
+                    }
+                }
+
+                ui.separator();
+                // §6: the statistics readout is always visible — a scatter
+                // plot without its r/ρ/N invites misreading.
+                ui.monospace(self.corr_stats_readout(snap));
+
+                ui.separator();
+                if self.corr_csv_path.is_empty() {
+                    self.corr_csv_path = "correlation.csv".to_string();
+                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.corr_csv_path)
+                        .desired_width(180.0)
+                        .hint_text("CSV path"),
+                );
+                if ui
+                    .button("CSV")
+                    .on_hover_text("Dump the aligned pair grid (frame, cell_x, cell_y, a, b, valid)")
+                    .clicked()
+                {
+                    self.corr_csv_status = Some(self.save_corr_csv(snap));
+                }
+                if let Some(status) = &self.corr_csv_status {
+                    ui.weak(status);
+                }
+            });
+        });
+
+        // -- right dock: conditional class table (02 §2 view 3) --
+        egui::SidePanel::right("bs_corr_classes")
+            .default_width(300.0)
+            .show(ctx, |ui| {
+                ui.heading("Motion class × bitstream");
+                ui.separator();
+                let Some(d) = self.corr_derived.as_ref() else {
+                    ui.label(if snap.file.is_none() {
+                        "No .catb loaded."
+                    } else {
+                        "No data for this frame."
+                    });
+                    return;
+                };
+                match &d.classes {
+                    Some((classes, valid, cols, rows)) => {
+                        let table = class_table(classes, valid, *cols, *rows, &d.bs_g);
+                        egui::Grid::new("bs_corr_class_grid")
+                            .striped(true)
+                            .spacing(egui::vec2(10.0, 4.0))
+                            .show(ui, |ui| {
+                                for head in ["class", "cells", "QP", "bpp", "|MV|px", "intra%"] {
+                                    ui.label(egui::RichText::new(head).small().strong());
+                                }
+                                ui.end_row();
+                                for row in table {
+                                    ui.label(row.class.label());
+                                    ui.monospace(format!("{}", row.cells));
+                                    if row.cells > 0 {
+                                        ui.monospace(format!("{:.1}", row.mean_qp));
+                                        ui.monospace(format!("{:.2}", row.mean_bpp));
+                                        ui.monospace(format!("{:.1}", row.mean_mv));
+                                        ui.monospace(format!("{:.0}%", row.intra_ratio * 100.0));
+                                    } else {
+                                        for _ in 0..4 {
+                                            ui.monospace("–");
+                                        }
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                        ui.add_space(4.0);
+                        ui.weak("current frame · valid cells only");
+                    }
+                    None => {
+                        ui.label("Motion classes need a previous frame —");
+                        ui.label("step forward once (→) to populate.");
+                    }
+                }
+            });
+
+        // -- centre: scatter plot (02 §2 view 1) --
+        egui::CentralPanel::default().show(ctx, |ui| {
+            use egui_plot::{Plot, PlotPoints, Points};
+
+            if snap.file.is_none() {
+                ui.centered_and_justified(|ui| {
+                    ui.label("Load a .catb to correlate analysis metrics with encoder decisions.");
+                });
+                return;
+            }
+
+            // Collect the plotted points. Range mode reuses the cached scan
+            // derivation (borrowed, not rebuilt — the scan can hold millions
+            // of samples).
+            let mut frame_pts: Vec<[f64; 2]> = Vec::new();
+            let mut note: Option<String> = None;
+            if self.corr_range_mode {
+                match snap.corr_scan.as_ref() {
+                    Some(scan) => {
+                        if self.corr_scan_stale(scan) {
+                            note = Some(
+                                "Scan result is for different settings — press Scan again."
+                                    .to_string(),
+                            );
+                        }
+                        if let Some(err) = &scan.error {
+                            note = Some(format!("Scan: {err}"));
+                        }
+                    }
+                    None if snap.corr_scanning => {
+                        note = Some("Scanning…".to_string());
+                    }
+                    None => {
+                        note = Some("Set a range and press Scan.".to_string());
+                    }
+                }
+            } else {
+                match self.corr_derived.as_ref() {
+                    Some(d) => match &d.pair {
+                        Some(p) => {
+                            for i in 0..p.valid.len() {
+                                if p.valid[i] {
+                                    frame_pts.push([p.a[i] as f64, p.b[i] as f64]);
+                                }
+                            }
+                        }
+                        None => {
+                            note = Some(format!(
+                                "{} requires a previous frame — step forward once (→).",
+                                self.corr_x.label()
+                            ));
+                        }
+                    },
+                    None => {
+                        note = Some("No aligned data for this frame.".to_string());
+                    }
+                }
+            }
+            let pts: &[[f64; 2]] = if self.corr_range_mode {
+                self.corr_scan_derived
+                    .as_ref()
+                    .map_or(&[][..], |d| d.pts.as_slice())
+            } else {
+                &frame_pts
+            };
+
+            // Cap the drawn points so a long-range 8px scan cannot stall the
+            // painter; statistics above always use the full data.
+            const MAX_POINTS: usize = 20_000;
+            let stride = pts.len().div_ceil(MAX_POINTS).max(1);
+            let drawn: Vec<[f64; 2]> = pts.iter().copied().step_by(stride).collect();
+
+            if let Some(note) = &note {
+                ui.weak(note);
+            }
+            Plot::new("bs_corr_scatter")
+                .x_axis_label(self.corr_x.label())
+                .y_axis_label(self.corr_y.label())
+                .allow_drag(true)
+                .allow_zoom(true)
+                .allow_scroll(true)
+                .show(ui, |plot_ui| {
+                    plot_ui.points(
+                        Points::new(PlotPoints::new(drawn))
+                            .radius(1.6)
+                            .color(egui::Color32::from_rgb(120, 190, 255)),
+                    );
+                });
+        });
+    }
+
+    /// Write the CSV dump for the current mode. Returns a status line.
+    fn save_corr_csv(&self, snap: &Snapshot) -> String {
+        let csv = if self.corr_range_mode {
+            match snap.corr_scan.as_ref() {
+                Some(scan) => {
+                    if self.corr_scan_stale(scan) {
+                        return "scan is stale (settings changed) — press Scan again".to_string();
+                    }
+                    let frames: Vec<(usize, &AlignedPair)> =
+                        scan.frames.iter().map(|(f, p)| (*f, p)).collect();
+                    csv_dump(&frames)
+                }
+                None => return "no scan result to export".to_string(),
+            }
+        } else {
+            match self
+                .corr_derived
+                .as_ref()
+                .and_then(|d| d.pair.as_ref().map(|p| (d.frame_idx, p)))
+            {
+                Some((frame, pair)) => csv_dump(&[(frame, pair)]),
+                None => return "no aligned data to export".to_string(),
+            }
+        };
+        match std::fs::write(&self.corr_csv_path, csv) {
+            Ok(()) => format!("saved {}", self.corr_csv_path),
+            Err(e) => format!("save failed: {e}"),
+        }
+    }
+
     // -- Frame Graph tab -------------------------------------------------------
 
     fn ui_frame_graph_tab(&mut self, ctx: &egui::Context, snap: &Snapshot) {
@@ -1766,7 +2322,7 @@ fn draw_legend(
             let (name, lo, hi) = match fill {
                 FillMode::Qp => ("QP", stats.qp_min, stats.qp_max),
                 FillMode::Bpp => ("bpp", 0.0, stats.bpp_max),
-                FillMode::MvHeat => ("|MV|px", 0.0, stats.mv_max / 4.0),
+                FillMode::MvHeat => ("|MV|px", 0.0, stats.mv_max),
                 _ => unreachable!(),
             };
             let bar_w = 90.0_f32;

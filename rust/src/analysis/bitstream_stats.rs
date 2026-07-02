@@ -347,7 +347,8 @@ pub struct BitstreamGrid {
     pub qp: Vec<f32>,
     /// Bits per covered pixel per cell (0.0 where uncovered).
     pub bpp: Vec<f32>,
-    /// Area-weighted mean L1-norm MV magnitude (quarter-pel units).
+    /// Area-weighted mean L1-norm MV magnitude in pixels (02 §1: the
+    /// quarter-pel L1 norm `|x|+|y|` divided by 4).
     pub mv_mag: Vec<f32>,
     /// Majority (largest-area) mode class per cell.
     pub mode: Vec<ModeClass>,
@@ -413,9 +414,11 @@ pub fn rasterize_blocks(blocks: &[BsBlock], width: u32, height: u32, cell: u32) 
         }
         let block_area = (b.w as f64) * (b.h as f64);
         let bits_per_px = b.bits.max(0) as f64 / block_area;
+        // Quarter-pel L1 norm / 4 → pixels (02 §1), so every consumer —
+        // heatmap legend, class table, scatter, CSV — shares one unit.
         let mv_mag = b
             .mv
-            .map(|(x, y)| (x.abs() + y.abs()) as f64)
+            .map(|(x, y)| (x.abs() + y.abs()) as f64 / 4.0)
             .unwrap_or(0.0);
         let mode = ModeClass::from_label(&b.prediction_mode);
 
@@ -569,8 +572,8 @@ mod raster_tests {
         assert!((g.qp[0] - 32.0).abs() < 1e-5);
         // 128 bits over 64 px = 2.0 bpp.
         assert!((g.bpp[0] - 2.0).abs() < 1e-5);
-        // |4| + |−2| = 6 quarter-pel.
-        assert!((g.mv_mag[0] - 6.0).abs() < 1e-5);
+        // (|4| + |−2|) quarter-pel / 4 = 1.5 px.
+        assert!((g.mv_mag[0] - 1.5).abs() < 1e-5);
         assert_eq!(g.mode[0], ModeClass::Inter);
         assert!((g.coverage[0] - 1.0).abs() < 1e-5);
         // Untouched cells stay zeroed / uncovered.
