@@ -7,9 +7,10 @@
 //! directory, an interned string table, a JSON meta blob, and fixed-size
 //! little-endian records (FRAME 80 B, BLOCK 156 B, REF 68 B). The file is
 //! mmap'd; FRAME records are parsed eagerly (small), BLOCK/REF records are
-//! parsed lazily per frame/block. The `syntax`, `cabac`, `transforms`,
-//! `coeffs`, and `frame_aux` sections are NOT parsed in M0 — only their
-//! directory entries are retained.
+//! parsed lazily per frame/block, and SYNTAX records (28 B) are parsed
+//! lazily per block (M4). The `cabac`, `transforms`, `coeffs`, and
+//! `frame_aux` sections are NOT parsed — only their directory entries are
+//! retained.
 
 use std::fs::File;
 use std::path::Path;
@@ -29,6 +30,8 @@ pub const FRAME_RECORD_SIZE: usize = 80;
 pub const BLOCK_RECORD_SIZE: usize = 156;
 /// REF record size in bytes.
 pub const REF_RECORD_SIZE: usize = 68;
+/// SYNTAX record size in bytes (§7).
+pub const SYNTAX_RECORD_SIZE: usize = 28;
 
 // Section directory indices (fixed, normative order).
 pub const SEC_STRINGS: usize = 0;
@@ -182,6 +185,23 @@ pub struct BsRef {
     pub reference_frame: Option<i32>,
     pub long_term: Option<bool>,
     pub pu_part_index: Option<i32>,
+}
+
+/// One SYNTAX record (28 bytes): a decoded syntax-element row (§7).
+///
+/// Only the fields the M4 visualization layers need are surfaced. Note that
+/// per §7 the element's `value` is a **string id**, not a numeric field —
+/// values are interned strings exactly as the decoder emitted them, so the
+/// resolved string is kept and numeric interpretation is left to consumers
+/// (see `bitstream_stats::extract_intra_modes`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SyntaxRow {
+    /// Resolved element name, e.g. `"intra_luma_pred_mode"`; `""` if absent.
+    pub name: String,
+    /// Resolved value string, e.g. `"26"`; `""` if absent.
+    pub value: String,
+    /// Bits consumed by the element.
+    pub bits: i64,
 }
 
 /// An open, header-validated `.catb` v4 file.
@@ -380,6 +400,34 @@ impl CatbFile {
         Ok(out)
     }
 
+    /// Lazily parse a block's SYNTAX records (decoded syntax-element rows).
+    ///
+    /// Same OOM guard pattern as `blocks_for_frame` / `refs_for_block`
+    /// (0.12.1 F1): `syntax_n` is clamped against the physical SYNTAX
+    /// section size *before* any allocation.
+    pub fn syntax_for_block(&self, block: &BsBlock) -> Result<Vec<SyntaxRow>, String> {
+        let syntax_bytes = self.section_bytes(SEC_SYNTAX);
+        let n = block.syntax_n.max(0) as usize;
+        let max_records = syntax_bytes.len() / SYNTAX_RECORD_SIZE;
+        if n > max_records {
+            return Err(format!(
+                "catb: block claims {n} syntax rows but the SYNTAX section \
+                 only holds {max_records} records"
+            ));
+        }
+        let mut out = Vec::with_capacity(n);
+        for j in 0..n {
+            let rec_idx = (block.syntax_off as usize)
+                .checked_add(j)
+                .ok_or_else(|| "catb: syntax record index overflows".to_string())?;
+            let byte_off = rec_idx
+                .checked_mul(SYNTAX_RECORD_SIZE)
+                .ok_or_else(|| "catb: syntax byte offset overflows".to_string())?;
+            out.push(parse_syntax_record(syntax_bytes, byte_off, &self.strings)?);
+        }
+        Ok(out)
+    }
+
     /// Lazily parse a block's REF records (per-PU reference rows).
     pub fn refs_for_block(&self, block: &BsBlock) -> Result<Vec<BsRef>, String> {
         let refs_bytes = self.section_bytes(SEC_REFS);
@@ -569,6 +617,18 @@ fn parse_block_record(bytes: &[u8], off: usize, strings: &[String]) -> Result<Bs
         } else {
             None
         },
+    })
+}
+
+/// Parse one 28-byte SYNTAX record at `off` (§7): `<3iqq` — name(string id),
+/// value(string id), coding(string id), bit_offset(i64), bits(i64). Only
+/// name/value/bits are surfaced (coding and bit_offset are unused by M4).
+fn parse_syntax_record(bytes: &[u8], off: usize, strings: &[String]) -> Result<SyntaxRow, String> {
+    let rec = get_bytes(bytes, off, SYNTAX_RECORD_SIZE, "SYNTAX record")?;
+    Ok(SyntaxRow {
+        name: resolve_str(strings, read_i32(rec, 0, "syntax.name")?).to_string(),
+        value: resolve_str(strings, read_i32(rec, 4, "syntax.value")?).to_string(),
+        bits: read_i64(rec, 20, "syntax.bits")?,
     })
 }
 

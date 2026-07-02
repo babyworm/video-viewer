@@ -214,6 +214,11 @@ pub struct VideoViewerApp {
     pub bitstream_offset: i32,
     /// The separate Bitstream Analysis OS window (M1).
     pub bitstream_window: crate::ui::bitstream_window::BitstreamWindow,
+    /// M4: render the window's layer stack on the main canvas (panel
+    /// checkbox; session-only, default off).
+    pub bitstream_overlay_main: bool,
+    /// Per-frame derived data cache for the main-canvas overlay.
+    bs_overlay_cache: crate::ui::bitstream_overlay::OverlayCache,
     /// Sidebar mini panel (§9) — stateless, isp_sideband.rs pattern.
     bitstream_panel: crate::analysis::bitstream_panel::BitstreamPanel,
     /// Successfully parsed .catb awaiting the user's resolution-mismatch
@@ -345,6 +350,8 @@ impl VideoViewerApp {
             catb_dialog: None,
             bitstream_offset: 0,
             bitstream_window,
+            bitstream_overlay_main: false,
+            bs_overlay_cache: crate::ui::bitstream_overlay::OverlayCache::default(),
             bitstream_panel: crate::analysis::bitstream_panel::BitstreamPanel::new(),
             corr_scan_job_id: 0,
             corr_scan_active_job: Arc::new(AtomicUsize::new(0)),
@@ -1427,6 +1434,10 @@ impl VideoViewerApp {
         self.corr_scan_active_job.store(0, Ordering::Release);
         self.bitstream_offset = 0;
         self.bitstream_window.reset_file_state();
+        // Main-canvas overlay cache keys on Arc::as_ptr — the allocator can
+        // hand a new file the old file's address after an unload, so the
+        // cache must be dropped explicitly (mirrors reset_file_state).
+        self.bs_overlay_cache = crate::ui::bitstream_overlay::OverlayCache::default();
         self.bitstream_file = Some(Arc::clone(&file));
         self.bitstream_path = Some(path.to_string());
         self.bitstream_error = None;
@@ -1483,6 +1494,10 @@ impl VideoViewerApp {
         self.bitstream_offset = 0;
         // Window-side caches/selection pointing into the unloaded file.
         self.bitstream_window.reset_file_state();
+        // Drop the main-canvas overlay cache too: it keys on Arc::as_ptr,
+        // and a subsequent load can reuse the freed allocation's address,
+        // which would render the old file's blocks over the new one.
+        self.bs_overlay_cache = crate::ui::bitstream_overlay::OverlayCache::default();
         let mut s = self.bitstream_window.shared.lock();
         s.file = None;
         s.file_name = None;
@@ -2739,6 +2754,7 @@ impl eframe::App for VideoViewerApp {
         let bs_error = self.bitstream_error.clone();
         let bs_offset = self.bitstream_offset;
         let bs_window_open = self.bitstream_window.open;
+        let bs_overlay_main = self.bitstream_overlay_main;
         let bs_total_frames = self.total_frames();
         let bs_viewer_size = self.reader.as_ref().map(|r| (r.width(), r.height()));
         let mut bs_action: Option<crate::analysis::bitstream_panel::BitstreamAction> = None;
@@ -2786,6 +2802,7 @@ impl eframe::App for VideoViewerApp {
                                 viewer_total_frames: bs_total_frames,
                                 viewer_size: bs_viewer_size,
                                 window_open: bs_window_open,
+                                overlay_on_canvas: bs_overlay_main,
                             },
                         );
                     }
@@ -2914,6 +2931,9 @@ impl eframe::App for VideoViewerApp {
                     self.bitstream_offset = offset;
                     self.update_bitstream_shared(ctx);
                 }
+                BitstreamAction::SetOverlayOnCanvas(on) => {
+                    self.bitstream_overlay_main = on;
+                }
             }
         }
         // Poll requests written by the window (one-way pull model: the child
@@ -3015,6 +3035,36 @@ impl eframe::App for VideoViewerApp {
                                     ctu_size: 64,
                                     zoom: self.canvas.zoom,
                                 },
+                            );
+                        }
+                    }
+                }
+
+                // M4: bitstream layer overlay on the main canvas — mirrors
+                // the Bitstream window's live ViewConfig (single source of
+                // truth; no separate overlay settings). Default off, and a
+                // no-op when no .catb is loaded.
+                if self.bitstream_overlay_main {
+                    if let (Some(file), Some(image_rect)) =
+                        (self.bitstream_file.as_ref(), self.canvas.image_rect())
+                    {
+                        let display_idx =
+                            crate::analysis::bitstream_stats::viewer_to_catb_display(
+                                self.current_frame_idx,
+                                self.bitstream_offset,
+                            )
+                            .filter(|&d| d < file.frame_count());
+                        if let Some(display_idx) = display_idx {
+                            crate::ui::bitstream_overlay::draw_bitstream_overlay(
+                                &crate::ui::bitstream_overlay::BitstreamOverlayParams {
+                                    painter: ui.painter(),
+                                    image_rect,
+                                    view: &self.bitstream_window.view,
+                                    mv_source: self.bitstream_window.mv_source,
+                                    file,
+                                    display_idx,
+                                },
+                                &mut self.bs_overlay_cache,
                             );
                         }
                     }

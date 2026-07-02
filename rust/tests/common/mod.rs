@@ -7,7 +7,9 @@
 
 use std::io::Write;
 
-use video_viewer::core::catb::{BLOCK_RECORD_SIZE, FRAME_RECORD_SIZE, REF_RECORD_SIZE};
+use video_viewer::core::catb::{
+    BLOCK_RECORD_SIZE, FRAME_RECORD_SIZE, REF_RECORD_SIZE, SYNTAX_RECORD_SIZE,
+};
 
 /// Encode the string table (§3): u32 count + count × (u32 len, utf8 bytes).
 pub fn encode_strings(strings: &[&str]) -> Vec<u8> {
@@ -161,6 +163,19 @@ pub fn ref_record(r: &RefSpec) -> Vec<u8> {
     out
 }
 
+/// Encode one 28-byte SYNTAX record (§7): name/value/coding string ids +
+/// bit_offset + bits.
+pub fn syntax_record(name_id: i32, value_id: i32, coding_id: i32, bit_offset: i64, bits: i64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SYNTAX_RECORD_SIZE);
+    for v in [name_id, value_id, coding_id] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&bit_offset.to_le_bytes());
+    out.extend_from_slice(&bits.to_le_bytes());
+    assert_eq!(out.len(), SYNTAX_RECORD_SIZE);
+    out
+}
+
 /// Assemble a full `.catb` v4 file: 176-byte header + contiguous sections in
 /// directory order starting at offset 176 (§2). Empty sections get the
 /// running offset with size 0, like the reference writer.
@@ -173,12 +188,27 @@ pub fn build_catb(
     refs: &[u8],
     frame_aux: &[u8],
 ) -> Vec<u8> {
+    build_catb_with_syntax(frame_count, strings, meta, frames, blocks, &[], refs, frame_aux)
+}
+
+/// Like [`build_catb`] but with a non-empty SYNTAX section (§7, M4).
+#[allow(clippy::too_many_arguments)]
+pub fn build_catb_with_syntax(
+    frame_count: u32,
+    strings: &[u8],
+    meta: &[u8],
+    frames: &[u8],
+    blocks: &[u8],
+    syntax: &[u8],
+    refs: &[u8],
+    frame_aux: &[u8],
+) -> Vec<u8> {
     let sections: [&[u8]; 10] = [
         strings,
         meta,
         frames,
         blocks,
-        &[], // syntax
+        syntax,
         &[], // cabac
         &[], // transforms
         refs,

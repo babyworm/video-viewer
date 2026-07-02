@@ -48,6 +48,10 @@ pub struct BitstreamViewSettings {
     pub fill: String,
     pub layer_mv: bool,
     pub layer_part: bool,
+    /// M4 Intra direction layer. `serde(default)` keeps pre-0.13 settings
+    /// files loading (field absent → false).
+    #[serde(default)]
+    pub layer_intra: bool,
     pub layer_label: bool,
     pub layer_grid: bool,
     pub layer_sel: bool,
@@ -55,6 +59,14 @@ pub struct BitstreamViewSettings {
     pub opacity: f32,
     pub show_loupe: bool,
     pub inspector_collapsed: bool,
+    /// Which vector the MV layer draws: "MV" / "MVP" / "MVD" (M4;
+    /// `serde(default)` for pre-0.13 files).
+    #[serde(default = "default_mv_source")]
+    pub mv_source: String,
+}
+
+fn default_mv_source() -> String {
+    "MV".to_string()
 }
 
 impl Default for BitstreamViewSettings {
@@ -65,12 +77,14 @@ impl Default for BitstreamViewSettings {
             fill: "QP".to_string(),
             layer_mv: false,
             layer_part: false,
+            layer_intra: false,
             layer_label: true,
             layer_grid: true,
             layer_sel: true,
             opacity: 0.6,
             show_loupe: false,
             inspector_collapsed: false,
+            mv_source: default_mv_source(),
         }
     }
 }

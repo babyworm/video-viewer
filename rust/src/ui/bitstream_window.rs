@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use crate::analysis::bitstream_panel::format_bits;
 use crate::analysis::bitstream_stats::{
     hit_test_min_area, lod_cell_size, rasterize_blocks, use_lod, viewer_to_catb_display,
-    BitstreamFile, BitstreamGrid, FrameTypeClass, ModeClass,
+    BitstreamFile, BitstreamGrid, FrameTypeClass, IntraDir, ModeClass,
 };
 use crate::analysis::correlation::{
     aggregate_bitstream_to_g, align, class_table, classes_at_g, csv_dump, opportunity_grid,
@@ -28,7 +28,11 @@ use crate::analysis::correlation::{
     CorrScanRequest, CorrScanResult, XMetric, YMetric, G_SIZES, PRESET_PAIRS,
 };
 use crate::analysis::motion::MotionClass;
-use crate::core::catb::BsBlock;
+use crate::core::catb::{BsBlock, BsRef};
+use crate::ui::bitstream_overlay::{
+    build_intra, build_refs, draw_intra_layer, draw_mv_layer, draw_part_layer, LayerGeom,
+    MvSource, MV_SOURCES,
+};
 use crate::ui::settings::BitstreamViewSettings;
 use crate::ui::sideband_overlay::diverging_colormap;
 
@@ -86,10 +90,12 @@ impl FillMode {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ViewConfig {
     pub fill: FillMode,
-    /// MV arrows — M4; toggle exists but is disabled in M1.
+    /// MV arrows (M4): per-PU arrows from REF geometry, block fallback.
     pub mv: bool,
-    /// Partition outlines — M4; toggle exists but is disabled in M1.
+    /// Partition outlines (M4): CU on every block + per-PU boundaries.
     pub part: bool,
+    /// Intra direction lines + P/DC badges (M4).
+    pub intra: bool,
     /// Per-block value text, rendered at zoom ≥ 2x only.
     pub label: bool,
     /// CTU (HEVC 64 px) / 4-MB (AVC) boundary grid.
@@ -112,6 +118,7 @@ impl ViewConfig {
             fill: FillMode::from_label(&s.fill),
             mv: s.layer_mv,
             part: s.layer_part,
+            intra: s.layer_intra,
             label: s.layer_label,
             grid: s.layer_grid,
             sel: s.layer_sel,
@@ -119,17 +126,24 @@ impl ViewConfig {
         }
     }
 
-    pub fn to_settings(self, show_loupe: bool, inspector_collapsed: bool) -> BitstreamViewSettings {
+    pub fn to_settings(
+        self,
+        show_loupe: bool,
+        inspector_collapsed: bool,
+        mv_source: MvSource,
+    ) -> BitstreamViewSettings {
         BitstreamViewSettings {
             fill: self.fill.label().to_string(),
             layer_mv: self.mv,
             layer_part: self.part,
+            layer_intra: self.intra,
             layer_label: self.label,
             layer_grid: self.grid,
             layer_sel: self.sel,
             opacity: self.opacity,
             show_loupe,
             inspector_collapsed,
+            mv_source: mv_source.label().to_string(),
         }
     }
 }
@@ -173,6 +187,7 @@ impl Preset {
             fill: FillMode::None,
             mv: false,
             part: false,
+            intra: false,
             label: false,
             grid: false,
             sel: true,
@@ -190,15 +205,18 @@ impl Preset {
                 label: true,
                 ..base
             },
+            // 04 §3 M4 intent: Motion = MV-heat fill + live MV arrows.
             Preset::Motion => ViewConfig {
                 fill: FillMode::MvHeat,
-                mv: true, // M4 layer — recorded now so the preset is stable
+                mv: true,
                 grid: true,
                 ..base
             },
+            // 04 §3 M4 intent: Mode = Mode fill + Part outlines + Intra dirs.
             Preset::Mode => ViewConfig {
                 fill: FillMode::Mode,
-                part: true, // M4 layer
+                part: true,
+                intra: true,
                 grid: true,
                 ..base
             },
@@ -224,6 +242,7 @@ pub fn matching_preset(cfg: &ViewConfig) -> Option<Preset> {
         c.fill == cfg.fill
             && c.mv == cfg.mv
             && c.part == cfg.part
+            && c.intra == cfg.intra
             && c.label == cfg.label
             && c.grid == cfg.grid
             && c.sel == cfg.sel
@@ -567,6 +586,12 @@ struct FrameDerived {
     grid_l1: BitstreamGrid,
     /// LOD aggregate grid (64 px HEVC / 32 px AVC) for zoom < 1.5.
     grid_lod: BitstreamGrid,
+    /// Per-block REF rows, parallel to `blocks` — built lazily the first
+    /// time the MV or Part layer needs them for this frame (M4).
+    refs: Option<Vec<Vec<BsRef>>>,
+    /// Per-block intra dirs, parallel to `blocks` — lazily for the Intra
+    /// layer (M4).
+    intra: Option<Vec<Vec<IntraDir>>>,
 }
 
 /// Snapshot of the shared state taken at the top of the child pass so the
@@ -599,6 +624,10 @@ pub struct BitstreamWindow {
     // root runs synchronously — plain fields, no lock needed.
     tab: BsTab,
     pub view: ViewConfig,
+    /// Which vector the MV layer draws (M4). Deliberately outside
+    /// `ViewConfig`: it must not break preset matching (a preset prescribes
+    /// *that* MV arrows show, not which vector they trace).
+    pub mv_source: MvSource,
     pub show_loupe: bool,
     pub inspector_collapsed: bool,
     /// Screen px per *viewer* image px; `None` = fit to canvas.
@@ -609,8 +638,6 @@ pub struct BitstreamWindow {
     texture: Option<egui::TextureHandle>,
     texture_gen: u64,
     derived: Option<FrameDerived>,
-    /// Transient status-strip hint ("MV/Part arrive in M4", …).
-    hint: Option<(String, f64)>,
     /// Show per-frame bits / avg-QP series in the Frame Graph tab.
     graph_show_bits: bool,
     graph_show_qp: bool,
@@ -718,6 +745,7 @@ impl BitstreamWindow {
             shared: Arc::new(Mutex::new(BitstreamShared::new())),
             tab: BsTab::Viewer,
             view: ViewConfig::default(),
+            mv_source: MvSource::Mv,
             show_loupe: false,
             inspector_collapsed: false,
             zoom: None,
@@ -726,7 +754,6 @@ impl BitstreamWindow {
             texture: None,
             texture_gen: u64::MAX,
             derived: None,
-            hint: None,
             graph_show_bits: true,
             graph_show_qp: true,
             corr_x: XMetric::Variance,
@@ -748,6 +775,7 @@ impl BitstreamWindow {
     /// Load persisted toggle state (called once at app start).
     pub fn apply_settings(&mut self, s: &BitstreamViewSettings) {
         self.view = ViewConfig::from_settings(s);
+        self.mv_source = MvSource::from_label(&s.mv_source);
         self.show_loupe = s.show_loupe;
         self.inspector_collapsed = s.inspector_collapsed;
     }
@@ -767,10 +795,6 @@ impl BitstreamWindow {
         self.filmstrip_cache = None;
     }
 
-    fn set_hint(&mut self, ctx: &egui::Context, text: &str) {
-        self.hint = Some((text.to_string(), ctx.input(|i| i.time)));
-    }
-
     /// Render the window. Returns the current view settings when they
     /// changed this frame (caller persists them to settings.toml).
     pub fn show(&mut self, ctx: &egui::Context) -> Option<BitstreamViewSettings> {
@@ -786,9 +810,9 @@ impl BitstreamWindow {
             return None;
         }
 
-        let settings_before = self
-            .view
-            .to_settings(self.show_loupe, self.inspector_collapsed);
+        let settings_before =
+            self.view
+                .to_settings(self.show_loupe, self.inspector_collapsed, self.mv_source);
 
         // Snapshot shared state; clone the frame image only when the
         // generation moved past the uploaded texture (upload gate).
@@ -903,9 +927,9 @@ impl BitstreamWindow {
             },
         );
 
-        let settings_after = self
-            .view
-            .to_settings(self.show_loupe, self.inspector_collapsed);
+        let settings_after =
+            self.view
+                .to_settings(self.show_loupe, self.inspector_collapsed, self.mv_source);
         (settings_after != settings_before).then_some(settings_after)
     }
 
@@ -930,6 +954,7 @@ impl BitstreamWindow {
             nums: [bool; 6],
             v: bool,
             p: bool,
+            d: bool,
             l: bool,
             s: bool,
             tab: bool,
@@ -958,6 +983,7 @@ impl BitstreamWindow {
                 ],
                 v: plain && i.key_pressed(egui::Key::V),
                 p: plain && i.key_pressed(egui::Key::P),
+                d: plain && i.key_pressed(egui::Key::D),
                 l: plain && i.key_pressed(egui::Key::L),
                 s: plain && i.key_pressed(egui::Key::S),
                 // Consume Tab so egui's focus traversal doesn't also react.
@@ -1010,9 +1036,15 @@ impl BitstreamWindow {
                 }
             }
         }
-        if k.v || k.p {
-            // MV / Part layers are disabled placeholders in M1.
-            self.set_hint(ctx, "MV / Part layers arrive in M4");
+        // M4: MV / Part / Intra layer toggles are live.
+        if k.v {
+            self.view.mv = !self.view.mv;
+        }
+        if k.p {
+            self.view.part = !self.view.part;
+        }
+        if k.d {
+            self.view.intra = !self.view.intra;
         }
         if k.l {
             self.view.label = !self.view.label;
@@ -1097,12 +1129,55 @@ impl BitstreamWindow {
                     });
 
                 ui.separator();
-                // MV / Part: visible but disabled — the layer system's slots
-                // are fixed now, the renderers arrive in M4.
-                ui.add_enabled(false, egui::SelectableLabel::new(self.view.mv, "MV"))
-                    .on_disabled_hover_text("MV arrows arrive in M4");
-                ui.add_enabled(false, egui::SelectableLabel::new(self.view.part, "Part"))
-                    .on_disabled_hover_text("Partition outlines arrive in M4");
+                // M4 layers: MV arrows / Partition outlines / Intra dirs.
+                if ui
+                    .selectable_label(self.view.mv, "MV")
+                    .on_hover_text(
+                        "Motion arrows (V): per-PU when REF geometry exists, \
+                         block-level otherwise. L0 orange / L1 purple, ref \
+                         index > 0 dashed. Rendered at zoom ≥ 1.5x.",
+                    )
+                    .clicked()
+                {
+                    self.view.mv = !self.view.mv;
+                }
+                if self.view.mv {
+                    // Vector source combo (design note: explicit combo, not a
+                    // hidden 3-state cycle — the active source stays visible).
+                    egui::ComboBox::from_id_salt("bs_mv_source")
+                        .selected_text(self.mv_source.label())
+                        .width(52.0)
+                        .show_ui(ui, |ui| {
+                            for s in MV_SOURCES {
+                                ui.selectable_value(&mut self.mv_source, s, s.label());
+                            }
+                        })
+                        .response
+                        .on_hover_text("Which vector the arrows trace: final MV, predictor (MVP), or difference (MVD)");
+                }
+                if ui
+                    .selectable_label(self.view.part, "Part")
+                    .on_hover_text(
+                        "Partition outlines (P): CU grey on every block, \
+                         per-PU boundaries magenta where REF rows carry PU \
+                         geometry. TU outlines not available (transforms \
+                         section unparsed).",
+                    )
+                    .clicked()
+                {
+                    self.view.part = !self.view.part;
+                }
+                if ui
+                    .selectable_label(self.view.intra, "Intra")
+                    .on_hover_text(
+                        "Intra prediction directions (D): angle lines per \
+                         (sub)block, P/DC badges at zoom ≥ 2x. Rendered at \
+                         zoom ≥ 1.5x.",
+                    )
+                    .clicked()
+                {
+                    self.view.intra = !self.view.intra;
+                }
                 if ui
                     .selectable_label(self.view.label, "Label")
                     .on_hover_text("Per-block values (rendered at zoom ≥ 2x)")
@@ -1174,6 +1249,7 @@ impl BitstreamWindow {
         // Refresh per-frame derived data (blocks, stats, grids). The frame
         // texture itself is uploaded tab-independently in `show()`.
         self.refresh_derived(snap);
+        self.ensure_layer_data(snap);
         // Opportunity fill consumes the correlation derivation (M3).
         if self.view.fill == FillMode::Opportunity {
             self.refresh_corr_derived(snap);
@@ -1222,7 +1298,23 @@ impl BitstreamWindow {
             stats,
             grid_l1,
             grid_lod,
+            refs: None,
+            intra: None,
         });
+    }
+
+    /// Lazily build the M4 layer data (REF rows / intra dirs) the current
+    /// view needs. Called after `refresh_derived`; a toggle flipped later
+    /// fills the missing piece on the next pass without re-deriving.
+    fn ensure_layer_data(&mut self, snap: &Snapshot) {
+        let Some(file) = snap.file.as_ref() else { return };
+        let Some(d) = self.derived.as_mut() else { return };
+        if (self.view.mv || self.view.part) && d.refs.is_none() {
+            d.refs = Some(build_refs(file, &d.blocks));
+        }
+        if self.view.intra && d.intra.is_none() {
+            d.intra = Some(build_intra(file, &d.blocks));
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1469,6 +1561,31 @@ impl BitstreamWindow {
                         stroke,
                     );
                     y += step;
+                }
+            }
+
+            // M4 layers: Part / MV / Intra — shared renderers with the
+            // main-canvas overlay (bitstream_overlay.rs). Inside the
+            // Alt-peek gate like every other layer.
+            let geom = LayerGeom {
+                origin,
+                zx,
+                zy,
+                clip: canvas_rect,
+            };
+            if self.view.part {
+                if let Some(refs) = d.refs.as_ref() {
+                    draw_part_layer(&painter, &geom, &d.blocks, refs);
+                }
+            }
+            if self.view.mv {
+                if let Some(refs) = d.refs.as_ref() {
+                    draw_mv_layer(&painter, &geom, &d.blocks, refs, self.mv_source);
+                }
+            }
+            if self.view.intra {
+                if let Some(intra) = d.intra.as_ref() {
+                    draw_intra_layer(&painter, &geom, &d.blocks, intra);
                 }
             }
 
@@ -2052,15 +2169,6 @@ impl BitstreamWindow {
                                 ),
                             );
                         }
-                    }
-                }
-                // Transient hint (disabled-layer keys etc.), ~2.5 s.
-                if let Some((text, t0)) = &self.hint {
-                    if ctx.input(|i| i.time) - t0 < 2.5 {
-                        ui.weak(text);
-                        ctx.request_repaint_after(std::time::Duration::from_millis(300));
-                    } else {
-                        self.hint = None;
                     }
                 }
             });
@@ -3176,22 +3284,24 @@ mod tests {
         assert_eq!(q.fill, FillMode::Qp);
         assert!(q.grid && q.label);
 
+        // M4: Motion carries live MV arrows.
         let m = Preset::Motion.config();
         assert_eq!(m.fill, FillMode::MvHeat);
-        assert!(m.mv && m.grid);
+        assert!(m.mv && m.grid && !m.part && !m.intra);
 
+        // M4: Mode carries Part outlines + Intra directions.
         let md = Preset::Mode.config();
         assert_eq!(md.fill, FillMode::Mode);
-        assert!(md.part && md.grid);
+        assert!(md.part && md.intra && md.grid && !md.mv);
 
         // M3 §3: Opportunity = {fill=Opportunity, Grid, Sel}.
         let o = Preset::Opportunity.config();
         assert_eq!(o.fill, FillMode::Opportunity);
-        assert!(o.grid && o.sel && !o.label && !o.mv && !o.part);
+        assert!(o.grid && o.sel && !o.label && !o.mv && !o.part && !o.intra);
 
         let c = Preset::Clean.config();
         assert_eq!(c.fill, FillMode::None);
-        assert!(!c.mv && !c.part && !c.label && !c.grid && !c.sel);
+        assert!(!c.mv && !c.part && !c.intra && !c.label && !c.grid && !c.sel);
     }
 
     #[test]
@@ -3221,11 +3331,26 @@ mod tests {
     fn view_config_settings_roundtrip() {
         let mut cfg = Preset::Motion.config();
         cfg.opacity = 0.42;
-        let s = cfg.to_settings(true, false);
+        cfg.intra = true;
+        let s = cfg.to_settings(true, false, MvSource::Mvd);
         assert_eq!(s.fill, "MV-heat");
-        assert!(s.layer_mv && s.layer_grid && s.show_loupe);
+        assert!(s.layer_mv && s.layer_grid && s.layer_intra && s.show_loupe);
+        assert_eq!(s.mv_source, "MVD");
         let back = ViewConfig::from_settings(&s);
         assert_eq!(back, cfg);
+        assert_eq!(MvSource::from_label(&s.mv_source), MvSource::Mvd);
+    }
+
+    #[test]
+    fn mode_preset_matches_after_settings_roundtrip() {
+        // A persisted Mode preset (Part+Intra on) must still be detected as
+        // the Mode preset after a settings round-trip — layer_intra must
+        // survive serialization.
+        let s = Preset::Mode
+            .config()
+            .to_settings(false, false, MvSource::Mv);
+        let back = ViewConfig::from_settings(&s);
+        assert_eq!(matching_preset(&back), Some(Preset::Mode));
     }
 
     #[test]

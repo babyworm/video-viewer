@@ -6,7 +6,9 @@
 
 use std::path::PathBuf;
 
-use video_viewer::analysis::bitstream_stats::{BitstreamFile, ResolutionSource};
+use video_viewer::analysis::bitstream_stats::{
+    extract_intra_modes, intra_grid_dim, intra_subblock_pos, BitstreamFile, ResolutionSource,
+};
 use video_viewer::core::catb::{
     CatbFile, MV_HAS_LIST_INDEX, MV_HAS_LONG_TERM, MV_HAS_MV, MV_HAS_MVD, MV_HAS_MVP,
     MV_HAS_POC, MV_LONG_TERM_VALUE, REF_HAS_MV, REF_HAS_MVD, REF_HAS_PU_PART,
@@ -15,8 +17,8 @@ use video_viewer::core::catb::{
 // Shared synthetic fixture writer (spec §2–§13) — tests/common/mod.rs.
 mod common;
 use common::{
-    block_record, build_catb, encode_strings, frame_record, ref_record, write_temp, BlockSpec,
-    RefSpec,
+    block_record, build_catb, build_catb_with_syntax, encode_strings, frame_record, ref_record,
+    syntax_record, write_temp, BlockSpec, RefSpec,
 };
 
 /// The Appendix A minimal file: 1 IDR frame, 1 intra 64×64 block. 713 bytes.
@@ -250,6 +252,62 @@ fn test_catb_presence_bits_roundtrip() {
     assert_eq!(r.pu_part_index, Some(1));
 }
 
+/// SYNTAX section round-trip (M4): a block with two syntax rows resolves
+/// name/value strings and bits; the clamp guard rejects hostile counts.
+#[test]
+fn test_catb_syntax_for_block_roundtrip_and_guard() {
+    let strings = encode_strings(&[
+        "",
+        "64x64",
+        "Intra",
+        "IDR",
+        "intra_luma_pred_mode",
+        "26",
+        "cabac",
+        "split_cu_flag",
+        "0",
+    ]);
+    let meta = br#"{"schema_version":1,"decoder":{"codec":"hevc"},"parameter_sets":[]}"#;
+    let frame = frame_record(0, 0, 3, 1, 0, 0, 0, 100, 20, 80, 0, 1, 0, 0);
+    let block = block_record(&BlockSpec {
+        w: 64,
+        h: 64,
+        qp: 32,
+        partition_id: 1,
+        prediction_mode_id: 2,
+        syntax_off: 0,
+        syntax_n: 2,
+        ..Default::default()
+    });
+    let mut syntax = syntax_record(7, 8, 6, 0, 1); // split_cu_flag = 0
+    syntax.extend(syntax_record(4, 5, 6, 1, 5)); // intra_luma_pred_mode = 26
+    let bytes = build_catb_with_syntax(1, &strings, meta, &frame, &block, &syntax, &[], &[]);
+    let f = write_temp(&bytes);
+    let catb = CatbFile::open(f.path()).expect("open");
+    let b = &catb.blocks_for_frame(0).expect("blocks")[0];
+    let rows = catb.syntax_for_block(b).expect("syntax rows");
+    assert_eq!(rows.len(), 2);
+    assert_eq!((rows[0].name.as_str(), rows[0].value.as_str(), rows[0].bits), ("split_cu_flag", "0", 1));
+    assert_eq!(
+        (rows[1].name.as_str(), rows[1].value.as_str(), rows[1].bits),
+        ("intra_luma_pred_mode", "26", 5)
+    );
+    // The extracted intra dir: HEVC mode 26 = vertical (90°).
+    let dirs = extract_intra_modes(&rows);
+    assert_eq!(dirs.len(), 1);
+    assert_eq!(dirs[0].mode, 26);
+    assert_eq!(dirs[0].angle_deg, Some(90.0));
+
+    // OOM guard (0.12.1 F1 pattern): a hostile syntax_n larger than the
+    // SYNTAX section must error before allocating.
+    let mut hostile = b.clone();
+    hostile.syntax_n = i32::MAX;
+    let err = catb.syntax_for_block(&hostile).expect_err("must reject syntax_n");
+    assert!(err.contains("SYNTAX section"), "unexpected error: {err}");
+    hostile.syntax_n = 0;
+    assert!(catb.syntax_for_block(&hostile).expect("zero rows ok").is_empty());
+}
+
 // ===========================================================================
 // Error cases
 // ===========================================================================
@@ -438,6 +496,104 @@ fn test_catb_differential_blocks() {
                 assert_eq!(b.reference.as_deref().unwrap_or(""), oref, "{ctx} reference");
             }
         }
+    }
+}
+
+/// Differential test — intra modes (M4): the modes extracted from each
+/// block's SYNTAX rows must agree with the oracle's
+/// `intra_prediction_mode` family:
+/// - `intra_prediction_mode_count` == number of extracted luma modes,
+/// - non-`mixed` blocks: every extracted mode equals the oracle value,
+/// - `mixed` blocks: the oracle's representative value is among ours.
+///
+/// Covers HEVC (`intra_luma_pred_mode`) and AVC
+/// (`intra4x4/8x8/16x16_pred_mode`), the two intra-carrying fixture
+/// families the task requires (hevc_intra / avc_cavlc) plus hevc_bslice's
+/// angular modes.
+#[test]
+fn test_catb_differential_intra_modes() {
+    let mut checked = 0usize;
+    for (dir, name) in [
+        ("hevc_intra", "hevc_intra"),
+        ("hevc_bslice", "hevc_bslice"),
+        ("avc_mb", "avc_cavlc"),
+    ] {
+        let catb = open_fixture(dir, name);
+        let oracle = load_oracle(dir, name, "blocks");
+        let oracle = oracle.as_array().expect("oracle blocks array");
+        let mut per_frame: Vec<Vec<&serde_json::Value>> = vec![Vec::new(); catb.frames.len()];
+        for ob in oracle {
+            let fi = ob["frame"].as_u64().expect("block frame idx") as usize;
+            per_frame[fi].push(ob);
+        }
+        for (fi, oracle_blocks) in per_frame.iter().enumerate() {
+            let blocks = catb.blocks_for_frame(fi).expect("blocks");
+            for (bi, (b, ob)) in blocks.iter().zip(oracle_blocks.iter()).enumerate() {
+                let source = ob["intra_prediction_mode_source"].as_str().unwrap_or("");
+                let rows = catb.syntax_for_block(b).expect("syntax rows");
+                let dirs = extract_intra_modes(&rows);
+                let ctx = format!("{dir} f{fi} b{bi}");
+                if source.is_empty() {
+                    // Oracle says no intra mode → we must extract none.
+                    assert!(dirs.is_empty(), "{ctx}: spurious intra modes {dirs:?}");
+                    continue;
+                }
+                let count = ob["intra_prediction_mode_count"].as_u64().unwrap() as usize;
+                let value = ob["intra_prediction_mode"].as_i64().unwrap() as i32;
+                let mixed = ob["intra_prediction_mode_mixed"].as_bool().unwrap_or(false);
+                assert_eq!(dirs.len(), count, "{ctx}: mode count");
+                let modes: Vec<i32> = dirs.iter().map(|d| d.mode).collect();
+                if mixed {
+                    assert!(
+                        modes.contains(&value),
+                        "{ctx}: representative {value} not in {modes:?}"
+                    );
+                } else {
+                    assert!(
+                        modes.iter().all(|&m| m == value),
+                        "{ctx}: expected all {value}, got {modes:?}"
+                    );
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked >= 20, "expected ≥20 intra blocks verified, got {checked}");
+}
+
+/// Regression — AVC intra4x4 sub-block ordering is H.264 §6.4.3 z-scan,
+/// not raster. Evidence block: `avc_cavlc` frame 0, block at (48, 0)
+/// (16x16, mixed intra4x4). It sits on the frame's top row, so FFmpeg
+/// substitutes LEFT_DC (mode 9) exactly where the top samples are
+/// unavailable: the MB's top 4×4 row. In z-scan order those are list
+/// positions {0,1,4,5}; a raster reading would demand {0,1,2,3} *and*
+/// would put Vertical (mode 0, needs top samples) on the frame edge —
+/// internally contradictory. `intra_subblock_pos` must therefore map every
+/// mode-9 entry (and only those) of this block to grid row 0.
+#[test]
+fn test_catb_avc_intra4x4_zscan_placement() {
+    let catb = open_fixture("avc_mb", "avc_cavlc");
+    let blocks = catb.blocks_for_frame(0).expect("frame 0 blocks");
+    let b = blocks
+        .iter()
+        .find(|b| b.x == 48 && b.y == 0 && b.w == 16 && b.h == 16)
+        .expect("16x16 block at (48,0)");
+    let dirs = extract_intra_modes(&catb.syntax_for_block(b).expect("syntax rows"));
+    assert_eq!(dirs.len(), 16, "mixed intra4x4 MB has 16 luma modes");
+    // Stored (z-scan) order as observed in the fixture's SYNTAX rows.
+    let modes: Vec<i32> = dirs.iter().map(|d| d.mode).collect();
+    assert_eq!(&modes[..8], &[9, 9, 0, 0, 9, 9, 0, 0], "z-scan prefix");
+    // Placement: LEFT_DC (top unavailable) ⇔ grid row 0, nothing else.
+    let dim = intra_grid_dim(dirs.len());
+    assert_eq!(dim, 4);
+    for (k, d) in dirs.iter().enumerate() {
+        let (col, row) = intra_subblock_pos(k, dim).expect("in grid");
+        assert_eq!(
+            row == 0,
+            d.mode == 9,
+            "k={k} mode={} placed at ({col},{row}) — top row iff LEFT_DC",
+            d.mode
+        );
     }
 }
 

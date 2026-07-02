@@ -6,6 +6,7 @@ use video_viewer::analysis::bitstream_stats::{
     hit_test_min_area, lod_cell_size, rasterize_blocks, use_lod, viewer_to_catb_display,
     FrameTypeClass, ModeClass,
 };
+use video_viewer::ui::bitstream_overlay::MvSource;
 use video_viewer::ui::bitstream_window::{
     filmstrip_color, matching_preset, next_preset, FillMode, Preset, ViewConfig, PRESETS,
 };
@@ -70,19 +71,45 @@ fn test_settings_view_config_conversion() {
         fill: "bpp".to_string(),
         layer_mv: false,
         layer_part: false,
+        layer_intra: false,
         layer_label: false,
         layer_grid: true,
         layer_sel: true,
         opacity: 0.6,
         show_loupe: false,
         inspector_collapsed: true,
+        mv_source: "MV".to_string(),
     };
     let cfg = ViewConfig::from_settings(&s);
     assert_eq!(cfg.fill, FillMode::Bpp);
     // This particular tuple is exactly the Rate preset.
     assert_eq!(matching_preset(&cfg), Some(Preset::Rate));
-    let back = cfg.to_settings(false, true);
+    let back = cfg.to_settings(false, true, MvSource::Mv);
     assert_eq!(back, s);
+}
+
+#[test]
+fn test_settings_pre_013_bitstream_section_parses() {
+    // A 0.12.x settings file: [bitstream] exists but has no layer_intra /
+    // mv_source — serde defaults must fill them (M4 backward compat).
+    let toml_str = format!(
+        r#"{OLD_SETTINGS_TOML}
+[bitstream]
+fill = "QP"
+layer_mv = false
+layer_part = false
+layer_label = true
+layer_grid = true
+layer_sel = true
+opacity = 0.6
+show_loupe = false
+inspector_collapsed = false
+"#
+    );
+    let s: Settings = toml::from_str(&toml_str).expect("0.12 settings must parse");
+    assert!(!s.bitstream.layer_intra);
+    assert_eq!(s.bitstream.mv_source, "MV");
+    assert_eq!(MvSource::from_label(&s.bitstream.mv_source), MvSource::Mv);
 }
 
 // ---------------------------------------------------------------------------
@@ -91,20 +118,31 @@ fn test_settings_view_config_conversion() {
 
 #[test]
 fn test_preset_apply_table() {
-    let cases: [(Preset, FillMode, bool, bool); 6] = [
-        // (preset, fill, grid, label)
-        (Preset::Rate, FillMode::Bpp, true, false),
-        (Preset::QpMap, FillMode::Qp, true, true),
-        (Preset::Motion, FillMode::MvHeat, true, false),
-        (Preset::Mode, FillMode::Mode, true, false),
-        (Preset::Opportunity, FillMode::Opportunity, true, false),
-        (Preset::Clean, FillMode::None, false, false),
+    let cases: [(Preset, FillMode, bool, bool, bool, bool, bool); 6] = [
+        // (preset, fill, grid, label, mv, part, intra) — M4 layer columns.
+        (Preset::Rate, FillMode::Bpp, true, false, false, false, false),
+        (Preset::QpMap, FillMode::Qp, true, true, false, false, false),
+        (Preset::Motion, FillMode::MvHeat, true, false, true, false, false),
+        (Preset::Mode, FillMode::Mode, true, false, false, true, true),
+        (
+            Preset::Opportunity,
+            FillMode::Opportunity,
+            true,
+            false,
+            false,
+            false,
+            false,
+        ),
+        (Preset::Clean, FillMode::None, false, false, false, false, false),
     ];
-    for (preset, fill, grid, label) in cases {
+    for (preset, fill, grid, label, mv, part, intra) in cases {
         let c = preset.config();
         assert_eq!(c.fill, fill, "{preset:?} fill");
         assert_eq!(c.grid, grid, "{preset:?} grid");
         assert_eq!(c.label, label, "{preset:?} label");
+        assert_eq!(c.mv, mv, "{preset:?} mv");
+        assert_eq!(c.part, part, "{preset:?} part");
+        assert_eq!(c.intra, intra, "{preset:?} intra");
         assert!((c.opacity - 0.6).abs() < 1e-6, "{preset:?} opacity");
         assert_eq!(matching_preset(&c), Some(preset));
     }

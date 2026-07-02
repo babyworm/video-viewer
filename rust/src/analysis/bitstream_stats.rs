@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use lru::LruCache;
 
-use crate::core::catb::{BsBlock, CatbFile};
+use crate::core::catb::{BsBlock, CatbFile, SyntaxRow};
 
 /// How many frames' block lists to keep parsed in memory.
 const BLOCK_CACHE_FRAMES: usize = 32;
@@ -331,6 +331,174 @@ impl ModeClass {
             _ => ModeClass::Unknown,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// M4: intra prediction directions from SYNTAX rows
+// ---------------------------------------------------------------------------
+
+/// One extracted intra luma prediction mode of a block (M4 Intra layer).
+///
+/// `angle_deg` is the prediction line orientation in **math convention**
+/// (degrees CCW from +x, y up); renderers negate y for screen space. A line
+/// through the (sub)block centre at this angle visualizes the direction —
+/// only the orientation matters, so θ and θ+180° draw identically.
+/// `None` = non-angular mode (Planar / DC / plane): no line, badge instead.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IntraDir {
+    /// Raw mode value as stored in the SYNTAX row.
+    pub mode: i32,
+    pub angle_deg: Option<f32>,
+    /// Badge for non-angular modes: `"P"` (Planar/Plane), `"DC"`, else `""`.
+    pub badge: &'static str,
+}
+
+/// HEVC intra luma mode → line angle (degrees, math convention).
+///
+/// Standard public knowledge (H.265 §8.4.4.2.6 intraPredAngle table /
+/// Figure 8-1 mode directions): 0 = Planar, 1 = DC (non-angular);
+/// 2..=34 angular, uniformly spanning 225°→45° so that
+/// `angle = 225 − (mode − 2) · 180/32`. Anchors: 2→225°, 10→180°
+/// (horizontal), 18→135°, 26→90° (vertical), 34→45°.
+pub fn intra_angle_hevc(mode: i32) -> Option<f32> {
+    if (2..=34).contains(&mode) {
+        Some(225.0 - (mode - 2) as f32 * (180.0 / 32.0))
+    } else {
+        None
+    }
+}
+
+/// AVC 4x4 / 8x8 intra mode → line angle (degrees, math convention).
+///
+/// Standard public knowledge (H.264 §8.3.1.2.x, Figure 8-4 prediction
+/// directions; intermediate modes use the ±½-slope directions, i.e.
+/// atan(1/2) ≈ 26.565° from an axis):
+/// 0 Vertical 90°, 1 Horizontal 0°, 2 DC (none),
+/// 3 Diagonal-Down-Left 45°, 4 Diagonal-Down-Right 135°,
+/// 5 Vertical-Right 116.565°, 6 Horizontal-Down 153.435°,
+/// 7 Vertical-Left 63.435°, 8 Horizontal-Up 26.565°.
+/// Values 9..=11 are the decoder's edge DC variants
+/// (Left-DC / Top-DC / DC-128, observed in the fixture string tables) —
+/// non-angular like DC.
+pub fn intra_angle_avc_nxn(mode: i32) -> Option<f32> {
+    const HALF_SLOPE: f32 = 26.565_05; // atan(1/2) in degrees
+    match mode {
+        0 => Some(90.0),
+        1 => Some(0.0),
+        3 => Some(45.0),
+        4 => Some(135.0),
+        5 => Some(90.0 + HALF_SLOPE),
+        6 => Some(180.0 - HALF_SLOPE),
+        7 => Some(90.0 - HALF_SLOPE),
+        8 => Some(HALF_SLOPE),
+        _ => None, // 2 = DC, 9..=11 = DC variants, out-of-range
+    }
+}
+
+/// AVC 16x16 intra mode → line angle (degrees, math convention).
+///
+/// The fixture decoder emits FFmpeg-internal 8x8/16x16 pred enum values,
+/// **not** the H.264 spec 0..3 order — confirmed against the oracle JSON
+/// label pairs (value 2 = "Vertical", 3 = "Plane", 6 = "DC128"):
+/// 0 DC, 1 Horizontal 0°, 2 Vertical 90°, 3 Plane (non-angular),
+/// 4/5/6 Left-DC / Top-DC / DC-128 (non-angular). The angular directions
+/// themselves are the standard H.264 16x16 vertical/horizontal modes.
+pub fn intra_angle_avc_16x16(mode: i32) -> Option<f32> {
+    match mode {
+        1 => Some(0.0),
+        2 => Some(90.0),
+        _ => None, // 0/4/5/6 DC-class, 3 Plane
+    }
+}
+
+/// Badge for a non-angular mode (empty for angular ones).
+fn intra_badge(name: &str, mode: i32) -> &'static str {
+    match name {
+        "intra_luma_pred_mode" => match mode {
+            0 => "P",
+            1 => "DC",
+            _ => "",
+        },
+        "intra4x4_pred_mode" | "intra8x8_pred_mode" => match mode {
+            2 | 9..=11 => "DC",
+            _ => "",
+        },
+        "intra16x16_pred_mode" => match mode {
+            0 | 4..=6 => "DC",
+            3 => "P",
+            _ => "",
+        },
+        _ => "",
+    }
+}
+
+/// Extract the intra **luma** prediction modes of a block from its SYNTAX
+/// rows (names observed in the fixture string tables:
+/// `intra_luma_pred_mode` for HEVC, `intra4x4_pred_mode` /
+/// `intra8x8_pred_mode` / `intra16x16_pred_mode` for AVC; chroma modes are
+/// deliberately excluded).
+///
+/// Multi-mode blocks (HEVC NxN = 4 rows, AVC 8x8 = 4 rows, AVC 4x4 = 16
+/// rows) return the rows **in stored (decode) order**. For AVC 4x4 that is
+/// H.264 §6.4.3 z-scan (`luma4x4BlkIdx`), *not* raster: the fixture proves
+/// it — `avc_cavlc.catb` block 3 (x=48, y=0, top frame row) stores its
+/// LEFT_DC (mode 9, "top unavailable") rows at positions {0,1,4,5}, which
+/// is exactly the top 4×4 row in z-scan and would be {0,1,2,3} in raster.
+/// The 2×2 grids (HEVC NxN, AVC 8x8) have identical z-scan/raster order.
+/// Renderers must map list position → sub-grid cell via
+/// [`intra_subblock_pos`]; a single mode sits at the block centre. Rows
+/// whose value string is not an integer are skipped.
+pub fn extract_intra_modes(rows: &[SyntaxRow]) -> Vec<IntraDir> {
+    let mut out = Vec::new();
+    for row in rows {
+        let angle_fn: fn(i32) -> Option<f32> = match row.name.as_str() {
+            "intra_luma_pred_mode" => intra_angle_hevc,
+            "intra4x4_pred_mode" | "intra8x8_pred_mode" => intra_angle_avc_nxn,
+            "intra16x16_pred_mode" => intra_angle_avc_16x16,
+            _ => continue,
+        };
+        let Ok(mode) = row.value.trim().parse::<i32>() else {
+            continue;
+        };
+        out.push(IntraDir {
+            mode,
+            angle_deg: angle_fn(mode),
+            badge: intra_badge(&row.name, mode),
+        });
+    }
+    out
+}
+
+/// Sub-grid dimension for `n` extracted intra dirs: 1 (single), 2 (HEVC NxN
+/// / AVC 8x8), or 4 (AVC 4x4). Stored order is decode order (see
+/// [`extract_intra_modes`]); use [`intra_subblock_pos`] to place entries.
+pub fn intra_grid_dim(n: usize) -> u32 {
+    match n {
+        0..=1 => 1,
+        2..=4 => 2,
+        _ => 4,
+    }
+}
+
+/// Map the `k`-th extracted intra dir to its `(col, row)` cell on the
+/// `dim`×`dim` sub-grid.
+///
+/// For `dim == 4` (AVC intra4x4) the stored order is H.264 §6.4.3 z-scan
+/// (`luma4x4BlkIdx`): four 8×8 quadrants in raster order, each holding four
+/// 4×4 blocks in raster order. Remap z→raster with `q = k >> 2` (quadrant),
+/// `z = k & 3` (block within quadrant):
+/// `raster = (q>>1)*8 + (z>>1)*4 + (q&1)*2 + (z&1)`.
+/// For `dim <= 2` z-scan and raster coincide, so `k` is used directly.
+/// Returns `None` when `k` falls outside the grid.
+pub fn intra_subblock_pos(k: usize, dim: u32) -> Option<(u32, u32)> {
+    let raster = if dim == 4 {
+        let (q, z) = (k >> 2, k & 3);
+        ((q >> 1) * 8 + (z >> 1) * 4 + (q & 1) * 2 + (z & 1)) as u32
+    } else {
+        k as u32
+    };
+    let (col, row) = (raster % dim.max(1), raster / dim.max(1));
+    (row < dim).then_some((col, row))
 }
 
 // ---------------------------------------------------------------------------
@@ -709,6 +877,104 @@ mod raster_tests {
         assert_eq!(FrameTypeClass::from_label("B"), FrameTypeClass::B);
         assert_eq!(FrameTypeClass::from_label("RASL"), FrameTypeClass::Other);
         assert_eq!(FrameTypeClass::from_label(""), FrameTypeClass::Other);
+    }
+
+    #[test]
+    fn hevc_intra_angle_anchors() {
+        // 45°-spaced anchors of the uniform 2..34 span (M4 task spec).
+        for (mode, deg) in [(2, 225.0), (10, 180.0), (18, 135.0), (26, 90.0), (34, 45.0)] {
+            let a = intra_angle_hevc(mode).unwrap();
+            assert!((a - deg).abs() < 1e-4, "mode {mode}: {a} != {deg}");
+        }
+        // Step between adjacent modes is 180/32 = 5.625°.
+        let step = intra_angle_hevc(2).unwrap() - intra_angle_hevc(3).unwrap();
+        assert!((step - 5.625).abs() < 1e-4);
+        // Planar / DC / out-of-range: non-angular.
+        assert_eq!(intra_angle_hevc(0), None);
+        assert_eq!(intra_angle_hevc(1), None);
+        assert_eq!(intra_angle_hevc(35), None);
+        assert_eq!(intra_angle_hevc(-1), None);
+    }
+
+    #[test]
+    fn avc_intra_angles() {
+        // 4x4/8x8: vertical / horizontal / diagonals (H.264 Fig. 8-4).
+        assert_eq!(intra_angle_avc_nxn(0), Some(90.0));
+        assert_eq!(intra_angle_avc_nxn(1), Some(0.0));
+        assert_eq!(intra_angle_avc_nxn(3), Some(45.0));
+        assert_eq!(intra_angle_avc_nxn(4), Some(135.0));
+        // DC and the decoder's edge-DC variants: non-angular.
+        for m in [2, 9, 10, 11, 12, -1] {
+            assert_eq!(intra_angle_avc_nxn(m), None, "mode {m}");
+        }
+        // 16x16 (FFmpeg enum order, oracle-confirmed): 1=H, 2=V; DC/Plane none.
+        assert_eq!(intra_angle_avc_16x16(1), Some(0.0));
+        assert_eq!(intra_angle_avc_16x16(2), Some(90.0));
+        for m in [0, 3, 4, 5, 6] {
+            assert_eq!(intra_angle_avc_16x16(m), None, "mode {m}");
+        }
+    }
+
+    #[test]
+    fn extract_intra_modes_maps_names_and_badges() {
+        let row = |name: &str, value: &str| SyntaxRow {
+            name: name.to_string(),
+            value: value.to_string(),
+            bits: 1,
+        };
+        let rows = vec![
+            row("split_cu_flag", "1"),          // not an intra mode → skipped
+            row("intra_luma_pred_mode", "0"),   // HEVC Planar
+            row("intra_luma_pred_mode", "1"),   // HEVC DC
+            row("intra_luma_pred_mode", "26"),  // HEVC vertical
+            row("intra4x4_pred_mode", "9"),     // AVC Left-DC variant
+            row("intra16x16_pred_mode", "3"),   // AVC Plane
+            row("chroma_pred_mode", "2"),       // chroma → excluded
+            row("intra_luma_pred_mode", "x"),   // unparsable → skipped
+        ];
+        let dirs = extract_intra_modes(&rows);
+        assert_eq!(dirs.len(), 5);
+        assert_eq!((dirs[0].angle_deg, dirs[0].badge), (None, "P"));
+        assert_eq!((dirs[1].angle_deg, dirs[1].badge), (None, "DC"));
+        assert_eq!((dirs[2].angle_deg, dirs[2].badge), (Some(90.0), ""));
+        assert_eq!((dirs[3].angle_deg, dirs[3].badge), (None, "DC"));
+        assert_eq!((dirs[4].angle_deg, dirs[4].badge), (None, "P"));
+        // Sub-grid dims: 1 mode → 1×1, 4 → 2×2, 16 → 4×4.
+        assert_eq!(intra_grid_dim(0), 1);
+        assert_eq!(intra_grid_dim(1), 1);
+        assert_eq!(intra_grid_dim(4), 2);
+        assert_eq!(intra_grid_dim(16), 4);
+    }
+
+    #[test]
+    fn intra_subblock_pos_zscan_to_raster() {
+        // dim=4 (AVC 4x4): stored order is z-scan (H.264 §6.4.3). The top
+        // 4×4 row of the MB is z-scan positions {0,1,4,5} — the pattern the
+        // avc_cavlc fixture shows at frame row y=0 (LEFT_DC substitution).
+        let full: Vec<_> = (0..16).map(|k| intra_subblock_pos(k, 4)).collect();
+        assert_eq!(
+            full,
+            [
+                // z-scan k → raster (col,row)
+                (0, 0), (1, 0), (0, 1), (1, 1), // quadrant 0 (top-left)
+                (2, 0), (3, 0), (2, 1), (3, 1), // quadrant 1 (top-right)
+                (0, 2), (1, 2), (0, 3), (1, 3), // quadrant 2 (bottom-left)
+                (2, 2), (3, 2), (2, 3), (3, 3), // quadrant 3 (bottom-right)
+            ]
+            .map(Some)
+        );
+        // Every cell covered exactly once (bijection).
+        let mut seen: Vec<_> = full.into_iter().flatten().collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 16);
+        // dim<=2: z-scan == raster, k used directly.
+        assert_eq!(intra_subblock_pos(0, 1), Some((0, 0)));
+        assert_eq!(intra_subblock_pos(3, 2), Some((1, 1)));
+        // Out-of-grid entries are rejected, not wrapped.
+        assert_eq!(intra_subblock_pos(1, 1), None);
+        assert_eq!(intra_subblock_pos(4, 2), None);
+        assert_eq!(intra_subblock_pos(16, 4), None);
     }
 
     #[test]

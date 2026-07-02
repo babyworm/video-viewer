@@ -1,3 +1,4 @@
+pub mod bitstream_overlay;
 pub mod bitstream_window;
 pub mod canvas;
 pub mod comparison;

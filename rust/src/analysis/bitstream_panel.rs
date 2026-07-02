@@ -17,6 +17,8 @@ pub enum BitstreamAction {
     Unload,
     OpenWindow,
     SetOffset(i32),
+    /// M4: toggle the main-canvas overlay (mirrors the window's ViewConfig).
+    SetOverlayOnCanvas(bool),
 }
 
 /// Read-only + mutable context handed to the panel each frame.
@@ -34,6 +36,8 @@ pub struct BitstreamPanelContext<'a> {
     pub viewer_size: Option<(u32, u32)>,
     /// Whether the analysis window is currently open ("Focus Window" label).
     pub window_open: bool,
+    /// M4: main-canvas overlay toggle state (app-owned, session only).
+    pub overlay_on_canvas: bool,
 }
 
 pub struct BitstreamPanel;
@@ -120,6 +124,21 @@ impl BitstreamPanel {
         };
         if ui.button(label).clicked() {
             action = Some(BitstreamAction::OpenWindow);
+        }
+
+        // M4: mirror the window's layer stack onto the main canvas. The
+        // window's ViewConfig is the single source of truth — there is no
+        // separate overlay configuration.
+        let mut overlay = ctx.overlay_on_canvas;
+        if ui
+            .checkbox(&mut overlay, "Overlay on main canvas")
+            .on_hover_text(
+                "Render the Bitstream window's current fill/Grid/MV/Part/\
+                 Intra layers on the main viewer canvas",
+            )
+            .changed()
+        {
+            action = Some(BitstreamAction::SetOverlayOnCanvas(overlay));
         }
 
         // Current-frame summary (M0 scope: visible without the window).
