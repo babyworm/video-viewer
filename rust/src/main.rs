@@ -23,6 +23,15 @@ struct Cli {
 
     #[arg(short, long)]
     output: Option<String>,
+
+    /// Bitstream telemetry (.catb) to auto-load at startup.
+    /// On failure: one stderr line + the GUI keeps starting (§7 error shown).
+    #[arg(long = "catb")]
+    catb: Option<String>,
+
+    /// Auto-open the Bitstream Analysis window after a successful --catb load.
+    #[arg(long = "catb-window")]
+    catb_window: bool,
 }
 
 fn main() {
@@ -75,5 +84,12 @@ fn main() {
         return;
     }
 
-    video_viewer::run_gui(cli.input, cli.width, cli.height, cli.format);
+    video_viewer::run_gui(
+        cli.input,
+        cli.width,
+        cli.height,
+        cli.format,
+        cli.catb,
+        cli.catb_window,
+    );
 }

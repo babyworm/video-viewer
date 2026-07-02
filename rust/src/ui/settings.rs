@@ -38,6 +38,42 @@ impl Default for GeneralSettings {
     }
 }
 
+/// Persisted view configuration for the Bitstream Analysis window (§2:
+/// toggle states survive window/app restarts). New optional section — old
+/// settings.toml files without `[bitstream]` parse via `serde(default)`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BitstreamViewSettings {
+    /// Fill layer name: "None" / "QP" / "bpp" / "Mode" / "MV-heat".
+    pub fill: String,
+    pub layer_mv: bool,
+    pub layer_part: bool,
+    pub layer_label: bool,
+    pub layer_grid: bool,
+    pub layer_sel: bool,
+    /// Fill opacity 0.0–1.0 (default 0.6 per §2).
+    pub opacity: f32,
+    pub show_loupe: bool,
+    pub inspector_collapsed: bool,
+}
+
+impl Default for BitstreamViewSettings {
+    fn default() -> Self {
+        // Mirrors the QP Map preset (§3) so a fresh install opens with the
+        // preset combo showing "QP Map", not "Custom".
+        Self {
+            fill: "QP".to_string(),
+            layer_mv: false,
+            layer_part: false,
+            layer_label: true,
+            layer_grid: true,
+            layer_sel: true,
+            opacity: 0.6,
+            show_loupe: false,
+            inspector_collapsed: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
     pub cache: CacheSettings,
@@ -45,6 +81,8 @@ pub struct Settings {
     pub defaults: DefaultSettings,
     #[serde(default)]
     pub general: GeneralSettings,
+    #[serde(default)]
+    pub bitstream: BitstreamViewSettings,
     #[serde(default)]
     pub recent_files: Vec<String>,
 }

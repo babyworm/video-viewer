@@ -9,6 +9,8 @@ pub fn run_gui(
     width: Option<u32>,
     height: Option<u32>,
     format: Option<String>,
+    catb: Option<String>,
+    catb_window: bool,
 ) {
     // Force software rendering on WSL2 / headless environments where GPU
     // drivers are unavailable.  LIBGL_ALWAYS_SOFTWARE makes Mesa's llvmpipe
@@ -37,6 +39,8 @@ pub fn run_gui(
                 width,
                 height,
                 format.clone(),
+                catb.clone(),
+                catb_window,
             )))
         }),
     ) {

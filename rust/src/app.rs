@@ -204,11 +204,30 @@ pub struct VideoViewerApp {
     show_sideband_panel: bool,
 
     // Bitstream telemetry (.catb) state — M0: load/unload + status-bar readout.
-    pub bitstream_file: Option<crate::analysis::bitstream_stats::BitstreamFile>,
+    // M1: Arc so the analysis window viewport + scan thread can share it.
+    pub bitstream_file: Option<Arc<crate::analysis::bitstream_stats::BitstreamFile>>,
     pub bitstream_path: Option<String>,
     /// Last .catb load error (shown in the status bar until a load succeeds).
     pub bitstream_error: Option<String>,
     catb_dialog: Option<dialogs::CatbFileDialog>,
+    /// R4 manual frame offset: catb display frame = viewer frame + offset.
+    pub bitstream_offset: i32,
+    /// The separate Bitstream Analysis OS window (M1).
+    pub bitstream_window: crate::ui::bitstream_window::BitstreamWindow,
+    /// Sidebar mini panel (§9) — stateless, isp_sideband.rs pattern.
+    bitstream_panel: crate::analysis::bitstream_panel::BitstreamPanel,
+    /// Successfully parsed .catb awaiting the user's resolution-mismatch
+    /// opt-in (R5/V18): (path, parsed file).
+    pending_catb: Option<(String, Arc<crate::analysis::bitstream_stats::BitstreamFile>)>,
+    /// CLI --catb path to auto-load on the first update pass.
+    startup_catb: Option<String>,
+    /// CLI --catb-window: open the analysis window once the load succeeds.
+    startup_catb_window: bool,
+    /// Frames left before honouring --catb-window. Creating a child viewport
+    /// in the very first update pass tears down the Wayland connection on
+    /// WSLg (observed: broken pipe + winit Exit Failure), so the auto-open
+    /// is deferred a few paints until the root surface is settled.
+    bs_window_open_delay: u8,
     /// Active "Guess with hint" dialog (View → Video Size → Guess with hint…).
     guess_size_dialog: Option<dialogs::GuessSizeDialog>,
     /// Pointer position captured while a file drag is in progress
@@ -233,8 +252,12 @@ impl VideoViewerApp {
         width: Option<u32>,
         height: Option<u32>,
         format: Option<String>,
+        catb: Option<String>,
+        catb_window: bool,
     ) -> Self {
         let settings = Settings::load();
+        let mut bitstream_window = crate::ui::bitstream_window::BitstreamWindow::new();
+        bitstream_window.apply_settings(&settings.bitstream);
         if settings.display.dark_theme {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
         } else {
@@ -317,6 +340,13 @@ impl VideoViewerApp {
             bitstream_path: None,
             bitstream_error: None,
             catb_dialog: None,
+            bitstream_offset: 0,
+            bitstream_window,
+            bitstream_panel: crate::analysis::bitstream_panel::BitstreamPanel::new(),
+            pending_catb: None,
+            startup_catb: catb,
+            startup_catb_window: catb_window,
+            bs_window_open_delay: 0,
             guess_size_dialog: None,
             last_drop_target_pos: None,
             interlace_view: InterlaceViewMode::Progressive,
@@ -645,6 +675,8 @@ impl VideoViewerApp {
         }
         // Update analysis visualizations.
         self.update_analysis(ctx);
+        // Mirror the new frame into the Bitstream Analysis window (if open).
+        self.update_bitstream_shared(ctx);
         true
     }
 
@@ -1354,19 +1386,125 @@ impl VideoViewerApp {
         self.sideband_overlay_mode = SidebandOverlayMode::None;
     }
 
-    /// Load a `.catb` bitstream telemetry file (M0: status readout only).
-    pub fn load_bitstream(&mut self, path: &str) -> Result<(), String> {
-        let file = crate::analysis::bitstream_stats::BitstreamFile::open(path)?;
-        self.bitstream_file = Some(file);
+    /// Load a `.catb` bitstream telemetry file. When the stream resolution
+    /// disagrees with the loaded video, the load is parked in `pending_catb`
+    /// and an opt-in confirmation dialog is shown instead (R5/V18).
+    pub fn load_bitstream(&mut self, ctx: &egui::Context, path: &str) -> Result<(), String> {
+        let file = Arc::new(crate::analysis::bitstream_stats::BitstreamFile::open(path)?);
+        let mismatch = self.reader.as_ref().is_some_and(|r| {
+            file.width > 0
+                && file.height > 0
+                && (file.width != r.width() || file.height != r.height())
+        });
+        if mismatch {
+            self.pending_catb = Some((path.to_string(), file));
+            return Ok(());
+        }
+        self.finalize_bitstream_load(ctx, path, file);
+        Ok(())
+    }
+
+    /// Commit a parsed `.catb`: publish it to the analysis window's shared
+    /// state and start the Frame Graph background scan (never on the UI
+    /// thread — scene-detect thread pattern).
+    fn finalize_bitstream_load(
+        &mut self,
+        ctx: &egui::Context,
+        path: &str,
+        file: Arc<crate::analysis::bitstream_stats::BitstreamFile>,
+    ) {
+        self.bitstream_file = Some(Arc::clone(&file));
         self.bitstream_path = Some(path.to_string());
         self.bitstream_error = None;
-        Ok(())
+        {
+            let mut s = self.bitstream_window.shared.lock();
+            s.file = Some(Arc::clone(&file));
+            s.file_name = std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned());
+            s.frame_graph = None;
+            s.frame_graph_scanning = true;
+        }
+        // Background per-frame bits / avg-QP scan for the Frame Graph tab.
+        let shared = Arc::clone(&self.bitstream_window.shared);
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let points = crate::ui::bitstream_window::compute_frame_graph(&file);
+            let mut s = shared.lock();
+            // Discard stale results if the file changed / was unloaded.
+            let still_current = s
+                .file
+                .as_ref()
+                .map(|f| Arc::ptr_eq(f, &file))
+                .unwrap_or(false);
+            if still_current {
+                s.frame_graph = Some(Arc::new(points));
+                s.frame_graph_scanning = false;
+            }
+            drop(s);
+            ctx2.request_repaint();
+        });
+        if self.startup_catb_window {
+            self.startup_catb_window = false;
+            // Deferred open: see bs_window_open_delay.
+            self.bs_window_open_delay = 3;
+            ctx.request_repaint();
+        } else {
+            self.update_bitstream_shared(ctx);
+        }
     }
 
     pub fn unload_bitstream(&mut self) {
         self.bitstream_file = None;
         self.bitstream_path = None;
         self.bitstream_error = None;
+        self.bitstream_offset = 0;
+        let mut s = self.bitstream_window.shared.lock();
+        s.file = None;
+        s.file_name = None;
+        // Keep the window's status strip / offset DragValue in sync — the
+        // root only pushes shared state on frame changes otherwise, so a
+        // stale non-zero offset would linger after unload.
+        s.offset = 0;
+        s.frame_graph = None;
+        s.frame_graph_scanning = false;
+    }
+
+    /// Open (or re-focus) the Bitstream Analysis window and push fresh data.
+    fn open_bitstream_window(&mut self, ctx: &egui::Context) {
+        let was_open = self.bitstream_window.open;
+        self.bitstream_window.open = true;
+        self.update_bitstream_shared(ctx);
+        if was_open {
+            ctx.send_viewport_cmd_to(
+                egui::ViewportId::from_hash_of("bitstream_viewport"),
+                egui::ViewportCommand::Focus,
+            );
+        }
+    }
+
+    /// Push the current frame + sync data into the analysis window's shared
+    /// state (only while the window is open — update_analysis convention).
+    fn update_bitstream_shared(&mut self, ctx: &egui::Context) {
+        if !self.bitstream_window.open {
+            return;
+        }
+        {
+            let mut shared = self.bitstream_window.shared.lock();
+            shared.viewer_frame = self.current_frame_idx;
+            shared.viewer_total = self.total_frames();
+            shared.viewer_size = self.reader.as_ref().map(|r| (r.width(), r.height()));
+            shared.offset = self.bitstream_offset;
+            shared.is_playing = self.is_playing;
+            if let (Some(rgb), Some(r)) = (&self.current_rgb, &self.reader) {
+                shared.frame_image = Some(egui::ColorImage::from_rgb(
+                    [r.width() as usize, r.height() as usize],
+                    rgb,
+                ));
+                shared.generation += 1;
+            }
+        }
+        ctx.request_repaint_of(egui::ViewportId::from_hash_of("bitstream_viewport"));
     }
 
     pub fn current_sideband_frame(&self) -> Option<&crate::core::sideband::SidebandFrame> {
@@ -1401,6 +1539,18 @@ impl eframe::App for VideoViewerApp {
                 .clone()
                 .unwrap_or_else(|| self.settings.defaults.format.clone());
             self.open_file(ctx, path, w, h, &fmt);
+        }
+
+        // --- Auto-load bitstream telemetry from CLI (--catb) ---
+        // Runs after the startup open_file above so open_file's
+        // unload_bitstream cannot clear it. §10: failure = one stderr line +
+        // §7 error display; startup continues.
+        if let Some(catb_path) = self.startup_catb.take() {
+            if let Err(e) = self.load_bitstream(ctx, &catb_path) {
+                eprintln!("catb: failed to load {catb_path}: {e}");
+                self.bitstream_error = Some(e);
+                self.startup_catb_window = false;
+            }
         }
 
         // --- Poll test video download ---
@@ -1968,6 +2118,12 @@ impl eframe::App for VideoViewerApp {
                         self.dialog_state = DialogState::CatbFile;
                     }
                     let bs_loaded = self.bitstream_file.is_some();
+                    if ui.add_enabled(bs_loaded, egui::Button::new("Bitstream Analysis Window"))
+                        .on_disabled_hover_text("Load a .catb telemetry file first")
+                        .clicked() {
+                        ui.close_menu();
+                        self.open_bitstream_window(ctx);
+                    }
                     if ui.add_enabled(bs_loaded, egui::Button::new("Unload Bitstream Telemetry"))
                         .clicked() {
                         ui.close_menu();
@@ -2257,10 +2413,16 @@ impl eframe::App for VideoViewerApp {
                 } else if self.current_file.is_none() {
                     ui.label("No file loaded — drop a file or use File → Open");
                 }
-                // Bitstream telemetry readout: current frame POC/type/bits.
+                // Bitstream telemetry readout: current frame POC/type/bits
+                // (with the R4 frame offset applied).
                 if let Some(ref bs) = self.bitstream_file {
                     ui.separator();
-                    if let Some(s) = bs.frame_summary(self.current_frame_idx) {
+                    if let Some(s) = crate::analysis::bitstream_stats::viewer_to_catb_display(
+                        self.current_frame_idx,
+                        self.bitstream_offset,
+                    )
+                    .and_then(|d| bs.frame_summary(d))
+                    {
                         let bits = s
                             .slice_bits
                             .map(|b| b.to_string())
@@ -2359,11 +2521,23 @@ impl eframe::App for VideoViewerApp {
         let sb_frame_idx = self.current_frame_idx;
         let mut sb_action: Option<crate::analysis::isp_sideband::SidebandAction> = None;
         let show_sb_panel = self.show_sideband_panel;
+        // Bitstream mini panel (§9): shown whenever telemetry is loaded or a
+        // load error must stay visible (window may be closed).
+        let bs_file_arc = self.bitstream_file.clone();
+        let bs_path = self.bitstream_path.clone();
+        let bs_error = self.bitstream_error.clone();
+        let bs_offset = self.bitstream_offset;
+        let bs_window_open = self.bitstream_window.open;
+        let bs_total_frames = self.total_frames();
+        let bs_viewer_size = self.reader.as_ref().map(|r| (r.width(), r.height()));
+        let mut bs_action: Option<crate::analysis::bitstream_panel::BitstreamAction> = None;
+        let show_bs_panel = bs_file_arc.is_some() || bs_error.is_some();
         // Three render modes for the right sidebar area:
         //   1. show_pixel_inspector || show_sb_panel → full sidebar
         //   2. neither shown                         → thin clickable
         //      "Pixel Inspector" strip that toggles the inspector back on
-        let render_sidebar = self.sidebar.show_pixel_inspector || show_sb_panel;
+        let render_sidebar =
+            self.sidebar.show_pixel_inspector || show_sb_panel || show_bs_panel;
         if render_sidebar {
             egui::SidePanel::right("sidebar")
                 .default_width(250.0)
@@ -2383,6 +2557,24 @@ impl eframe::App for VideoViewerApp {
                                 opacity: &mut sb_opacity,
                                 show_values: &mut sb_show_vals,
                                 current_frame_idx: sb_frame_idx,
+                            },
+                        );
+                    }
+                    if show_bs_panel {
+                        if pixel_rendered || show_sb_panel {
+                            ui.separator();
+                        }
+                        bs_action = self.bitstream_panel.show(
+                            ui,
+                            &mut crate::analysis::bitstream_panel::BitstreamPanelContext {
+                                bitstream: bs_file_arc.as_deref(),
+                                bitstream_path: bs_path.as_deref(),
+                                error: bs_error.as_deref(),
+                                offset: bs_offset,
+                                current_frame_idx: sb_frame_idx,
+                                viewer_total_frames: bs_total_frames,
+                                viewer_size: bs_viewer_size,
+                                window_open: bs_window_open,
                             },
                         );
                     }
@@ -2488,6 +2680,76 @@ impl eframe::App for VideoViewerApp {
         }
         // Analysis as a separate floating window.
         self.sidebar.show_analysis_window(ctx);
+
+        // --- Bitstream Analysis window (separate OS viewport, M1) ---
+        // Handle mini-panel actions first.
+        if let Some(action) = bs_action {
+            use crate::analysis::bitstream_panel::BitstreamAction;
+            match action {
+                BitstreamAction::LoadRequested => {
+                    let initial_dir = self.current_file.as_ref()
+                        .and_then(|f| std::path::Path::new(f).parent())
+                        .and_then(|p| p.to_str());
+                    self.catb_dialog = Some(dialogs::CatbFileDialog::new(initial_dir));
+                    self.dialog_state = DialogState::CatbFile;
+                }
+                BitstreamAction::Unload => {
+                    self.unload_bitstream();
+                }
+                BitstreamAction::OpenWindow => {
+                    self.open_bitstream_window(ctx);
+                }
+                BitstreamAction::SetOffset(offset) => {
+                    self.bitstream_offset = offset;
+                    self.update_bitstream_shared(ctx);
+                }
+            }
+        }
+        // Poll requests written by the window (one-way pull model: the child
+        // never seeks by itself).
+        {
+            let (seek, toggle_play, offset_req) = {
+                let mut s = self.bitstream_window.shared.lock();
+                (
+                    s.seek_request.take(),
+                    std::mem::take(&mut s.toggle_play_request),
+                    s.offset_request.take(),
+                )
+            };
+            if let Some(offset) = offset_req {
+                self.bitstream_offset = offset;
+                self.update_bitstream_shared(ctx);
+            }
+            if let Some(idx) = seek {
+                self.goto_frame(ctx, idx);
+                self.is_playing = false;
+            }
+            if toggle_play {
+                self.is_playing = !self.is_playing;
+                if self.is_playing {
+                    self.last_frame_time = Some(Instant::now());
+                }
+            }
+        }
+        // Deferred --catb-window auto-open (see bs_window_open_delay).
+        if self.bs_window_open_delay > 0 {
+            self.bs_window_open_delay -= 1;
+            if self.bs_window_open_delay == 0 {
+                self.open_bitstream_window(ctx);
+            } else {
+                ctx.request_repaint();
+            }
+        }
+        // Mirror playback state every root pass so the child can self-repaint
+        // during playback and stop when playback ends (sidebar convention).
+        if self.bitstream_window.open {
+            self.bitstream_window.shared.lock().is_playing = self.is_playing;
+        }
+        if let Some(new_view_settings) = self.bitstream_window.show(ctx) {
+            // §2: toggle state persists across window/app restarts.
+            self.settings.bitstream = new_view_settings;
+            self.settings.save();
+        }
 
         // --- Central panel (canvas / video diff) ---
         let mut comparison_action = None;
@@ -2871,13 +3133,50 @@ impl VideoViewerApp {
             if let Some(ref mut dlg) = self.catb_dialog {
                 if let Some(result) = dlg.show(ctx) {
                     if let Some(path) = result {
-                        if let Err(e) = self.load_bitstream(&path) {
+                        if let Err(e) = self.load_bitstream(ctx, &path) {
                             self.bitstream_error = Some(e);
                         }
                     }
                     self.dialog_state = DialogState::None;
                     self.catb_dialog = None;
                 }
+            }
+        }
+
+        // Bitstream resolution-mismatch opt-in dialog (R5/V18): the parsed
+        // .catb is parked in pending_catb until the user confirms or rejects.
+        if let Some((path, file)) = self.pending_catb.take() {
+            let viewer = self
+                .reader
+                .as_ref()
+                .map(|r| (r.width(), r.height()))
+                .unwrap_or((0, 0));
+            let mut decision: Option<bool> = None;
+            egui::Window::new("Bitstream resolution mismatch")
+                .resizable(false)
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "Stream {}×{} ≠ viewer {}×{} — overlay scaled, values unreliable",
+                        file.width, file.height, viewer.0, viewer.1,
+                    ));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Load anyway").clicked() {
+                            decision = Some(true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            decision = Some(false);
+                        }
+                    });
+                });
+            match decision {
+                Some(true) => self.finalize_bitstream_load(ctx, &path, file),
+                Some(false) => {
+                    // Rejected → not loaded (V18). Clear any --catb-window intent.
+                    self.startup_catb_window = false;
+                }
+                None => self.pending_catb = Some((path, file)),
             }
         }
 

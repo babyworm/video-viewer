@@ -277,16 +277,17 @@ impl CatbFile {
 
     fn from_mmap(mmap: Mmap) -> Result<Self, String> {
         let data: &[u8] = &mmap;
+        // §7 fixed wording (UX spec 04): magic/version mismatch surfaces this
+        // exact string in the sidebar panel — do not reword.
+        const UNSUPPORTED: &str =
+            "Unsupported .catb (need v4) — regenerate with codec-analyzer ≥0.8.3";
         let magic = get_bytes(data, 0, 8, "magic")?;
         if magic != CATB_MAGIC {
-            return Err("not a .catb file (magic mismatch, expected \"CATB0001\")".to_string());
+            return Err(UNSUPPORTED.to_string());
         }
         let version = read_u32(data, 8, "version")?;
         if version != CATB_VERSION {
-            return Err(format!(
-                "unsupported .catb version {version} (expected {CATB_VERSION}) — \
-                 regenerate with codec-analyzer >= 0.8.3"
-            ));
+            return Err(UNSUPPORTED.to_string());
         }
         let frame_count = read_u32(data, 12, "frame_count")?;
 

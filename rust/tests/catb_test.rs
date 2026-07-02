@@ -453,13 +453,17 @@ fn test_catb_presence_bits_roundtrip() {
 // Error cases
 // ===========================================================================
 
+/// §7 fixed wording (UX spec 04) — string equality is the contract.
+const UNSUPPORTED_MSG: &str =
+    "Unsupported .catb (need v4) — regenerate with codec-analyzer ≥0.8.3";
+
 #[test]
 fn test_catb_bad_magic() {
     let mut bytes = appendix_a_bytes();
     bytes[0..8].copy_from_slice(b"NOTCATB!");
     let f = write_temp(&bytes);
     let err = CatbFile::open(f.path()).unwrap_err();
-    assert!(err.contains("not a .catb file"), "got: {err}");
+    assert_eq!(err, UNSUPPORTED_MSG);
 }
 
 #[test]
@@ -468,10 +472,7 @@ fn test_catb_bad_version() {
     bytes[8..12].copy_from_slice(&3u32.to_le_bytes());
     let f = write_temp(&bytes);
     let err = CatbFile::open(f.path()).unwrap_err();
-    assert!(
-        err.contains("unsupported .catb version 3") && err.contains("expected 4"),
-        "got: {err}"
-    );
+    assert_eq!(err, UNSUPPORTED_MSG);
 }
 
 #[test]

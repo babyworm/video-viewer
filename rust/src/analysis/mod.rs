@@ -1,3 +1,4 @@
+pub mod bitstream_panel;
 pub mod bitstream_stats;
 pub mod block_stats;
 pub mod histogram;
