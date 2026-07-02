@@ -21,6 +21,9 @@ pub enum DialogState {
     /// state so a B pick can never land in the A slot.
     CatbFileB,
     DecoderRun,
+    /// M-E: locate the original Annex-B bitstream for the loaded `.catb`
+    /// (Structure-tab NAL browser / HEX view source).
+    LocateBitstream,
     GuessSize,
 }
 
@@ -1743,6 +1746,99 @@ impl CatbFileDialog {
                 });
 
                 // Inline file browser
+                if let Some(ref mut fb) = self.file_browser {
+                    ui.separator();
+                    if let Some(selected) = fb.show(ui) {
+                        self.path = selected;
+                        self.file_browser = None;
+                    }
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!self.path.is_empty(), egui::Button::new("Open"))
+                        .clicked()
+                    {
+                        result = Some(Some(self.path.clone()));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(None);
+                    }
+                });
+            });
+
+        if !open {
+            return Some(None);
+        }
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Locate Original Bitstream Dialog (M-E)
+// ---------------------------------------------------------------------------
+
+/// Path picker for the Structure tab's "Locate bitstream…" — connects the
+/// raw Annex-B stream a loaded `.catb` was produced from (NAL browser /
+/// HEX view source). Mirrors [`CatbFileDialog`].
+pub struct LocateBitstreamDialog {
+    pub path: String,
+    file_browser: Option<FileBrowser>,
+    initial_dir: PathBuf,
+}
+
+impl LocateBitstreamDialog {
+    pub fn new(initial_dir: Option<&str>) -> Self {
+        let initial_dir = initial_dir
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        Self {
+            path: String::new(),
+            file_browser: None,
+            initial_dir,
+        }
+    }
+
+    /// Returns Some(Some(path)) on Open, Some(None) on cancel, None while open.
+    pub fn show(&mut self, ctx: &egui::Context) -> Option<Option<String>> {
+        let mut result = None;
+        let mut open = true;
+
+        egui::Window::new("Locate Original Bitstream")
+            .open(&mut open)
+            .resizable(true)
+            .collapsible(false)
+            .min_width(500.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Bitstream:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.path)
+                            .desired_width(350.0)
+                            .hint_text("/path/to/stream.h265 (.hevc/.h264/.264/.265)"),
+                    );
+                    let browse_label = if self.file_browser.is_some() { "Close" } else { "Browse..." };
+                    if ui.button(browse_label).clicked() {
+                        if self.file_browser.is_some() {
+                            self.file_browser = None;
+                        } else {
+                            let start = if !self.path.is_empty() {
+                                Path::new(&self.path)
+                                    .parent()
+                                    .filter(|p| p.is_dir())
+                                    .map(|p| p.to_path_buf())
+                                    .unwrap_or_else(|| self.initial_dir.clone())
+                            } else {
+                                self.initial_dir.clone()
+                            };
+                            self.file_browser = Some(FileBrowser::new(start));
+                        }
+                    }
+                });
+
                 if let Some(ref mut fb) = self.file_browser {
                     ui.separator();
                     if let Some(selected) = fb.show(ui) {

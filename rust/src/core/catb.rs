@@ -10,8 +10,8 @@
 //! parsed lazily per frame/block, and SYNTAX (28 B), CABAC (28 B), and
 //! TRANSFORM (104 B) records are parsed lazily per block (M4 / M-B).
 //! Coefficient detail is resolved per-TU from the `coeffs` i32 section
-//! (§11 indirect rule). Only `frame_aux` remains unparsed — its directory
-//! entry is retained.
+//! (§11 indirect rule), and `frame_aux` (per-frame loop-filter / SAO JSON
+//! blobs, §12) is parsed lazily per frame (M-E).
 
 use std::fs::File;
 use std::path::Path;
@@ -378,6 +378,63 @@ impl TxRow {
     }
 }
 
+/// One `frame_aux.loop_filters[]` deblocking-edge row (§12, M-E). Fixture-
+/// observed keys (hevc_* fixtures): `x/y/w/h` (a 1×4 or 4×1 px edge
+/// segment), `orientation` ("vertical"/"horizontal"), `boundary_strength`
+/// (0–2), `filter_strength` ("strong"/"weak"/"none"), `reason`
+/// ("boundary_strength_zero"/"threshold"/""), `qp`, `beta`, `tc`, plus
+/// `ctu_address/ctu_x/ctu_y/segment/no_p/no_q/pcm_or_bypass/
+/// filter_slice_edges/beta_offset/tc_offset/telemetry_source` (not
+/// surfaced). Lenient: missing/mistyped keys decay to defaults.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LoopFilterRow {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    /// `true` = vertical edge (the segment spans `y..y+h` at `x`).
+    pub vertical: bool,
+    pub boundary_strength: i32,
+    /// "strong" / "weak" / "none" (fixture-observed values).
+    pub filter_strength: String,
+    /// Why the filter did not apply: "boundary_strength_zero" /
+    /// "threshold" / "" (applied).
+    pub reason: String,
+    pub qp: i32,
+}
+
+/// One `frame_aux.sao[]` row (§12, M-E). Fixtures carry per-CTU rows whose
+/// `type_*` are all `"not_applied"`; parsed for completeness, no overlay
+/// consumes them yet.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SaoRow {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub type_y: String,
+    pub type_cb: String,
+    pub type_cr: String,
+    pub merge_left: bool,
+    pub merge_up: bool,
+}
+
+impl SaoRow {
+    /// Any component carries an applied SAO type.
+    pub fn applied(&self) -> bool {
+        [&self.type_y, &self.type_cb, &self.type_cr]
+            .iter()
+            .any(|t| !t.is_empty() && *t != "not_applied")
+    }
+}
+
+/// One frame's `frame_aux` blob, lazily parsed (§12).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FrameAux {
+    pub loop_filters: Vec<LoopFilterRow>,
+    pub sao: Vec<SaoRow>,
+}
+
 /// One CABAC record (28 bytes): a decoded bin row (§8).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CabacRow {
@@ -739,6 +796,42 @@ impl CatbFile {
         }))
     }
 
+    /// Lazily parse frame `frame_idx`'s `frame_aux` blob (§12, M-E): the
+    /// per-frame compact JSON `{"loop_filters": [...], "sao": [...]}`
+    /// addressed by the FRAME record's `(aux_off, aux_n)`.
+    ///
+    /// `aux_n <= 0` (spec: "no aux") and an out-of-section range both yield
+    /// an empty [`FrameAux`]; truncated/invalid JSON is an `Err` (never a
+    /// panic); missing/mistyped rows inside valid JSON decay to defaults.
+    /// Callers cache the result (rows outnumber blocks 12–15×; the
+    /// `BitstreamFile` layer keeps a 1-frame LRU).
+    pub fn frame_aux_for_frame(&self, frame_idx: usize) -> Result<FrameAux, String> {
+        let frame = self
+            .frames
+            .get(frame_idx)
+            .ok_or_else(|| format!("catb: frame index {frame_idx} out of range"))?;
+        if frame.aux_n <= 0 {
+            return Ok(FrameAux::default());
+        }
+        let aux_bytes = self.section_bytes(SEC_FRAME_AUX);
+        let start = usize::try_from(frame.aux_off)
+            .map_err(|_| "catb: aux_off overflows".to_string())?;
+        let len = usize::try_from(frame.aux_n).unwrap_or(0);
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| "catb: aux range overflows".to_string())?;
+        if end > aux_bytes.len() {
+            return Err(format!(
+                "catb: frame {frame_idx} aux range {start}+{len} exceeds the \
+                 frame_aux section ({} bytes)",
+                aux_bytes.len()
+            ));
+        }
+        let v: serde_json::Value = serde_json::from_slice(&aux_bytes[start..end])
+            .map_err(|e| format!("catb: frame {frame_idx} aux JSON invalid: {e}"))?;
+        Ok(parse_frame_aux(&v))
+    }
+
     /// Lightweight per-block TX aggregate for the CoeffEnergy /
     /// NonzeroCoeffs fills (M-B): `(Σ coeff_abs_sum, Σ nonzero_coeff_count)`
     /// over the block's TX records, honouring the §9.1 presence bits
@@ -953,6 +1046,61 @@ fn parse_ref_list(v: Option<&serde_json::Value>) -> Vec<RefListEntry> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Lenient `frame_aux` blob parser (M-E §12): rows that are not objects are
+/// skipped; missing keys decay to defaults.
+fn parse_frame_aux(v: &serde_json::Value) -> FrameAux {
+    let i32_of = |o: &serde_json::Value, k: &str| -> i32 {
+        o.get(k).and_then(|x| x.as_i64()).unwrap_or(0) as i32
+    };
+    let str_of = |o: &serde_json::Value, k: &str| -> String {
+        o.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
+    };
+    let bool_of = |o: &serde_json::Value, k: &str| -> bool {
+        o.get(k).and_then(|x| x.as_bool()).unwrap_or(false)
+    };
+    let loop_filters = v
+        .get("loop_filters")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|r| r.is_object())
+                .map(|r| LoopFilterRow {
+                    x: i32_of(r, "x"),
+                    y: i32_of(r, "y"),
+                    w: i32_of(r, "w"),
+                    h: i32_of(r, "h"),
+                    vertical: str_of(r, "orientation") == "vertical",
+                    boundary_strength: i32_of(r, "boundary_strength"),
+                    filter_strength: str_of(r, "filter_strength"),
+                    reason: str_of(r, "reason"),
+                    qp: i32_of(r, "qp"),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let sao = v
+        .get("sao")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|r| r.is_object())
+                .map(|r| SaoRow {
+                    x: i32_of(r, "x"),
+                    y: i32_of(r, "y"),
+                    w: i32_of(r, "w"),
+                    h: i32_of(r, "h"),
+                    type_y: str_of(r, "type_y"),
+                    type_cb: str_of(r, "type_cb"),
+                    type_cr: str_of(r, "type_cr"),
+                    merge_left: bool_of(r, "merge_left"),
+                    merge_up: bool_of(r, "merge_up"),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    FrameAux { loop_filters, sao }
 }
 
 /// Lenient `frames_meta[i]` element parser (any missing/mistyped member

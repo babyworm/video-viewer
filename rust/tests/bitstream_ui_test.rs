@@ -75,6 +75,7 @@ fn test_settings_view_config_conversion() {
         layer_part: false,
         layer_tu: false,
         layer_intra: false,
+        layer_lf: false,
         layer_label: false,
         layer_grid: true,
         layer_sel: true,

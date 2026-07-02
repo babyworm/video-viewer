@@ -55,6 +55,10 @@ pub struct BitstreamViewSettings {
     /// files loading (field absent → false).
     #[serde(default)]
     pub layer_intra: bool,
+    /// M-E deblocking loop-filter edge layer (`serde(default)` for
+    /// pre-0.21 files).
+    #[serde(default)]
+    pub layer_lf: bool,
     pub layer_label: bool,
     pub layer_grid: bool,
     pub layer_sel: bool,
@@ -82,6 +86,7 @@ impl Default for BitstreamViewSettings {
             layer_part: false,
             layer_tu: false,
             layer_intra: false,
+            layer_lf: false,
             layer_label: true,
             layer_grid: true,
             layer_sel: true,

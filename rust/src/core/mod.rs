@@ -6,6 +6,7 @@ pub mod decoder_run;
 pub mod dropped;
 pub mod formats;
 pub mod hints;
+pub mod nal;
 pub mod pixel;
 pub mod ppm;
 pub mod reader;

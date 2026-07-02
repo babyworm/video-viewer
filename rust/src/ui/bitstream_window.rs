@@ -36,11 +36,12 @@ use crate::analysis::stage::{
     compute_block_quality, psnr_to_g, stage_available, BlockQuality, QualityUnavailable,
     StageCache, StageKind,
 };
-use crate::core::catb::{BsBlock, BsRef, TxRow};
+use crate::core::catb::{BsBlock, BsRef, FrameAux, TxRow};
 use crate::core::dropped::{classify_dropped_file, DroppedKind};
+use crate::core::nal::{nal_type_name, NalCodec, NalScan};
 use crate::ui::bitstream_overlay::{
-    build_intra, build_refs, build_tx, draw_intra_layer, draw_mv_layer, draw_part_layer,
-    draw_tu_layer, LayerGeom, MvSource, MV_SOURCES,
+    build_intra, build_refs, build_tx, draw_intra_layer, draw_lf_layer, draw_mv_layer,
+    draw_part_layer, draw_tu_layer, LayerGeom, MvSource, MV_SOURCES,
 };
 use crate::ui::settings::BitstreamViewSettings;
 use crate::ui::sideband_overlay::diverging_colormap;
@@ -161,6 +162,9 @@ pub struct ViewConfig {
     pub tu: bool,
     /// Intra direction lines + P/DC badges (M4).
     pub intra: bool,
+    /// M-E deblocking loop-filter edges (frame_aux): green = strong,
+    /// yellow = weak, red = evaluated but not applied.
+    pub lf: bool,
     /// Per-block value text, rendered at zoom ≥ 2x only.
     pub label: bool,
     /// CTU (HEVC 64 px) / 4-MB (AVC) boundary grid.
@@ -185,6 +189,7 @@ impl ViewConfig {
             part: s.layer_part,
             tu: s.layer_tu,
             intra: s.layer_intra,
+            lf: s.layer_lf,
             label: s.layer_label,
             grid: s.layer_grid,
             sel: s.layer_sel,
@@ -204,6 +209,7 @@ impl ViewConfig {
             layer_part: self.part,
             layer_tu: self.tu,
             layer_intra: self.intra,
+            layer_lf: self.lf,
             layer_label: self.label,
             layer_grid: self.grid,
             layer_sel: self.sel,
@@ -256,6 +262,7 @@ impl Preset {
             part: false,
             tu: false,
             intra: false,
+            lf: false,
             label: false,
             grid: false,
             sel: true,
@@ -312,6 +319,7 @@ pub fn matching_preset(cfg: &ViewConfig) -> Option<Preset> {
             && c.part == cfg.part
             && c.tu == cfg.tu
             && c.intra == cfg.intra
+            && c.lf == cfg.lf
             && c.label == cfg.label
             && c.grid == cfg.grid
             && c.sel == cfg.sel
@@ -772,6 +780,16 @@ pub struct BitstreamShared {
     /// canvas (02 §2 view 1). Kept until replaced, like the window's own
     /// marker; Esc clears it.
     pub corr_hover_cell: Option<(u32, u32, u32)>,
+    /// M-E: the original Annex-B bitstream connected to the loaded `.catb`
+    /// (root-owned; auto-inferred on load, or user-located).
+    pub bitstream_source: Option<std::path::PathBuf>,
+    /// M-E: NAL scan of `bitstream_source` (background thread on set).
+    pub nal_scan: Option<Arc<NalScan>>,
+    pub nal_scanning: bool,
+    /// M-E: why the NAL scan failed (shown in the Structure tab).
+    pub nal_error: Option<String>,
+    /// Child → root: open the "Locate bitstream…" path dialog.
+    pub locate_bitstream_request: bool,
 }
 
 /// Analysis-side grids for one viewer frame, computed by the root
@@ -819,6 +837,11 @@ impl BitstreamShared {
             corr_scan_progress: (0, 0),
             scene_changes: Vec::new(),
             corr_hover_cell: None,
+            bitstream_source: None,
+            nal_scan: None,
+            nal_scanning: false,
+            nal_error: None,
+            locate_bitstream_request: false,
         }
     }
 }
@@ -878,6 +901,10 @@ struct FrameDerived {
     /// lazily when a quality fill is active, keyed on the viewer image
     /// generation (the frame pixels can arrive after the block data).
     quality: Option<(u64, Result<BlockQuality, QualityUnavailable>)>,
+    /// M-E: this frame's `frame_aux` (deblocking edges) — lazily for the LF
+    /// layer via the file's 1-frame LRU. Parse errors decay to an empty aux
+    /// (nothing to draw; the Structure tab surfaces frame_aux problems).
+    lf: Option<Arc<FrameAux>>,
 }
 
 /// Snapshot of the shared state taken at the top of the child pass so the
@@ -909,6 +936,11 @@ struct Snapshot {
     corr_scanning: bool,
     corr_scan_progress: (usize, usize),
     scene_changes: Vec<usize>,
+    /// M-E: NAL browser data (Structure tab).
+    bitstream_source: Option<std::path::PathBuf>,
+    nal_scan: Option<Arc<NalScan>>,
+    nal_scanning: bool,
+    nal_error: Option<String>,
 }
 
 pub struct BitstreamWindow {
@@ -997,6 +1029,47 @@ pub struct BitstreamWindow {
     pub diff_mode: bool,
     /// M-D: per-frame Δ derivation cache (A/B grids diffed at L1 + LOD).
     diff: Option<DiffDerived>,
+    /// M-E: NAL table kind filter (Structure tab).
+    nal_filter: NalKindFilter,
+    /// M-E: NAL table type-name search.
+    nal_search: String,
+    /// M-E: selected NAL unit index (drives the HEX view).
+    selected_nal: Option<usize>,
+    /// M-E: HEX view 4 KB page within the selected unit.
+    hex_page: usize,
+    /// M-E: filtered NAL row indices, cached per (scan identity, filter,
+    /// search) — recomputing over a multi-million-unit scan every repaint
+    /// would stall the table.
+    nal_filtered: Option<NalFilteredCache>,
+}
+
+/// M-E: NAL table kind filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NalKindFilter {
+    All,
+    Vcl,
+    NonVcl,
+}
+
+impl NalKindFilter {
+    fn label(self) -> &'static str {
+        match self {
+            NalKindFilter::All => "All",
+            NalKindFilter::Vcl => "VCL",
+            NalKindFilter::NonVcl => "non-VCL",
+        }
+    }
+}
+
+const NAL_KIND_FILTERS: [NalKindFilter; 3] =
+    [NalKindFilter::All, NalKindFilter::Vcl, NalKindFilter::NonVcl];
+
+/// M-E: cached filtered NAL row set (see `BitstreamWindow::nal_filtered`).
+struct NalFilteredCache {
+    scan_ptr: usize,
+    filter: NalKindFilter,
+    search: String,
+    rows: Vec<u32>,
 }
 
 /// M-D: cached per-frame Δ data, keyed on both file identities, the viewer
@@ -1135,6 +1208,11 @@ impl BitstreamWindow {
             stage_texture: None,
             diff_mode: false,
             diff: None,
+            nal_filter: NalKindFilter::All,
+            nal_search: String::new(),
+            selected_nal: None,
+            hex_page: 0,
+            nal_filtered: None,
         }
     }
 
@@ -1165,6 +1243,10 @@ impl BitstreamWindow {
         self.picture = PictureSource::Source;
         self.stage_texture = None;
         self.stage_cache = StageCache::new();
+        // M-E: the NAL selection/filter cache points into the old scan.
+        self.selected_nal = None;
+        self.hex_page = 0;
+        self.nal_filtered = None;
         // M-D: the Δ pair is anchored on A — an A change invalidates it.
         self.reset_b_state();
     }
@@ -1234,6 +1316,10 @@ impl BitstreamWindow {
                 corr_scanning: s.corr_scanning,
                 corr_scan_progress: s.corr_scan_progress,
                 scene_changes: s.scene_changes.clone(),
+                bitstream_source: s.bitstream_source.clone(),
+                nal_scan: s.nal_scan.clone(),
+                nal_scanning: s.nal_scanning,
+                nal_error: s.nal_error.clone(),
             };
             (snap, title)
         };
@@ -1723,6 +1809,41 @@ impl BitstreamWindow {
                 {
                     self.view.intra = !self.view.intra;
                 }
+                // M-E LF layer. No shortcut key by design: L is Label and F
+                // is fit-zoom in this window's key map, and a third-choice
+                // mnemonic would be worse than none — toolbar-only toggle.
+                {
+                    // Cheap availability probe: the reference catb writer
+                    // always emits an aux blob; the empty one is exactly
+                    // 28 bytes (`{"loop_filters":[],"sao":[]}`), so anything
+                    // larger *may* carry rows without parsing it here.
+                    let lf_available = snap.file.as_ref().zip(decode_idx).is_some_and(
+                        |(f, di)| {
+                            f.catb.frames.get(di).is_some_and(|fr| fr.aux_n > 28)
+                        },
+                    );
+                    let resp = ui.add_enabled(
+                        lf_available || self.view.lf,
+                        egui::SelectableLabel::new(self.view.lf, "LF"),
+                    );
+                    if resp.clicked() {
+                        self.view.lf = !self.view.lf;
+                    }
+                    if lf_available || self.view.lf {
+                        resp.on_hover_text(
+                            "Deblocking loop-filter edges (frame_aux): green = \
+                             strong, yellow = weak, red = evaluated but not \
+                             applied (dim red = BS 0). Rendered at zoom ≥ 1.5x.",
+                        );
+                    } else {
+                        resp.on_disabled_hover_text(
+                            "No loop-filter rows captured for this frame — \
+                             AVC captures or low telemetry levels omit them; \
+                             re-run with Deep telemetry (--telemetry-level \
+                             full).",
+                        );
+                    }
+                }
                 if ui
                     .selectable_label(self.view.label, "Label")
                     .on_hover_text("Per-block values (rendered at zoom ≥ 2x)")
@@ -1859,6 +1980,7 @@ impl BitstreamWindow {
             intra: None,
             tx: None,
             quality: None,
+            lf: None,
         });
     }
 
@@ -2003,6 +2125,15 @@ impl BitstreamWindow {
         }
         if self.view.tu && d.tx.is_none() {
             d.tx = Some(build_tx(file, &d.blocks));
+        }
+        if self.view.lf && d.lf.is_none() {
+            // Errors decay to an empty aux (nothing to draw); the 1-frame
+            // LRU inside the file keeps repeat fetches cheap.
+            d.lf = Some(
+                file.decode_idx(d.display_idx)
+                    .and_then(|di| file.frame_aux_decode(di).ok())
+                    .unwrap_or_default(),
+            );
         }
     }
 
@@ -2435,6 +2566,13 @@ impl BitstreamWindow {
             if self.view.intra {
                 if let Some(intra) = d.intra.as_ref() {
                     draw_intra_layer(&painter, &geom, &d.blocks, intra);
+                }
+            }
+            // M-E LF layer: deblocking edges over everything but labels
+            // (edge segments are thin — under the fills they would vanish).
+            if self.view.lf {
+                if let Some(aux) = d.lf.as_ref() {
+                    draw_lf_layer(&painter, &geom, &aux.loop_filters);
                 }
             }
 
@@ -3108,6 +3246,67 @@ impl BitstreamWindow {
                             ui.colored_label(egui::Color32::RED, format!("TX parse: {e}"));
                         }
                     }
+                }
+
+                // M-E: CABAC bin browser (VQA CU/TU tab analogue — decoded
+                // bins only; the engine R/V state is not captured in .catb).
+                ui.add_space(6.0);
+                if b.cabac_n > 0 {
+                    egui::CollapsingHeader::new(format!("CABAC bins ({})", b.cabac_n))
+                        .id_salt("bs_cabac_bins")
+                        .show(ui, |ui| {
+                            // Body only runs while open — the rows parse on
+                            // demand (28 B records, no caching needed).
+                            match file.catb.cabac_for_block(&b) {
+                                Ok(rows) => self.ui_inspector_cabac_table(ui, &rows),
+                                Err(e) => {
+                                    ui.colored_label(
+                                        egui::Color32::RED,
+                                        format!("CABAC parse: {e}"),
+                                    );
+                                }
+                            }
+                        });
+                } else {
+                    ui.weak(
+                        "No CABAC bins captured for this block — re-run with \
+                         Deep telemetry (--telemetry-level full).",
+                    );
+                }
+            });
+    }
+
+    /// M-E: CABAC bin table for the selected block (name / ctx / bin /
+    /// bits), capped at 256 rows.
+    fn ui_inspector_cabac_table(&self, ui: &mut egui::Ui, rows: &[crate::core::catb::CabacRow]) {
+        const CABAC_ROW_CAP: usize = 256;
+        egui::ScrollArea::vertical()
+            .id_salt("bs_cabac_table")
+            .max_height(180.0)
+            .show(ui, |ui| {
+                egui::Grid::new("bs_cabac_grid")
+                    .striped(true)
+                    .spacing(egui::vec2(8.0, 2.0))
+                    .show(ui, |ui| {
+                        for head in ["#", "name", "ctx", "bin", "bits"] {
+                            ui.label(egui::RichText::new(head).small());
+                        }
+                        ui.end_row();
+                        for (k, r) in rows.iter().take(CABAC_ROW_CAP).enumerate() {
+                            ui.monospace(format!("{k}"));
+                            ui.monospace(if r.name.is_empty() { "?" } else { &r.name });
+                            ui.monospace(format!("{}", r.ctx));
+                            ui.monospace(format!("{}", r.bin));
+                            ui.monospace(format!("{}", r.bits));
+                            ui.end_row();
+                        }
+                    });
+                if rows.len() > CABAC_ROW_CAP {
+                    ui.weak(format!(
+                        "… {} more bins not shown (Stats tab has the \
+                         per-frame aggregate)",
+                        rows.len() - CABAC_ROW_CAP
+                    ));
                 }
             });
     }
@@ -4715,8 +4914,284 @@ impl BitstreamWindow {
                              the Inspector shows its missing keys.",
                         );
                     });
+
+                // -- 5. NAL Units — original bitstream (M-E) --
+                self.ui_nal_section(ui, snap, decode);
+
+                // -- 6. Hex view — selected NAL unit (M-E) --
+                self.ui_hex_section(ui, snap);
             });
         });
+    }
+
+    /// M-E: NAL unit table over the connected original bitstream (VQA NAL
+    /// tab analogue — unit list only; per-unit syntax trees are out of
+    /// catb/scanner scope).
+    fn ui_nal_section(&mut self, ui: &mut egui::Ui, snap: &Snapshot, decode: Option<usize>) {
+        let title = match snap.nal_scan.as_ref() {
+            Some(scan) => format!(
+                "NAL Units ({} — {} unit{})",
+                scan.codec.label(),
+                scan.units.len(),
+                if scan.units.len() == 1 { "" } else { "s" },
+            ),
+            None => "NAL Units".to_string(),
+        };
+        egui::CollapsingHeader::new(title)
+            .default_open(true)
+            .show(ui, |ui| {
+                // Source line + locate button (always available: the user
+                // can re-point a wrong inference).
+                ui.horizontal(|ui| {
+                    match snap.bitstream_source.as_ref() {
+                        Some(p) => {
+                            ui.weak(format!("source: {}", p.display()));
+                        }
+                        None => {
+                            ui.weak("No original bitstream connected.");
+                        }
+                    }
+                    if ui
+                        .small_button("Locate bitstream…")
+                        .on_hover_text(
+                            "Point at the raw .h265/.h264 the .catb was \
+                             produced from (auto-inferred from the .catb \
+                             location when possible)",
+                        )
+                        .clicked()
+                    {
+                        self.shared.lock().locate_bitstream_request = true;
+                        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                    }
+                });
+                if snap.nal_scanning {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("scanning bitstream…");
+                    });
+                    return;
+                }
+                if let Some(err) = snap.nal_error.as_ref() {
+                    ui.colored_label(egui::Color32::RED, err);
+                    return;
+                }
+                let Some(scan) = snap.nal_scan.as_ref() else {
+                    ui.weak(
+                        "Connect the original bitstream to browse its NAL \
+                         units and bytes.",
+                    );
+                    return;
+                };
+                if scan.truncated {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(240, 200, 40),
+                        "⚠ scan stopped at the unit cap — listing is partial",
+                    );
+                }
+
+                // Filter row.
+                ui.horizontal(|ui| {
+                    ui.label("Show:");
+                    for f in NAL_KIND_FILTERS {
+                        if ui
+                            .selectable_label(self.nal_filter == f, f.label())
+                            .clicked()
+                        {
+                            self.nal_filter = f;
+                        }
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.nal_search)
+                            .desired_width(140.0)
+                            .hint_text("type name contains…"),
+                    );
+                    if !self.nal_search.is_empty() && ui.small_button("×").clicked() {
+                        self.nal_search.clear();
+                    }
+                });
+
+                // Filtered row cache (scan identity + filter + search key).
+                let scan_ptr = Arc::as_ptr(scan) as usize;
+                let stale = self.nal_filtered.as_ref().is_none_or(|c| {
+                    c.scan_ptr != scan_ptr
+                        || c.filter != self.nal_filter
+                        || c.search != self.nal_search
+                });
+                if stale {
+                    let needle = self.nal_search.to_ascii_lowercase();
+                    let rows: Vec<u32> = scan
+                        .units
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, u)| match self.nal_filter {
+                            NalKindFilter::All => true,
+                            NalKindFilter::Vcl => u.is_vcl,
+                            NalKindFilter::NonVcl => !u.is_vcl,
+                        })
+                        .filter(|(_, u)| {
+                            needle.is_empty()
+                                || nal_type_name(scan.codec, u.nal_type)
+                                    .to_ascii_lowercase()
+                                    .contains(&needle)
+                        })
+                        .map(|(i, _)| i as u32)
+                        .collect();
+                    self.nal_filtered = Some(NalFilteredCache {
+                        scan_ptr,
+                        filter: self.nal_filter,
+                        search: self.nal_search.clone(),
+                        rows,
+                    });
+                }
+                let rows: &[u32] = self
+                    .nal_filtered
+                    .as_ref()
+                    .map(|c| c.rows.as_slice())
+                    .unwrap_or(&[]);
+
+                // Current frame ↔ VCL mapping is an **approximation**: catb
+                // frames are decode-order AUs, matched to the scanner's
+                // AU counter — no per-NAL link exists in the container.
+                if decode.is_some() {
+                    ui.weak(
+                        "orange = current frame's VCL units (decode-order AU \
+                         match — approximate)",
+                    );
+                }
+
+                let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + 4.0;
+                let mut clicked: Option<usize> = None;
+                egui::ScrollArea::vertical()
+                    .id_salt("bs_nal_table")
+                    .max_height(260.0)
+                    .show_rows(ui, row_h, rows.len(), |ui, range| {
+                        for k in range {
+                            let i = rows[k] as usize;
+                            let Some(u) = scan.units.get(i) else { continue };
+                            // AU-boundary striping (VQA: alternating shade
+                            // per access unit).
+                            let striped = u.au_id % 2 == 1;
+                            let is_current =
+                                u.is_vcl && decode.is_some_and(|d| d == u.au_id as usize);
+                            let id_col = match scan.codec {
+                                NalCodec::Hevc => format!("T{}", u.temporal_id),
+                                NalCodec::Avc => format!("r{}", u.nal_ref_idc),
+                            };
+                            let text = format!(
+                                "#{i:<4} {:>#10x} {:>7}  {:<18} {:>3} {}",
+                                u.offset,
+                                u.size,
+                                nal_type_name(scan.codec, u.nal_type),
+                                id_col,
+                                if u.is_vcl { "VCL" } else { "   " },
+                            );
+                            let mut rt = egui::RichText::new(text).monospace();
+                            if is_current {
+                                rt = rt.color(egui::Color32::from_rgb(255, 165, 60));
+                            } else if striped {
+                                rt = rt.color(ui.visuals().weak_text_color());
+                            }
+                            let resp = ui.selectable_label(
+                                self.selected_nal == Some(i),
+                                rt,
+                            );
+                            if resp.clicked() {
+                                clicked = Some(i);
+                            }
+                            if u.forbidden {
+                                resp.on_hover_text(
+                                    "forbidden_zero_bit set — corrupt unit or \
+                                     wrong codec detection",
+                                );
+                            }
+                        }
+                    });
+                if let Some(i) = clicked {
+                    self.selected_nal = Some(i);
+                    self.hex_page = 0;
+                }
+            });
+    }
+
+    /// M-E: hex dump of the selected NAL unit (start code included),
+    /// paged at 4 KB. The BLOCK/TX `bit_offset` fields are **frame-local
+    /// decode-domain positions** (oracle `bit_range` cross-check: frame 1's
+    /// first block sits at bit 31 while the frame starts at byte 958), so
+    /// no block→byte-range highlight is possible here by design.
+    fn ui_hex_section(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
+        const HEX_PAGE_BYTES: usize = 4096;
+        const HEX_COLS: usize = 16;
+        egui::CollapsingHeader::new("Hex view")
+            .default_open(false)
+            .show(ui, |ui| {
+                let Some(scan) = snap.nal_scan.as_ref() else {
+                    ui.weak("Connect the original bitstream first.");
+                    return;
+                };
+                let Some(i) = self.selected_nal.filter(|&i| i < scan.units.len()) else {
+                    ui.weak("Select a NAL unit above to dump its bytes.");
+                    return;
+                };
+                let u = &scan.units[i];
+                let bytes = scan.unit_bytes(i);
+                ui.weak(format!(
+                    "#{} {} @ {:#x} · {} bytes (incl. {}-byte start code)",
+                    i,
+                    nal_type_name(scan.codec, u.nal_type),
+                    u.offset,
+                    bytes.len(),
+                    u.start_code_len,
+                ));
+                let pages = bytes.len().div_ceil(HEX_PAGE_BYTES).max(1);
+                if pages > 1 {
+                    ui.horizontal(|ui| {
+                        self.hex_page = self.hex_page.min(pages - 1);
+                        if ui.small_button("◀").clicked() && self.hex_page > 0 {
+                            self.hex_page -= 1;
+                        }
+                        ui.monospace(format!("page {}/{pages}", self.hex_page + 1));
+                        if ui.small_button("▶").clicked() && self.hex_page + 1 < pages {
+                            self.hex_page += 1;
+                        }
+                    });
+                } else {
+                    self.hex_page = 0;
+                }
+                let page_start = self.hex_page * HEX_PAGE_BYTES;
+                let page = &bytes[page_start.min(bytes.len())
+                    ..(page_start + HEX_PAGE_BYTES).min(bytes.len())];
+                let n_rows = page.len().div_ceil(HEX_COLS);
+                let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + 2.0;
+                egui::ScrollArea::vertical()
+                    .id_salt("bs_hex_dump")
+                    .max_height(220.0)
+                    .show_rows(ui, row_h, n_rows, |ui, range| {
+                        for r in range {
+                            let base = r * HEX_COLS;
+                            let chunk = &page[base..(base + HEX_COLS).min(page.len())];
+                            let mut hex = String::with_capacity(HEX_COLS * 3 + 1);
+                            let mut ascii = String::with_capacity(HEX_COLS);
+                            for (j, b) in chunk.iter().enumerate() {
+                                if j == 8 {
+                                    hex.push(' ');
+                                }
+                                hex.push_str(&format!("{b:02x} "));
+                                ascii.push(if (0x20..0x7f).contains(b) {
+                                    *b as char
+                                } else {
+                                    '.'
+                                });
+                            }
+                            // Absolute file offset column (start code base).
+                            let file_off = u.offset as usize + page_start + base;
+                            ui.monospace(format!("{file_off:08x}  {hex:<49} |{ascii}|"));
+                        }
+                    });
+                ui.weak(
+                    "block bit_offset is frame-local (decode domain) — no \
+                     byte-range highlight is derivable from it",
+                );
+            });
     }
 
     // -- Stats tab (M-B) --------------------------------------------------

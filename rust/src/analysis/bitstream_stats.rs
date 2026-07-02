@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use lru::LruCache;
 
-use crate::core::catb::{BsBlock, CabacRow, CatbFile, SyntaxRow};
+use crate::core::catb::{BsBlock, CabacRow, CatbFile, FrameAux, SyntaxRow};
 
 /// How many frames' block lists to keep parsed in memory.
 const BLOCK_CACHE_FRAMES: usize = 32;
@@ -62,6 +62,10 @@ pub struct BitstreamFile {
     pub height: u32,
     pub resolution_source: ResolutionSource,
     cache: Mutex<LruCache<usize, Arc<Vec<BsBlock>>>>,
+    /// 1-frame `frame_aux` LRU (M-E): loop-filter rows outnumber blocks
+    /// 12–15× (fixtures: 228–457 KB JSON per frame), so only the frame on
+    /// screen stays parsed.
+    aux_cache: Mutex<Option<(usize, Arc<FrameAux>)>>,
 }
 
 impl std::fmt::Debug for BitstreamFile {
@@ -92,6 +96,7 @@ impl BitstreamFile {
             cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(BLOCK_CACHE_FRAMES).expect("nonzero cache size"),
             )),
+            aux_cache: Mutex::new(None),
         })
     }
 
@@ -117,6 +122,23 @@ impl BitstreamFile {
             cache.put(decode_idx, Arc::clone(&blocks));
         }
         Ok(blocks)
+    }
+
+    /// Cached `frame_aux` (loop-filter / SAO rows) for a **decode-order**
+    /// frame index — lazy parse + 1-frame LRU (M-E).
+    pub fn frame_aux_decode(&self, decode_idx: usize) -> Result<Arc<FrameAux>, String> {
+        if let Ok(cache) = self.aux_cache.lock() {
+            if let Some((idx, aux)) = cache.as_ref() {
+                if *idx == decode_idx {
+                    return Ok(Arc::clone(aux));
+                }
+            }
+        }
+        let aux = Arc::new(self.catb.frame_aux_for_frame(decode_idx)?);
+        if let Ok(mut cache) = self.aux_cache.lock() {
+            *cache = Some((decode_idx, Arc::clone(&aux)));
+        }
+        Ok(aux)
     }
 
     /// Cached block list for a **display-order** frame index.

@@ -369,6 +369,59 @@ pub fn draw_tu_layer(painter: &egui::Painter, geom: &LayerGeom, tx: &[Vec<TxRow>
 }
 
 // ---------------------------------------------------------------------------
+// LF layer (M-E) — deblocking edge segments from frame_aux.loop_filters,
+// colour-coded by applied filter strength (VQA Loop Filter mode convention:
+// Green = strong, Yellow = weak, Red = evaluated but not applied).
+// ---------------------------------------------------------------------------
+
+/// Strong-filter edge (green).
+const LF_STRONG: egui::Color32 = egui::Color32::from_rgb(70, 220, 90);
+/// Weak-filter edge (yellow).
+const LF_WEAK: egui::Color32 = egui::Color32::from_rgb(235, 210, 60);
+/// Evaluated but not applied (red); BS = 0 edges render dimmer so the
+/// thresholded-out edges (the interesting "almost filtered" cases) stand
+/// out over the dominant BS-0 population (fixtures: ~64% of rows).
+const LF_NONE: egui::Color32 = egui::Color32::from_rgb(230, 70, 60);
+const LF_NONE_BS0: egui::Color32 = egui::Color32::from_rgba_premultiplied(115, 35, 30, 128);
+
+/// Draw one frame's deblocking-edge rows. Fixture rows are 1-px-thick edge
+/// segments (`w`=1 vertical / `h`=1 horizontal); each renders as a line
+/// along the block boundary it sits on. Skipped below [`LAYER_MIN_ZOOM`]
+/// (edge segments are sub-CU geometry).
+pub fn draw_lf_layer(
+    painter: &egui::Painter,
+    geom: &LayerGeom,
+    rows: &[crate::core::catb::LoopFilterRow],
+) {
+    if geom.zoom() < LAYER_MIN_ZOOM {
+        return;
+    }
+    for r in rows {
+        let color = match r.filter_strength.as_str() {
+            "strong" => LF_STRONG,
+            "weak" => LF_WEAK,
+            _ if r.boundary_strength == 0 => LF_NONE_BS0,
+            _ => LF_NONE,
+        };
+        let (a, b) = if r.vertical {
+            (
+                geom.pos(r.x as f32, r.y as f32),
+                geom.pos(r.x as f32, (r.y + r.h.max(1)) as f32),
+            )
+        } else {
+            (
+                geom.pos(r.x as f32, r.y as f32),
+                geom.pos((r.x + r.w.max(1)) as f32, r.y as f32),
+            )
+        };
+        if !egui::Rect::from_two_pos(a, b).intersects(geom.clip) {
+            continue;
+        }
+        painter.line_segment([a, b], egui::Stroke::new(1.5, color));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Intra layer — direction lines through (sub)block centres, P/DC badges.
 // ---------------------------------------------------------------------------
 

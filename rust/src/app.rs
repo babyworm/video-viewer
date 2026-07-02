@@ -246,6 +246,12 @@ pub struct VideoViewerApp {
     pub bitstream_offset_b: i32,
     /// Separate picker instance so a B pick can never land in the A slot.
     catb_dialog_b: Option<dialogs::CatbFileDialog>,
+    /// M-E: "Locate bitstream…" picker (Structure tab NAL browser).
+    locate_bitstream_dialog: Option<dialogs::LocateBitstreamDialog>,
+    /// M-E: NAL scan job counter (publish-if-current guard for the
+    /// background scan thread — path equality is not enough when the same
+    /// file is re-located twice).
+    nal_scan_job: Arc<AtomicUsize>,
     /// Correlation range-scan job guard (scene-detect job_id pattern).
     corr_scan_job_id: usize,
     corr_scan_active_job: Arc<AtomicUsize>,
@@ -410,6 +416,8 @@ impl VideoViewerApp {
             bitstream_error_b: None,
             bitstream_offset_b: 0,
             catb_dialog_b: None,
+            locate_bitstream_dialog: None,
+            nal_scan_job: Arc::new(AtomicUsize::new(0)),
             startup_catb: catb,
             startup_catb_window: catb_window,
             bs_window_open_delay: 0,
@@ -1524,6 +1532,17 @@ impl VideoViewerApp {
             s.corr_scanning = false;
             s.corr_scan_progress = (0, 0);
             s.corr_hover_cell = None;
+            // M-E: NAL state belongs to the previous file's source.
+            s.bitstream_source = None;
+            s.nal_scan = None;
+            s.nal_scanning = false;
+            s.nal_error = None;
+            s.locate_bitstream_request = false;
+        }
+        // M-E: auto-connect the original bitstream — decoder-run workdir
+        // convention (<name>.catb-run/) first, same-stem sibling second.
+        if let Some(src) = crate::core::nal::infer_bitstream_source(std::path::Path::new(path)) {
+            self.set_bitstream_source(ctx, src);
         }
         // Background per-frame bits / avg-QP scan for the Frame Graph tab.
         let shared = Arc::clone(&self.bitstream_window.shared);
@@ -1583,7 +1602,48 @@ impl VideoViewerApp {
         s.corr_scanning = false;
         s.corr_scan_progress = (0, 0);
         s.corr_hover_cell = None;
+        // M-E: drop the NAL browser state with the file (reset convention).
+        s.bitstream_source = None;
+        s.nal_scan = None;
+        s.nal_scanning = false;
+        s.nal_error = None;
+        s.locate_bitstream_request = false;
+        drop(s);
+        self.nal_scan_job.fetch_add(1, Ordering::Release);
         self.corr_scan_active_job.store(0, Ordering::Release);
+    }
+
+    /// M-E: connect an original Annex-B bitstream to the loaded `.catb` and
+    /// scan its NAL units on a background thread (frame-graph job pattern:
+    /// job-id guard + publish-if-current).
+    pub fn set_bitstream_source(&mut self, ctx: &egui::Context, path: std::path::PathBuf) {
+        let job = self.nal_scan_job.fetch_add(1, Ordering::AcqRel) + 1;
+        {
+            let mut s = self.bitstream_window.shared.lock();
+            s.bitstream_source = Some(path.clone());
+            s.nal_scan = None;
+            s.nal_scanning = true;
+            s.nal_error = None;
+        }
+        let shared = Arc::clone(&self.bitstream_window.shared);
+        let job_guard = Arc::clone(&self.nal_scan_job);
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let result = crate::core::nal::NalScan::open(&path);
+            let mut s = shared.lock();
+            // Discard stale results (file replaced / source re-located).
+            if job_guard.load(Ordering::Acquire) != job {
+                return;
+            }
+            s.nal_scanning = false;
+            match result {
+                Ok(scan) => s.nal_scan = Some(Arc::new(scan)),
+                Err(e) => s.nal_error = Some(e),
+            }
+            drop(s);
+            ctx2.request_repaint();
+            ctx2.request_repaint_of(egui::ViewportId::from_hash_of("bitstream_viewport"));
+        });
     }
 
     /// M-D: load the comparison `.catb` (B). Requires A (the Δ pair is
@@ -3553,15 +3613,28 @@ impl eframe::App for VideoViewerApp {
         // Poll requests written by the window (one-way pull model: the child
         // never seeks by itself).
         {
-            let (seek, toggle_play, offset_req, drop_req) = {
+            let (seek, toggle_play, offset_req, drop_req, locate_req) = {
                 let mut s = self.bitstream_window.shared.lock();
                 (
                     s.seek_request.take(),
                     std::mem::take(&mut s.toggle_play_request),
                     s.offset_request.take(),
                     s.drop_request.take(),
+                    std::mem::take(&mut s.locate_bitstream_request),
                 )
             };
+            // M-E: Structure tab "Locate bitstream…" — root-owned dialog
+            // (drop_request pattern: the child only parks the request).
+            if locate_req && self.dialog_state == DialogState::None {
+                let initial_dir = self
+                    .bitstream_path
+                    .as_ref()
+                    .and_then(|p| std::path::Path::new(p).parent())
+                    .map(|p| p.to_string_lossy().into_owned());
+                self.locate_bitstream_dialog =
+                    Some(dialogs::LocateBitstreamDialog::new(initial_dir.as_deref()));
+                self.dialog_state = DialogState::LocateBitstream;
+            }
             // 0.15.0: file dropped on the analysis window — the child only
             // classified and parked it; routing is root-owned and identical
             // to a main-window drop (Other = load as current video).
@@ -4080,6 +4153,25 @@ impl VideoViewerApp {
                     }
                     self.dialog_state = DialogState::None;
                     self.catb_dialog_b = None;
+                }
+            }
+        }
+
+        // M-E: locate the original bitstream for the NAL browser.
+        if self.dialog_state == DialogState::LocateBitstream {
+            if let Some(ref mut dlg) = self.locate_bitstream_dialog {
+                if let Some(result) = dlg.show(ctx) {
+                    if let Some(path) = result {
+                        let p = std::path::PathBuf::from(&path);
+                        if p.is_file() {
+                            self.set_bitstream_source(ctx, p);
+                        } else {
+                            self.bitstream_window.shared.lock().nal_error =
+                                Some(format!("Not a file: {path}"));
+                        }
+                    }
+                    self.dialog_state = DialogState::None;
+                    self.locate_bitstream_dialog = None;
                 }
             }
         }
