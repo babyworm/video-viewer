@@ -484,7 +484,10 @@ impl VideoViewerApp {
                 let start_frame = reader.initial_frame();
                 self.current_frame_idx = 0;
                 self.bookmarks.clear();
-                if let Some(fps) = reader.y4m_fps() {
+                if let Some(fps) = reader
+                    .y4m_fps()
+                    .or_else(|| crate::core::hints::parse_filename_hints(&path).fps)
+                {
                     let fps_u32 = fps.round() as u32;
                     use crate::ui::navigation::FPS_OPTIONS;
                     if let Some(idx) = FPS_OPTIONS.iter().position(|&f| f == fps_u32) {
@@ -2369,13 +2372,22 @@ impl eframe::App for VideoViewerApp {
 
         // --- Auto-open from CLI args ---
         if let Some(path) = self.startup_input.take() {
-            let w = self.startup_width.unwrap_or(self.settings.defaults.width);
-            let h = self.startup_height.unwrap_or(self.settings.defaults.height);
-            let fmt = self
-                .startup_format
-                .clone()
-                .unwrap_or_else(|| self.settings.defaults.format.clone());
+            let (detected_w, detected_h, detected_fmt, info) = self.resolve_raw_open_params(&path);
+            let w = self.startup_width.unwrap_or(detected_w);
+            let h = self.startup_height.unwrap_or(detected_h);
+            let detected_fmt = if self.startup_format.is_none()
+                && (self.startup_width.is_some() || self.startup_height.is_some())
+                && !detected_fmt.is_empty()
+            {
+                crate::core::hints::resolve_raw_params_for_dimensions(&path, w, h).format
+            } else {
+                detected_fmt
+            };
+            let fmt = self.startup_format.clone().unwrap_or(detected_fmt);
             self.open_file(ctx, path, w, h, &fmt);
+            if self.startup_width.is_none() && self.startup_height.is_none() {
+                self.status_info = info;
+            }
         }
 
         // --- Auto-load bitstream telemetry from CLI (--catb) ---
@@ -3320,12 +3332,15 @@ impl eframe::App for VideoViewerApp {
             });
         });
 
-        // Handle status bar resolution click → open Guess Size dialog
-        // (was Parameters in v0.6.x; user prefers exploratory guess flow there.
-        // Manual entry is still available via Tools → Video Parameters and
-        // View → Video Size → Custom Size…)
         if status_params_clicked {
-            self.open_guess_size_dialog();
+            if let Some(ref reader) = self.reader {
+                self.params_dialog = Some(dialogs::ParametersDialog::new(
+                    reader.width(),
+                    reader.height(),
+                    reader.format_name(),
+                ));
+                self.dialog_state = DialogState::Parameters;
+            }
         }
         self.show_zoom_dialog(ctx);
 

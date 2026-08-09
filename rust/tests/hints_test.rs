@@ -1,14 +1,55 @@
 use video_viewer::core::hints::{
     guess_all_resolutions_no_hint, guess_resolution_from_size,
     guess_resolutions_with_frame_count, parse_filename_hints, resolve_raw_params,
-    NAMED_RESOLUTIONS,
+    resolve_raw_params_for_dimensions, NAMED_RESOLUTIONS,
 };
+use video_viewer::ui::dialogs::{OpenFileDialog, ParametersDialog};
+use video_viewer::ui::navigation::FPS_OPTIONS;
 
 #[test]
 fn test_resolution_wxh() {
     let hints = parse_filename_hints("test_1920x1080_nv12.yuv");
     assert_eq!(hints.width, Some(1920));
     assert_eq!(hints.height, Some(1080));
+}
+
+#[test]
+fn test_jv_ctc_filename_hints() {
+    let cases = [
+        ("B_BasketballDrive_1920x1080_50.yuv", 1920, 1080, 50),
+        ("B_BQTerrace_1920x1080_60.yuv", 1920, 1080, 60),
+        ("B_Cactus_1920x1080_50.yuv", 1920, 1080, 50),
+        ("B_Kimono_1920x1080_24.yuv", 1920, 1080, 24),
+        ("B_ParkScene_1920x1080_24.yuv", 1920, 1080, 24),
+        ("C_BasketballDrill_832x480_50.yuv", 832, 480, 50),
+        ("C_BQMall_832x480_60.yuv", 832, 480, 60),
+        ("C_PartyScene_832x480_50.yuv", 832, 480, 50),
+        ("C_RaceHorses_832x480_30.yuv", 832, 480, 30),
+        ("D_BasketballPass_416x240_50.yuv", 416, 240, 50),
+        ("D_BlowingBubbles_416x240_50.yuv", 416, 240, 50),
+        ("D_BQSquare_416x240_60.yuv", 416, 240, 60),
+        ("D_RaceHorses_416x240_30.yuv", 416, 240, 30),
+        ("E_FourPeople_1280x720_60.yuv", 1280, 720, 60),
+        ("E_Johnny_1280x720_60.yuv", 1280, 720, 60),
+        ("E_KristenAndSara_1280x720_60.yuv", 1280, 720, 60),
+    ];
+
+    for (filename, width, height, fps) in cases {
+        let hints = parse_filename_hints(filename);
+        assert_eq!(
+            (hints.width, hints.height),
+            (Some(width), Some(height)),
+            "{filename}"
+        );
+        assert_eq!(hints.fps, Some(fps as f64), "{filename}");
+    }
+}
+
+#[test]
+fn test_playback_fps_options_cover_jv_ctc() {
+    for fps in [24, 30, 50, 60] {
+        assert!(FPS_OPTIONS.contains(&fps), "missing {fps} FPS option");
+    }
 }
 
 #[test]
@@ -403,4 +444,158 @@ fn test_resolve_with_fourcc_and_file_size_guess() {
     assert_eq!(r.height, 1080);
     assert_eq!(r.format, "NV12"); // 4CC from filename wins
     assert!(r.info.is_some());
+}
+
+fn write_yuv420_probe(prefix: &str, nv12: bool, neutral: bool) -> tempfile::NamedTempFile {
+    use std::io::Write;
+
+    const WIDTH: usize = 16;
+    const HEIGHT: usize = 16;
+    const CHROMA_WIDTH: usize = WIDTH / 2;
+    const CHROMA_HEIGHT: usize = HEIGHT / 2;
+
+    let y = vec![80_u8; WIDTH * HEIGHT];
+    let (u, v) = if neutral {
+        (
+            vec![128_u8; CHROMA_WIDTH * CHROMA_HEIGHT],
+            vec![128_u8; CHROMA_WIDTH * CHROMA_HEIGHT],
+        )
+    } else {
+        let u = (0..CHROMA_HEIGHT)
+            .flat_map(|row| (0..CHROMA_WIDTH).map(move |col| 40 + col as u8 + 2 * row as u8))
+            .collect();
+        let v = (0..CHROMA_HEIGHT)
+            .flat_map(|row| (0..CHROMA_WIDTH).map(move |col| 210 - 2 * col as u8 - row as u8))
+            .collect();
+        (u, v)
+    };
+
+    let mut raw = y;
+    if nv12 {
+        for (&u_sample, &v_sample) in u.iter().zip(&v) {
+            raw.push(u_sample);
+            raw.push(v_sample);
+        }
+    } else {
+        raw.extend_from_slice(&u);
+        raw.extend_from_slice(&v);
+    }
+
+    let mut file = tempfile::Builder::new()
+        .prefix(prefix)
+        .suffix(".yuv")
+        .tempfile()
+        .unwrap();
+    file.write_all(&raw).unwrap();
+    file
+}
+
+#[test]
+fn test_resolve_content_distinguishes_i420_from_nv12() {
+    let i420 = write_yuv420_probe("sample_16x16_", false, false);
+    let nv12 = write_yuv420_probe("sample_16x16_", true, false);
+
+    let i420_result = resolve_raw_params(
+        i420.path().to_str().unwrap(),
+        Some(i420.as_file().metadata().unwrap().len()),
+        640,
+        480,
+        "NV12",
+    );
+    let nv12_result = resolve_raw_params(
+        nv12.path().to_str().unwrap(),
+        Some(nv12.as_file().metadata().unwrap().len()),
+        640,
+        480,
+        "I420",
+    );
+
+    assert_eq!(i420_result.format, "I420");
+    assert_eq!(nv12_result.format, "NV12");
+}
+
+#[test]
+fn test_explicit_dimensions_drive_content_format_guess() {
+    let nv12 = write_yuv420_probe("sample_", true, false);
+
+    let result = resolve_raw_params_for_dimensions(nv12.path().to_str().unwrap(), 16, 16);
+
+    assert_eq!((result.width, result.height), (16, 16));
+    assert_eq!(result.format, "NV12");
+}
+
+#[test]
+fn test_resolve_ambiguous_content_falls_back_to_i420() {
+    let neutral = write_yuv420_probe("sample_16x16_", false, true);
+    let result = resolve_raw_params(
+        neutral.path().to_str().unwrap(),
+        Some(neutral.as_file().metadata().unwrap().len()),
+        640,
+        480,
+        "NV12",
+    );
+
+    assert_eq!(result.format, "I420");
+}
+
+#[test]
+fn test_resolve_fourcc_wins_over_content_guess() {
+    let i420 = write_yuv420_probe("sample_NV12_16x16_", false, false);
+    let result = resolve_raw_params(
+        i420.path().to_str().unwrap(),
+        Some(i420.as_file().metadata().unwrap().len()),
+        640,
+        480,
+        "I420",
+    );
+
+    assert_eq!(result.format, "NV12");
+}
+
+#[test]
+fn test_dialogs_resolve_short_i420_name_to_the_i420_entry() {
+    let parameters = ParametersDialog::new(16, 16, "I420");
+    let open_file = OpenFileDialog::new(16, 16, "I420", None);
+
+    assert_eq!(
+        parameters.format_names[parameters.format_idx],
+        "I420 (4:2:0)"
+    );
+    assert_eq!(open_file.format_names[open_file.format_idx], "I420 (4:2:0)");
+}
+
+#[test]
+fn test_unrenderable_fourcc_is_not_auto_applied_or_offered_for_viewing() {
+    let hints = parse_filename_hints("sample_RGBP_16x16.yuv");
+    let rgb565 = write_yuv420_probe("sample_RGBP_16x16_", true, false);
+    let mixed = write_yuv420_probe("sample_RGBP_NV12_16x16_", false, false);
+    let resolved = resolve_raw_params(
+        rgb565.path().to_str().unwrap(),
+        Some(rgb565.as_file().metadata().unwrap().len()),
+        640,
+        480,
+        "NV12",
+    );
+    let mixed_resolved = resolve_raw_params(
+        mixed.path().to_str().unwrap(),
+        Some(mixed.as_file().metadata().unwrap().len()),
+        640,
+        480,
+        "I420",
+    );
+    let parameters = ParametersDialog::new(16, 16, "I420");
+
+    assert_eq!(hints.format, None);
+    assert_eq!(resolved.format, "I420");
+    assert!(resolved.info.unwrap().contains("RGBP"));
+    assert_eq!(mixed_resolved.format, "NV12");
+    assert_eq!(mixed_resolved.info, None);
+    assert!(!parameters
+        .format_names
+        .iter()
+        .any(|name| name.starts_with("RGB565")));
+    assert_eq!(
+        parameters.format_names[parameters.format_idx],
+        "I420 (4:2:0)"
+    );
 }

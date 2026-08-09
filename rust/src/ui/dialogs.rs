@@ -1,6 +1,21 @@
+use crate::core::formats::{get_all_formats, get_format_by_name};
 use eframe::egui;
-use crate::core::formats::get_all_formats;
 use std::path::{Path, PathBuf};
+
+fn format_index(format_names: &[String], key: &str) -> usize {
+    let canonical = get_format_by_name(key)
+        .map(|format| format.name.as_str())
+        .unwrap_or(key);
+    format_names
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case(canonical))
+        .or_else(|| {
+            format_names
+                .iter()
+                .position(|name| name.starts_with("I420 "))
+        })
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum DialogState {
@@ -42,12 +57,10 @@ impl ParametersDialog {
     pub fn new(width: u32, height: u32, current_format: &str) -> Self {
         let format_names: Vec<String> = get_all_formats()
             .iter()
+            .filter(|format| format.is_viewable())
             .map(|f| f.name.clone())
             .collect();
-        let format_idx = format_names
-            .iter()
-            .position(|n| n.eq_ignore_ascii_case(current_format))
-            .unwrap_or(0);
+        let format_idx = format_index(&format_names, current_format);
         Self {
             width,
             height,
@@ -1340,12 +1353,10 @@ impl OpenFileDialog {
     pub fn new(default_width: u32, default_height: u32, default_format: &str, initial_dir: Option<&str>) -> Self {
         let format_names: Vec<String> = get_all_formats()
             .iter()
+            .filter(|format| format.is_viewable())
             .map(|f| f.name.clone())
             .collect();
-        let format_idx = format_names
-            .iter()
-            .position(|n| n.eq_ignore_ascii_case(default_format))
-            .unwrap_or(0);
+        let format_idx = format_index(&format_names, default_format);
         let initial_dir = initial_dir
             .map(PathBuf::from)
             .filter(|p| p.is_dir())
@@ -1412,20 +1423,18 @@ impl OpenFileDialog {
                     .to_lowercase();
                 self.is_auto_detect = crate::core::reader::is_auto_detect_ext(&ext);
 
-                // Auto-fill from filename hints when path changes
                 if !self.is_auto_detect && self.path != self.last_hinted_path && !self.path.is_empty() {
-                    let hints = crate::core::hints::parse_filename_hints(&self.path);
-                    if let Some(w) = hints.width {
-                        self.width = w;
-                    }
-                    if let Some(h) = hints.height {
-                        self.height = h;
-                    }
-                    if let Some(ref fmt) = hints.format {
-                        if let Some(idx) = self.format_names.iter().position(|n| n.eq_ignore_ascii_case(fmt)) {
-                            self.format_idx = idx;
-                        }
-                    }
+                    let file_size = std::fs::metadata(&self.path).ok().map(|metadata| metadata.len());
+                    let resolved = crate::core::hints::resolve_raw_params(
+                        &self.path,
+                        file_size,
+                        self.width,
+                        self.height,
+                        "I420",
+                    );
+                    self.width = resolved.width;
+                    self.height = resolved.height;
+                    self.format_idx = format_index(&self.format_names, &resolved.format);
                     self.last_hinted_path = self.path.clone();
                 }
 

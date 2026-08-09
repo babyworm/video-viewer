@@ -8,6 +8,7 @@ pub struct FilenameHints {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub format: Option<String>,
+    pub unviewable_format: Option<String>,
     pub fps: Option<f64>,
     pub bit_depth: Option<u32>,
 }
@@ -244,56 +245,134 @@ pub struct ResolvedParams {
     pub info: Option<String>,
 }
 
+fn plane_variation(data: &[u8], width: usize, height: usize, offset: usize, stride: usize) -> u64 {
+    let sample = |idx: usize| data[offset + idx * stride];
+    let mut total = 0_u64;
+    for row in 0..height {
+        for col in 1..width {
+            total += sample(row * width + col).abs_diff(sample(row * width + col - 1)) as u64;
+        }
+    }
+    for row in 1..height {
+        for col in 0..width {
+            total += sample(row * width + col).abs_diff(sample((row - 1) * width + col)) as u64;
+        }
+    }
+    total
+}
+
+fn guess_yuv420_format_from_file(path: &str, width: u32, height: u32) -> Option<&'static str> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+        return None;
+    }
+    let y_size = (width as usize).checked_mul(height as usize)?;
+    let chroma_plane_size = y_size / 4;
+    let mut chroma = vec![0_u8; chroma_plane_size.checked_mul(2)?];
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(y_size as u64)).ok()?;
+    file.read_exact(&mut chroma).ok()?;
+
+    let chroma_width = width as usize / 2;
+    let chroma_height = height as usize / 2;
+    let i420_score = plane_variation(&chroma, chroma_width, chroma_height, 0, 1)
+        + plane_variation(&chroma, chroma_width, chroma_height, chroma_plane_size, 1);
+    let nv12_score = plane_variation(&chroma, chroma_width, chroma_height, 0, 2)
+        + plane_variation(&chroma, chroma_width, chroma_height, 1, 2);
+
+    const CONFIDENCE_RATIO: u64 = 80;
+    if i420_score < nv12_score
+        && i420_score.saturating_mul(100) <= nv12_score.saturating_mul(CONFIDENCE_RATIO)
+    {
+        Some("I420")
+    } else if nv12_score < i420_score
+        && nv12_score.saturating_mul(100) <= i420_score.saturating_mul(CONFIDENCE_RATIO)
+    {
+        Some("NV12")
+    } else {
+        None
+    }
+}
+
+/// Resolve the format for caller-supplied dimensions without replacing them
+/// with filename or file-size guesses.
+pub fn resolve_raw_params_for_dimensions(
+    path: &str,
+    width: u32,
+    height: u32,
+) -> ResolvedParams {
+    let hints = parse_filename_hints(path);
+    let content_format = (hints.format.is_none() && hints.unviewable_format.is_none())
+        .then(|| guess_yuv420_format_from_file(path, width, height))
+        .flatten();
+    let info = if hints.format.is_some() {
+        None
+    } else {
+        hints
+            .unviewable_format
+            .as_deref()
+            .map(|fourcc| format!("Filename format {fourcc} is not viewable; using I420"))
+            .or_else(|| {
+                content_format
+                    .map(|guessed| format!("Content guess: {guessed} from chroma continuity"))
+            })
+    };
+    let format = hints
+        .format
+        .unwrap_or_else(|| content_format.unwrap_or("I420").to_string());
+
+    ResolvedParams {
+        width,
+        height,
+        format,
+        info,
+    }
+}
+
 /// Decide the (width, height, format) to open a raw file with, using this priority:
-///   1. Filename hints supply both width and height → use them (format from hint or default).
-///   2. File-size guess succeeds → use it, attach an info message.
-///   3. Defaults.
+///   1. Resolve size from filename, file size, or configured dimensions.
+///   2. Resolve format from a viewable filename FourCC, a confident I420/NV12 content
+///      guess, or I420. A recognized but unviewable FourCC skips content guessing.
 pub fn resolve_raw_params(
     path: &str,
     file_size: Option<u64>,
     default_width: u32,
     default_height: u32,
-    default_format: &str,
+    _default_format: &str,
 ) -> ResolvedParams {
     let hints = parse_filename_hints(path);
 
-    // 1. Filename hints win when they specify the resolution.
-    if let (Some(w), Some(h)) = (hints.width, hints.height) {
-        return ResolvedParams {
-            width: w,
-            height: h,
-            format: hints.format.unwrap_or_else(|| default_format.to_string()),
-            info: None,
-        };
-    }
+    let (width, height, mut info) = if let (Some(w), Some(h)) = (hints.width, hints.height) {
+        (w, h, None)
+    } else if let Some(g) = file_size.and_then(guess_resolution_from_size) {
+        (
+            g.width,
+            g.height,
+            Some(format!(
+                "File-size guess: {}×{} ({} frames) — verify via Tools → Video Parameters",
+                g.width, g.height, g.num_frames
+            )),
+        )
+    } else {
+        (default_width, default_height, None)
+    };
 
-    // 2. Try file-size guess.
-    if let Some(sz) = file_size {
-        if let Some(g) = guess_resolution_from_size(sz) {
-            // Preserve filename format hint if present; otherwise use the guess's format.
-            let format = hints
-                .format
-                .clone()
-                .unwrap_or_else(|| g.format.to_string());
-            let info = Some(format!(
-                "File-size guess: {}×{} {} ({} frames) — verify via Tools → Video Parameters",
-                g.width, g.height, g.format, g.num_frames
-            ));
-            return ResolvedParams {
-                width: g.width,
-                height: g.height,
-                format,
-                info,
-            };
+    let resolved_format = resolve_raw_params_for_dimensions(path, width, height);
+    if let Some(message) = resolved_format.info {
+        if let Some(existing) = info.as_mut() {
+            existing.push_str("; ");
+            existing.push_str(&message);
+        } else {
+            info = Some(message);
         }
     }
 
-    // 3. Defaults (format may still come from filename hint).
     ResolvedParams {
-        width: default_width,
-        height: default_height,
-        format: hints.format.unwrap_or_else(|| default_format.to_string()),
-        info: None,
+        width,
+        height,
+        format: resolved_format.format,
+        info,
     }
 }
 
@@ -481,13 +560,16 @@ pub fn parse_filename_hints(filename: &str) -> FilenameHints {
             break;
         }
         if let Some(&fmt) = aliases.get(*token) {
-            hints.format = Some(fmt.to_string());
-            format_set = true;
-            continue;
+            if let Some(format) = crate::core::formats::get_format_by_name(fmt) {
+                if format.is_viewable() {
+                    hints.format = Some(fmt.to_string());
+                    format_set = true;
+                } else {
+                    hints.unviewable_format = Some(format.fourcc.clone());
+                }
+                continue;
+            }
         }
-        // NEW: Support raw V4L2 FourCC codes in filenames (e.g. YV12, NV12, YUYV, P010, RGGB, pRAA, ...)
-        // We deliberately use get_format_by_fourcc (exact fourcc match) to avoid matching
-        // human-readable names (e.g. "Greyscale (10-bit BE packed)").
         let fourcc_candidates = [
             token.to_string(),
             token.to_uppercase(),
@@ -495,8 +577,12 @@ pub fn parse_filename_hints(filename: &str) -> FilenameHints {
         ];
         for cand in &fourcc_candidates {
             if let Some(fmt) = crate::core::formats::get_format_by_fourcc(cand) {
-                hints.format = Some(fmt.fourcc.clone());
-                format_set = true;
+                if fmt.is_viewable() {
+                    hints.format = Some(fmt.fourcc.clone());
+                    format_set = true;
+                } else {
+                    hints.unviewable_format = Some(fmt.fourcc.clone());
+                }
                 break;
             }
         }

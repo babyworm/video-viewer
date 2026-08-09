@@ -26,6 +26,35 @@ pub struct VideoFormat {
 }
 
 impl VideoFormat {
+    pub(crate) fn is_viewable(&self) -> bool {
+        match self.format_type {
+            FormatType::YuvPlanar => matches!(
+                self.fourcc.as_str(),
+                "YU12"
+                    | "YV12"
+                    | "0T20"
+                    | "2T22"
+                    | "4T44"
+                    | "0C20"
+                    | "2C22"
+                    | "4C44"
+                    | "422P"
+                    | "444P"
+            ),
+            FormatType::YuvSemiPlanar => matches!(
+                self.fourcc.as_str(),
+                "NV12" | "NV21" | "P010" | "P012" | "P016" | "P210" | "T010" | "NV15" | "NV20"
+            ),
+            FormatType::YuvPacked => matches!(
+                self.fourcc.as_str(),
+                "YUYV" | "UYVY" | "Y210" | "Y212" | "Y216"
+            ),
+            FormatType::Rgb => matches!(self.fourcc.as_str(), "RGB3" | "BGR3"),
+            FormatType::Bayer | FormatType::Grey => true,
+            FormatType::Compressed => false,
+        }
+    }
+
     pub fn frame_size(&self, width: u32, height: u32) -> usize {
         let w = width as usize;
         let h = height as usize;

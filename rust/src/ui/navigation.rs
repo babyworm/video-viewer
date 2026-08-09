@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use eframe::egui;
 
-pub const FPS_OPTIONS: [u32; 8] = [1, 5, 10, 15, 24, 25, 30, 60];
+pub const FPS_OPTIONS: [u32; 9] = [1, 5, 10, 15, 24, 25, 30, 50, 60];
 
 #[derive(Debug, Clone)]
 pub enum NavigationAction {
