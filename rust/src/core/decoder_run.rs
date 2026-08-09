@@ -708,7 +708,7 @@ mod tests {
         let new = dir.path().join("new.catb");
         std::fs::write(&old, b"x").unwrap();
         let past = std::time::SystemTime::now() - Duration::from_secs(3600);
-        std::fs::File::open(&old).unwrap().set_modified(past).unwrap();
+        std::fs::File::options().write(true).open(&old).unwrap().set_modified(past).unwrap();
         std::fs::write(&new, b"y").unwrap();
         assert_eq!(resolve_telemetry(&expected), Some(new));
     }
