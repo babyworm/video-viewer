@@ -141,8 +141,8 @@ pub fn draw_part_layer(
     blocks: &[BsBlock],
     refs: &[Vec<BsRef>],
 ) {
-    let cu_stroke = egui::Stroke::new(1.0, CU_OUTLINE);
-    let pu_stroke = egui::Stroke::new(1.0, PU_OUTLINE);
+    let cu_stroke = egui::Stroke::new(1.0_f32, CU_OUTLINE);
+    let pu_stroke = egui::Stroke::new(1.0_f32, PU_OUTLINE);
     for (i, b) in blocks.iter().enumerate() {
         let rect = geom.rect(b.x as f32, b.y as f32, b.w as f32, b.h as f32);
         // Cull off-screen and sub-3px rects (outline mush at far zoom-out).
@@ -211,7 +211,7 @@ fn draw_arrow(
         mv.0 as f32 / 4.0 * geom.zx,
         mv.1 as f32 / 4.0 * geom.zy,
     );
-    let stroke = egui::Stroke::new(1.5, color);
+    let stroke = egui::Stroke::new(1.5_f32, color);
     if d.length() < 1.0 {
         // Zero / sub-pixel motion: a dot instead of an invisible arrow.
         painter.circle_filled(start, 1.5, color);
@@ -309,7 +309,7 @@ pub fn tu_stroke(depth: i32) -> egui::Stroke {
         (TU_OUTLINE.g() as f32 * scale) as u8,
         (TU_OUTLINE.b() as f32 * scale) as u8,
     );
-    egui::Stroke::new(1.0, c)
+    egui::Stroke::new(1.0_f32, c)
 }
 
 /// True when the resolved TX type label denotes a transform-skip TU.
@@ -417,7 +417,7 @@ pub fn draw_lf_layer(
         if !egui::Rect::from_two_pos(a, b).intersects(geom.clip) {
             continue;
         }
-        painter.line_segment([a, b], egui::Stroke::new(1.5, color));
+        painter.line_segment([a, b], egui::Stroke::new(1.5_f32, color));
     }
 }
 
@@ -439,7 +439,7 @@ pub fn draw_intra_layer(
     if geom.zoom() < LAYER_MIN_ZOOM {
         return;
     }
-    let stroke = egui::Stroke::new(1.5, INTRA_LINE);
+    let stroke = egui::Stroke::new(1.5_f32, INTRA_LINE);
     let badges = geom.zoom() >= 2.0;
     for (i, b) in blocks.iter().enumerate() {
         let Some(dirs) = intra.get(i).filter(|d| !d.is_empty()) else {
@@ -661,7 +661,7 @@ pub fn draw_bitstream_overlay(p: &BitstreamOverlayParams, cache: &mut OverlayCac
     // Grid layer: CTU / 4-MB boundaries (window canvas rule).
     if p.view.grid {
         let step = lod_cell_size(&p.file.catb.meta.codec) as f32;
-        let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(0, 220, 0, 130));
+        let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(0, 220, 0, 130));
         let mut x = step;
         while x < sw as f32 {
             let sx = geom.origin.x + x * geom.zx;

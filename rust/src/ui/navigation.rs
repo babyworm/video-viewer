@@ -62,7 +62,7 @@ impl NavigationBar {
                     + (frame_idx as f32 / max_frame as f32) * slider_rect.width();
                 painter.line_segment(
                     [egui::pos2(x, slider_rect.top()), egui::pos2(x, slider_rect.bottom())],
-                    egui::Stroke::new(2.0, egui::Color32::RED),
+                    egui::Stroke::new(2.0_f32, egui::Color32::RED),
                 );
             }
             for &frame_idx in bookmarks {
@@ -70,7 +70,7 @@ impl NavigationBar {
                     + (frame_idx as f32 / max_frame as f32) * slider_rect.width();
                 painter.line_segment(
                     [egui::pos2(x, slider_rect.top()), egui::pos2(x, slider_rect.bottom())],
-                    egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 200, 200)),
+                    egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(0, 200, 200)),
                 );
             }
         }

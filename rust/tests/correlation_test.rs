@@ -6,7 +6,7 @@
 //! r > 0.8. V20: CSV row count, valid=false flags, and r re-computed from
 //! the CSV must match the readout.
 
-use std::path::PathBuf;
+use std::{io::Write, path::PathBuf};
 
 use video_viewer::analysis::bitstream_stats::{rasterize_blocks, BitstreamFile};
 use video_viewer::analysis::correlation::{
@@ -337,8 +337,12 @@ fn fixture_dir() -> PathBuf {
 fn test_real_fixture_end_to_end_smoke() {
     let dir = fixture_dir();
     let file = BitstreamFile::open(dir.join("hevc_bslice.catb")).expect("open fixture catb");
+    let mut yuv = tempfile::NamedTempFile::new().expect("create fixture yuv");
+    let mut frame: Vec<u8> = (0u8..64).map(|x| x * 4).cycle().take(64 * 64).collect();
+    frame.resize(64 * 64 * 3 / 2, 128);
+    yuv.write_all(&frame).expect("write fixture yuv");
     let mut reader = video_viewer::core::reader::VideoReader::open(
-        dir.join("hevc_bslice_64x64_i420.yuv").to_str().unwrap(),
+        yuv.path().to_str().expect("fixture yuv path"),
         64,
         64,
         "I420",

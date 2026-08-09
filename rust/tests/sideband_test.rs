@@ -282,7 +282,7 @@ fn test_ctu_display() {
     write_ctu_params(&mut buf, 30, 10, 5, 0, 0, 0, 15, 0, -2, 0, 0, 256, 128, 0, 0);
 
     let sb = SidebandFile::from_bytes(&buf).unwrap();
-    let display = format!("{}", &sb.frame(0).unwrap().ctus[0]);
+    let display = format!("{}", sb.frame(0).unwrap().ctus[0]);
     assert!(display.contains("act=30"), "got: {}", display);
     assert!(display.contains("qp_delta=-2"), "got: {}", display);
 }

@@ -300,7 +300,7 @@ impl Sidebar {
                             let x = rect.min.x + (c as f32 + 1.0) * cell_w + (c as f32 + 0.5) * spacing_x;
                             painter.line_segment(
                                 [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
-                                egui::Stroke::new(2.0, color),
+                                egui::Stroke::new(2.0_f32, color),
                             );
                         }
                     }
@@ -316,7 +316,7 @@ impl Sidebar {
                             let y = rect.min.y + (r as f32 + 1.0) * cell_h + (r as f32 + 0.5) * spacing_y;
                             painter.line_segment(
                                 [egui::pos2(rect.min.x, y), egui::pos2(rect.max.x, y)],
-                                egui::Stroke::new(2.0, color),
+                                egui::Stroke::new(2.0_f32, color),
                             );
                         }
                     }
@@ -733,20 +733,20 @@ impl Sidebar {
                 for line_pts in &boundary_lines {
                     let line = Line::new(PlotPoints::new(line_pts.to_vec()))
                         .color(dash_color)
-                        .width(1.0)
+                        .width(1.0_f32)
                         .style(egui_plot::LineStyle::dashed_dense());
                     plot_ui.line(line);
                 }
                 // Cross axes through center
                 let axis_color = egui::Color32::from_rgb(60, 60, 60);
                 plot_ui.line(Line::new(PlotPoints::new(vec![[-128.0, 0.0], [128.0, 0.0]]))
-                    .color(axis_color).width(0.5));
+                    .color(axis_color).width(0.5_f32));
                 plot_ui.line(Line::new(PlotPoints::new(vec![[0.0, -128.0], [0.0, 128.0]]))
-                    .color(axis_color).width(0.5));
+                    .color(axis_color).width(0.5_f32));
 
                 // Data points
                 let scatter = Points::new(pts)
-                    .radius(1.0)
+                    .radius(1.0_f32)
                     .color(egui::Color32::LIGHT_GREEN);
                 plot_ui.points(scatter);
             });
@@ -1356,7 +1356,7 @@ impl Sidebar {
         painter.rect_stroke(
             loupe_rect.expand(2.0),
             3.0,
-            egui::Stroke::new(1.0, egui::Color32::GRAY),
+            egui::Stroke::new(1.0_f32, egui::Color32::GRAY),
             egui::StrokeKind::Outside,
         );
 
@@ -1397,7 +1397,7 @@ impl Sidebar {
         painter.rect_stroke(
             center_rect,
             0.0,
-            egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 220, 40)),
+            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 220, 40)),
             egui::StrokeKind::Inside,
         );
 

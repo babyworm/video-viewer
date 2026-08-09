@@ -601,7 +601,7 @@ impl ComparisonView {
                 painter.rect_stroke(
                     rect,
                     0.0,
-                    egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.fg_stroke.color),
+                    egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.fg_stroke.color),
                     egui::StrokeKind::Outside,
                 );
                 let placeholder = match role {
@@ -637,7 +637,7 @@ impl ComparisonView {
                 painter.rect_stroke(
                     rect,
                     0.0,
-                    egui::Stroke::new(2.0, egui::Color32::from_rgb(60, 140, 240)),
+                    egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(60, 140, 240)),
                     egui::StrokeKind::Inside,
                 );
                 let hint = match role {
@@ -780,7 +780,7 @@ fn draw_metric_overlay(
         return;
     }
 
-    let stroke = egui::Stroke::new(0.5, egui::Color32::from_black_alpha(140));
+    let stroke = egui::Stroke::new(0.5_f32, egui::Color32::from_black_alpha(140));
 
     for block in &map.blocks {
         let block_uv = egui::Rect::from_min_max(

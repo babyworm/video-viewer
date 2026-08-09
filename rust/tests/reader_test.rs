@@ -127,6 +127,107 @@ fn test_reader_rejects_raw_file_without_complete_frame() {
 }
 
 #[test]
+fn test_reader_rejects_empty_file_before_mapping() {
+    let file = NamedTempFile::new().unwrap();
+
+    let err = VideoReader::open(
+        file.path().to_str().unwrap(),
+        4,
+        4,
+        "I420",
+        "BT.601",
+    )
+    .err()
+    .expect("empty input should be rejected before mapping");
+
+    assert!(err.contains("empty"), "unexpected error: {err}");
+}
+
+#[test]
+fn test_reader_rejects_registered_but_unviewable_raw_format() {
+    let mut file = NamedTempFile::new().unwrap();
+    file.write_all(&[0_u8; 32]).unwrap();
+    file.flush().unwrap();
+
+    let err = match VideoReader::open(
+        file.path().to_str().unwrap(),
+        4,
+        4,
+        "RGB565",
+        "BT.601",
+    ) {
+        Ok(_) => panic!("unviewable raw format should fail before reader creation"),
+        Err(error) => error,
+    };
+
+    assert!(err.contains("not viewable"), "unexpected error: {err}");
+}
+
+#[test]
+fn test_reader_rejects_raw_dimensions_above_the_viewer_limit() {
+    let (file, _) = make_raw_i420(1);
+
+    let err = VideoReader::open(
+        file.path().to_str().unwrap(),
+        u32::MAX - 1,
+        u32::MAX - 1,
+        "I420",
+        "BT.601",
+    )
+    .err()
+    .expect("oversized raw dimensions should be rejected before frame-size arithmetic");
+
+    assert!(err.contains("8192"), "unexpected error: {err}");
+}
+
+#[test]
+fn test_reader_rejects_dimensions_misaligned_for_chroma_subsampling() {
+    let mut file = NamedTempFile::new().unwrap();
+    file.write_all(&[128_u8; 64]).unwrap();
+    file.flush().unwrap();
+
+    for (format, width, height) in [
+        ("I420", 3, 4),
+        ("I420", 4, 3),
+        ("NV12", 3, 4),
+        ("NV12", 4, 3),
+    ] {
+        let err = VideoReader::open(
+            file.path().to_str().unwrap(),
+            width,
+            height,
+            format,
+            "BT.601",
+        )
+        .err()
+        .expect("misaligned chroma dimensions should be rejected before conversion");
+
+        assert!(err.contains("subsampling"), "unexpected error: {err}");
+    }
+}
+
+#[test]
+fn test_reader_rejects_partial_t010_tiles() {
+    let mut file = NamedTempFile::new().unwrap();
+    file.write_all(&[128_u8; 384]).unwrap();
+    file.flush().unwrap();
+
+    for (width, height) in [(4, 4), (6, 8)] {
+        let err = VideoReader::open(
+            file.path().to_str().unwrap(),
+            width,
+            height,
+            "T010",
+            "BT.601",
+        )
+        .err()
+        .expect("partial T010 tiles should be rejected before conversion");
+
+        assert!(err.contains("4x4 tiles"), "unexpected error: {err}");
+    }
+}
+
+#[test]
 fn test_reader_out_of_bounds() {
     let (file, _) = make_raw_i420(3);
     let path = file.path().to_str().unwrap();
@@ -156,6 +257,47 @@ fn test_reader_y4m() {
     assert_eq!(reader.total_frames(), 1);
     // FPS from header: 25/1 = 25.0
     assert_eq!(reader.y4m_fps(), Some(25.0));
+}
+
+#[test]
+fn test_reader_rejects_y4m_dimensions_above_the_viewer_limit() {
+    let mut file = tempfile::Builder::new()
+        .suffix(".y4m")
+        .tempfile()
+        .unwrap();
+    file.write_all(b"YUV4MPEG2 W4294967295 H4294967295 F1:1 Ip C420\n")
+        .unwrap();
+    file.flush().unwrap();
+
+    let err = VideoReader::open(file.path().to_str().unwrap(), 0, 0, "", "BT.601")
+        .err()
+        .expect("oversized Y4M dimensions should be rejected before frame-size arithmetic");
+
+    assert!(err.contains("8192"), "unexpected error: {err}");
+}
+
+#[test]
+fn test_reader_rejects_invalid_y4m_dimensions() {
+    for header in [
+        b"YUV4MPEG2 W0 H4 F1:1 Ip C420\n".as_slice(),
+        b"YUV4MPEG2 W3 H4 F1:1 Ip C420\n".as_slice(),
+    ] {
+        let mut file = tempfile::Builder::new()
+            .suffix(".y4m")
+            .tempfile()
+            .unwrap();
+        file.write_all(header).unwrap();
+        file.flush().unwrap();
+
+        let err = VideoReader::open(file.path().to_str().unwrap(), 0, 0, "", "BT.601")
+            .err()
+            .expect("invalid Y4M dimensions should be rejected before conversion");
+
+        assert!(
+            err.contains("dimensions") || err.contains("subsampling"),
+            "unexpected error: {err}"
+        );
+    }
 }
 
 #[test]

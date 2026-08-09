@@ -1340,6 +1340,7 @@ pub struct OpenFileDialog {
     pub is_auto_detect: bool,
     /// Track last path for which hints were applied, to avoid re-overriding user edits.
     last_hinted_path: String,
+    pub(crate) detected_info: Option<String>,
     /// Inline file browser (created on demand when Browse is clicked).
     file_browser: Option<FileBrowser>,
     /// Starting directory for file browser.
@@ -1372,6 +1373,7 @@ impl OpenFileDialog {
             format_names,
             is_auto_detect: false,
             last_hinted_path: String::new(),
+            detected_info: None,
             file_browser: None,
             initial_dir,
         }
@@ -1423,18 +1425,31 @@ impl OpenFileDialog {
                     .to_lowercase();
                 self.is_auto_detect = crate::core::reader::is_auto_detect_ext(&ext);
 
-                if !self.is_auto_detect && self.path != self.last_hinted_path && !self.path.is_empty() {
+                if self.is_auto_detect && self.path != self.last_hinted_path {
+                    self.detected_info = None;
+                    self.last_hinted_path = self.path.clone();
+                } else if !self.is_auto_detect
+                    && self.path != self.last_hinted_path
+                    && !self.path.is_empty()
+                {
                     let file_size = std::fs::metadata(&self.path).ok().map(|metadata| metadata.len());
+                    let default_format = self
+                        .format_names
+                        .get(self.format_idx)
+                        .and_then(|name| get_format_by_name(name))
+                        .and_then(|format| format.name.split_whitespace().next())
+                        .unwrap_or("I420");
                     let resolved = crate::core::hints::resolve_raw_params(
                         &self.path,
                         file_size,
                         self.width,
                         self.height,
-                        "I420",
+                        default_format,
                     );
                     self.width = resolved.width;
                     self.height = resolved.height;
                     self.format_idx = format_index(&self.format_names, &resolved.format);
+                    self.detected_info = resolved.info;
                     self.last_hinted_path = self.path.clone();
                 }
 
@@ -1445,14 +1460,25 @@ impl OpenFileDialog {
                     .show(ui, |ui| {
                         if !self.is_auto_detect {
                             ui.label("Width:");
-                            ui.add(egui::DragValue::new(&mut self.width).range(1..=8192));
+                            if ui
+                                .add(egui::DragValue::new(&mut self.width).range(1..=8192))
+                                .changed()
+                            {
+                                self.detected_info = None;
+                            }
                             ui.end_row();
 
                             ui.label("Height:");
-                            ui.add(egui::DragValue::new(&mut self.height).range(1..=8192));
+                            if ui
+                                .add(egui::DragValue::new(&mut self.height).range(1..=8192))
+                                .changed()
+                            {
+                                self.detected_info = None;
+                            }
                             ui.end_row();
 
                             ui.label("Format:");
+                            let previous_format_idx = self.format_idx;
                             let current = self
                                 .format_names
                                 .get(self.format_idx)
@@ -1465,6 +1491,9 @@ impl OpenFileDialog {
                                         ui.selectable_value(&mut self.format_idx, idx, name);
                                     }
                                 });
+                            if self.format_idx != previous_format_idx {
+                                self.detected_info = None;
+                            }
                             ui.end_row();
                         } else {
                             ui.label("Info:");
@@ -1483,26 +1512,33 @@ impl OpenFileDialog {
                 }
 
                 if !self.path.is_empty() {
-                    // Show hint-detected info
-                    let hints = crate::core::hints::parse_filename_hints(&self.path);
-                    if hints.width.is_some() || hints.format.is_some() {
+                    if let Some(info) = self.detected_info.as_deref() {
                         ui.add_space(4.0);
                         ui.label(
-                            egui::RichText::new(format!(
-                                "Detected: {}{}{}",
-                                hints
-                                    .width
-                                    .map(|w| format!("{}x{}", w, hints.height.unwrap_or(0)))
-                                    .unwrap_or_default(),
-                                if hints.width.is_some() && hints.format.is_some() {
-                                    " "
-                                } else {
-                                    ""
-                                },
-                                hints.format.as_deref().unwrap_or(""),
-                            ))
+                            egui::RichText::new(info)
                             .color(egui::Color32::LIGHT_BLUE),
                         );
+                    } else {
+                        let hints = crate::core::hints::parse_filename_hints(&self.path);
+                        if hints.width.is_some() || hints.format.is_some() {
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Detected: {}{}{}",
+                                    hints
+                                        .width
+                                        .map(|w| format!("{}x{}", w, hints.height.unwrap_or(0)))
+                                        .unwrap_or_default(),
+                                    if hints.width.is_some() && hints.format.is_some() {
+                                        " "
+                                    } else {
+                                        ""
+                                    },
+                                    hints.format.as_deref().unwrap_or(""),
+                                ))
+                                .color(egui::Color32::LIGHT_BLUE),
+                            );
+                        }
                     }
                 }
 

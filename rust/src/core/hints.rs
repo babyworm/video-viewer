@@ -8,9 +8,14 @@ pub struct FilenameHints {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub format: Option<String>,
-    pub unviewable_format: Option<String>,
     pub fps: Option<f64>,
     pub bit_depth: Option<u32>,
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct ParsedFilenameHints {
+    hints: FilenameHints,
+    unviewable_format: Option<String>,
 }
 
 /// One named resolution entry. Single source of truth used by:
@@ -108,6 +113,13 @@ pub struct SizeGuess {
     pub num_frames: u64,
 }
 
+pub(crate) fn size_guess_info(guess: &SizeGuess) -> String {
+    format!(
+        "File-size guess: {}×{} ({} frames) — verify via Tools → Video Parameters",
+        guess.width, guess.height, guess.num_frames
+    )
+}
+
 /// Try to recover (width, height, format) from a raw file size.
 ///
 /// Returns the first candidate (w, h, fmt) whose per-frame size divides
@@ -175,6 +187,9 @@ pub fn guess_all_resolutions_no_hint(file_size: u64) -> Vec<SizeGuess> {
             let Some(fmt) = crate::core::formats::get_format_by_name(fmt_name) else {
                 continue;
             };
+            if !fmt.is_viewable() {
+                continue;
+            }
             let fs = fmt.frame_size(cand.width, cand.height) as u64;
             if fs == 0 {
                 continue;
@@ -219,6 +234,9 @@ pub fn guess_resolutions_with_frame_count(file_size: u64, num_frames: u64) -> Ve
             let Some(fmt) = crate::core::formats::get_format_by_name(fmt_name) else {
                 continue;
             };
+            if !fmt.is_viewable() {
+                continue;
+            }
             let fs = fmt.frame_size(cand.width, cand.height) as u64;
             if fs == bytes_per_frame {
                 results.push(SizeGuess {
@@ -245,34 +263,56 @@ pub struct ResolvedParams {
     pub info: Option<String>,
 }
 
+const MAX_RAW_DIMENSION: u32 = 8192;
+const MAX_VARIATION_SAMPLES_PER_AXIS: usize = 256;
+
 fn plane_variation(data: &[u8], width: usize, height: usize, offset: usize, stride: usize) -> u64 {
     let sample = |idx: usize| data[offset + idx * stride];
+    let row_step = height.div_ceil(MAX_VARIATION_SAMPLES_PER_AXIS).max(1);
+    let col_step = width.div_ceil(MAX_VARIATION_SAMPLES_PER_AXIS).max(1);
     let mut total = 0_u64;
-    for row in 0..height {
-        for col in 1..width {
-            total += sample(row * width + col).abs_diff(sample(row * width + col - 1)) as u64;
+    for row in (0..height).step_by(row_step) {
+        for col in (col_step..width).step_by(col_step) {
+            total += sample(row * width + col)
+                .abs_diff(sample(row * width + col - col_step)) as u64;
         }
     }
-    for row in 1..height {
-        for col in 0..width {
-            total += sample(row * width + col).abs_diff(sample((row - 1) * width + col)) as u64;
+    for row in (row_step..height).step_by(row_step) {
+        for col in (0..width).step_by(col_step) {
+            total += sample(row * width + col)
+                .abs_diff(sample((row - row_step) * width + col)) as u64;
         }
     }
     total
 }
 
-fn guess_yuv420_format_from_file(path: &str, width: u32, height: u32) -> Option<&'static str> {
+fn guess_yuv420_format_from_file(
+    path: &str,
+    width: u32,
+    height: u32,
+) -> Result<Option<&'static str>, ()> {
     use std::io::{Read, Seek, SeekFrom};
 
-    if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        return None;
+    if width == 0
+        || height == 0
+        || width > MAX_RAW_DIMENSION
+        || height > MAX_RAW_DIMENSION
+        || !width.is_multiple_of(2)
+        || !height.is_multiple_of(2)
+    {
+        return Err(());
     }
-    let y_size = (width as usize).checked_mul(height as usize)?;
+    let y_size = (width as usize).checked_mul(height as usize).ok_or(())?;
     let chroma_plane_size = y_size / 4;
-    let mut chroma = vec![0_u8; chroma_plane_size.checked_mul(2)?];
-    let mut file = std::fs::File::open(path).ok()?;
-    file.seek(SeekFrom::Start(y_size as u64)).ok()?;
-    file.read_exact(&mut chroma).ok()?;
+    let chroma_size = chroma_plane_size.checked_mul(2).ok_or(())?;
+    let frame_size = y_size.checked_add(chroma_size).ok_or(())?;
+    let mut file = std::fs::File::open(path).map_err(|_| ())?;
+    if file.metadata().map_err(|_| ())?.len() < frame_size as u64 {
+        return Err(());
+    }
+    let mut chroma = vec![0_u8; chroma_size];
+    file.seek(SeekFrom::Start(y_size as u64)).map_err(|_| ())?;
+    file.read_exact(&mut chroma).map_err(|_| ())?;
 
     let chroma_width = width as usize / 2;
     let chroma_height = height as usize / 2;
@@ -285,13 +325,62 @@ fn guess_yuv420_format_from_file(path: &str, width: u32, height: u32) -> Option<
     if i420_score < nv12_score
         && i420_score.saturating_mul(100) <= nv12_score.saturating_mul(CONFIDENCE_RATIO)
     {
-        Some("I420")
+        Ok(Some("I420"))
     } else if nv12_score < i420_score
         && nv12_score.saturating_mul(100) <= i420_score.saturating_mul(CONFIDENCE_RATIO)
     {
-        Some("NV12")
+        Ok(Some("NV12"))
     } else {
-        None
+        Ok(None)
+    }
+}
+
+fn normalized_viewable_default(default_format: &str) -> String {
+    crate::core::formats::get_format_by_name(default_format)
+        .filter(|format| format.is_viewable())
+        .map(|_| default_format.to_string())
+        .unwrap_or_else(|| "I420".to_string())
+}
+
+fn resolve_raw_format(
+    path: &str,
+    width: u32,
+    height: u32,
+    parsed: &ParsedFilenameHints,
+    default_format: &str,
+) -> (String, Option<String>) {
+    if let Some(format) = parsed.hints.format.as_ref() {
+        return (format.clone(), None);
+    }
+    if let Some(fourcc) = parsed.unviewable_format.as_deref() {
+        return (
+            "I420".to_string(),
+            Some(format!(
+                "Filename format {fourcc} is not viewable; using I420"
+            )),
+        );
+    }
+
+    let fallback = normalized_viewable_default(default_format);
+    let probe_yuv420 = crate::core::formats::get_format_by_name(&fallback)
+        .and_then(|format| format.name.split_whitespace().next())
+        .is_some_and(|name| matches!(name, "I420" | "NV12"));
+    if !probe_yuv420 {
+        return (fallback, None);
+    }
+
+    match guess_yuv420_format_from_file(path, width, height) {
+        Ok(Some(guessed)) => (
+            guessed.to_string(),
+            Some(format!(
+                "Content guess: {guessed} from chroma continuity"
+            )),
+        ),
+        Ok(None) => {
+            let info = format!("Format unknown; using {fallback}");
+            (fallback, Some(info))
+        }
+        Err(()) => (fallback, None),
     }
 }
 
@@ -302,25 +391,17 @@ pub fn resolve_raw_params_for_dimensions(
     width: u32,
     height: u32,
 ) -> ResolvedParams {
-    let hints = parse_filename_hints(path);
-    let content_format = (hints.format.is_none() && hints.unviewable_format.is_none())
-        .then(|| guess_yuv420_format_from_file(path, width, height))
-        .flatten();
-    let info = if hints.format.is_some() {
-        None
-    } else {
-        hints
-            .unviewable_format
-            .as_deref()
-            .map(|fourcc| format!("Filename format {fourcc} is not viewable; using I420"))
-            .or_else(|| {
-                content_format
-                    .map(|guessed| format!("Content guess: {guessed} from chroma continuity"))
-            })
-    };
-    let format = hints
-        .format
-        .unwrap_or_else(|| content_format.unwrap_or("I420").to_string());
+    resolve_raw_params_for_dimensions_with_default(path, width, height, "I420")
+}
+
+pub fn resolve_raw_params_for_dimensions_with_default(
+    path: &str,
+    width: u32,
+    height: u32,
+    default_format: &str,
+) -> ResolvedParams {
+    let parsed = parse_filename_hints_internal(path);
+    let (format, info) = resolve_raw_format(path, width, height, &parsed, default_format);
 
     ResolvedParams {
         width,
@@ -339,27 +420,28 @@ pub fn resolve_raw_params(
     file_size: Option<u64>,
     default_width: u32,
     default_height: u32,
-    _default_format: &str,
+    default_format: &str,
 ) -> ResolvedParams {
-    let hints = parse_filename_hints(path);
+    let parsed = parse_filename_hints_internal(path);
+    let hints = &parsed.hints;
 
-    let (width, height, mut info) = if let (Some(w), Some(h)) = (hints.width, hints.height) {
-        (w, h, None)
-    } else if let Some(g) = file_size.and_then(guess_resolution_from_size) {
-        (
-            g.width,
-            g.height,
-            Some(format!(
-                "File-size guess: {}×{} ({} frames) — verify via Tools → Video Parameters",
-                g.width, g.height, g.num_frames
-            )),
-        )
-    } else {
-        (default_width, default_height, None)
-    };
+    let (width, height, mut info, size_guess_format) =
+        if let (Some(w), Some(h)) = (hints.width, hints.height) {
+            (w, h, None, None)
+        } else if let Some(g) = file_size.and_then(guess_resolution_from_size) {
+            (g.width, g.height, Some(size_guess_info(&g)), Some(g.format))
+        } else {
+            (default_width, default_height, None, None)
+        };
 
-    let resolved_format = resolve_raw_params_for_dimensions(path, width, height);
-    if let Some(message) = resolved_format.info {
+    let (format, format_info) = resolve_raw_format(
+        path,
+        width,
+        height,
+        &parsed,
+        size_guess_format.unwrap_or(default_format),
+    );
+    if let Some(message) = format_info {
         if let Some(existing) = info.as_mut() {
             existing.push_str("; ");
             existing.push_str(&message);
@@ -371,7 +453,7 @@ pub fn resolve_raw_params(
     ResolvedParams {
         width,
         height,
-        format: resolved_format.format,
+        format,
         info,
     }
 }
@@ -499,9 +581,9 @@ fn parse_wxh(s: &str) -> Option<(u32, u32)> {
     None
 }
 
-/// Parse metadata hints from a filename (may be a full path).
-pub fn parse_filename_hints(filename: &str) -> FilenameHints {
+fn parse_filename_hints_internal(filename: &str) -> ParsedFilenameHints {
     let mut hints = FilenameHints::default();
+    let mut unviewable_format = None;
 
     // Basename (case-insensitive matching)
     let basename = Path::new(filename)
@@ -565,7 +647,7 @@ pub fn parse_filename_hints(filename: &str) -> FilenameHints {
                     hints.format = Some(fmt.to_string());
                     format_set = true;
                 } else {
-                    hints.unviewable_format = Some(format.fourcc.clone());
+                    unviewable_format = Some(format.fourcc.clone());
                 }
                 continue;
             }
@@ -581,7 +663,7 @@ pub fn parse_filename_hints(filename: &str) -> FilenameHints {
                     hints.format = Some(fmt.fourcc.clone());
                     format_set = true;
                 } else {
-                    hints.unviewable_format = Some(fmt.fourcc.clone());
+                    unviewable_format = Some(fmt.fourcc.clone());
                 }
                 break;
             }
@@ -605,7 +687,15 @@ pub fn parse_filename_hints(filename: &str) -> FilenameHints {
         hints.bit_depth = Some(bd);
     }
 
-    hints
+    ParsedFilenameHints {
+        hints,
+        unviewable_format,
+    }
+}
+
+/// Parse metadata hints from a filename (may be a full path).
+pub fn parse_filename_hints(filename: &str) -> FilenameHints {
+    parse_filename_hints_internal(filename).hints
 }
 
 /// Parse "Nfps" or "N.Nfps" from the string. Returns fps if 0.1 <= fps <= 240.
@@ -616,7 +706,9 @@ fn parse_fps_suffix(s: &str) -> Option<f64> {
         let before = &search[..pos];
         // Extract trailing number from `before`
         let num_start = before
-            .rfind(|c: char| !c.is_ascii_digit() && c != '.')
+            .as_bytes()
+            .iter()
+            .rposition(|byte| !byte.is_ascii_digit() && *byte != b'.')
             .map(|p| p + 1)
             .unwrap_or(0);
         let num_str = &before[num_start..];
@@ -660,7 +752,9 @@ fn parse_bit_depth(s: &str) -> Option<u32> {
             let before = &search[..pos];
             // Boundary before digits
             let num_start = before
-                .rfind(|c: char| !c.is_ascii_digit())
+                .as_bytes()
+                .iter()
+                .rposition(|byte| !byte.is_ascii_digit())
                 .map(|p| p + 1)
                 .unwrap_or(0);
             // Check that char before digits is a separator or start

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 use std::fs::File;
@@ -25,6 +26,7 @@ pub fn is_auto_detect_ext(ext: &str) -> bool {
 
 /// Default cache budget: 512 MiB.
 const DEFAULT_CACHE_BYTES: usize = 512 * 1024 * 1024;
+const MAX_RAW_DIMENSION: u32 = 8192;
 
 /// Backing store for file data — either a memory-mapped view or a heap buffer.
 enum FileData {
@@ -39,6 +41,12 @@ impl FileData {
             FileData::Heap(v) => v.as_slice(),
         }
     }
+}
+
+fn read_frame_prefix<R: Read>(reader: R, frame_size: usize) -> std::io::Result<Vec<u8>> {
+    let mut frame = Vec::with_capacity(frame_size);
+    reader.take(frame_size as u64).read_to_end(&mut frame)?;
+    Ok(frame)
 }
 
 pub struct VideoReader {
@@ -134,23 +142,22 @@ impl VideoReader {
         } else {
 
         // ------------------------------------------------------------------
-        // 2. Non-image: read file into memory (mmap preferred, fallback).
+        // 2. Non-image: map the file without duplicating large inputs in memory.
         // ------------------------------------------------------------------
         let file = File::open(path)
             .map_err(|e| format!("Cannot open '{}': {e}", path))?;
+        if file
+            .metadata()
+            .map_err(|e| format!("Cannot inspect '{}': {e}", path))?
+            .len()
+            == 0
+        {
+            return Err(format!("Input file '{}' is empty", path));
+        }
 
-        let raw_data = match unsafe { Mmap::map(&file) } {
-            Ok(m) => FileData::Mmap(m),
-            Err(_) => {
-                use std::io::Read;
-                let mut buf = Vec::new();
-                let mut f = File::open(path)
-                    .map_err(|e| format!("Cannot re-open '{}': {e}", path))?;
-                f.read_to_end(&mut buf)
-                    .map_err(|e| format!("Cannot read '{}': {e}", path))?;
-                FileData::Heap(buf)
-            }
-        };
+        let raw_data = unsafe { Mmap::map(&file) }
+            .map(FileData::Mmap)
+            .map_err(|e| format!("Cannot memory-map '{}': {e}", path))?;
 
         let raw = raw_data.as_slice();
         is_y4m = ext == "y4m" || raw.starts_with(b"YUV4MPEG2");
@@ -184,7 +191,22 @@ impl VideoReader {
             let fmt_name = header.to_format_name();
             format = get_format_by_name(fmt_name)
                 .ok_or_else(|| format!("Unknown Y4M format name '{fmt_name}'"))?;
-
+            if width == 0 || height == 0 {
+                return Err("Y4M dimensions must be non-zero".to_string());
+            }
+            if width > MAX_RAW_DIMENSION || height > MAX_RAW_DIMENSION {
+                return Err(format!(
+                    "Y4M dimensions {width}x{height} exceed the supported maximum {MAX_RAW_DIMENSION}x{MAX_RAW_DIMENSION}"
+                ));
+            }
+            if !width.is_multiple_of(format.subsampling.0)
+                || !height.is_multiple_of(format.subsampling.1)
+            {
+                return Err(format!(
+                    "Y4M dimensions {width}x{height} do not align to {}x{} chroma subsampling for '{}'",
+                    format.subsampling.0, format.subsampling.1, format.fourcc
+                ));
+            }
             frame_size = format.frame_size(width, height);
             frame_offsets = build_frame_offsets(raw, frame_size);
             total_frames = frame_offsets.len();
@@ -209,6 +231,11 @@ impl VideoReader {
             if width == 0 || height == 0 {
                 return Err("Width and height must be provided for raw files".to_string());
             }
+            if width > MAX_RAW_DIMENSION || height > MAX_RAW_DIMENSION {
+                return Err(format!(
+                    "Raw dimensions {width}x{height} exceed the supported maximum {MAX_RAW_DIMENSION}x{MAX_RAW_DIMENSION}"
+                ));
+            }
 
             let fmt_key = if !hinted_format.is_empty() {
                 hinted_format.as_str()
@@ -219,6 +246,24 @@ impl VideoReader {
             };
             format = get_format_by_name(fmt_key)
                 .ok_or_else(|| format!("Unknown format '{fmt_key}'"))?;
+            if !format.is_viewable() {
+                return Err(format!("Format '{}' is not viewable", format.fourcc));
+            }
+            if !width.is_multiple_of(format.subsampling.0)
+                || !height.is_multiple_of(format.subsampling.1)
+            {
+                return Err(format!(
+                    "Raw dimensions {width}x{height} do not align to {}x{} chroma subsampling for '{}'",
+                    format.subsampling.0, format.subsampling.1, format.fourcc
+                ));
+            }
+            if format.fourcc == "T010"
+                && (!width.is_multiple_of(4) || !height.is_multiple_of(8))
+            {
+                return Err(format!(
+                    "Raw dimensions {width}x{height} do not form complete 4x4 tiles for T010 (width must be a multiple of 4 and height a multiple of 8)"
+                ));
+            }
 
             frame_size = format.frame_size(width, height);
             if frame_size == 0 {
@@ -323,17 +368,18 @@ impl VideoReader {
         // One-frame raw sequence: read the selected frame file directly.
         if !self.raw_paths.is_empty() {
             let path = &self.raw_paths[idx];
-            let raw = std::fs::read(path)
+            let file = File::open(path)
                 .map_err(|e| format!("Cannot read '{}': {}", path.display(), e))?;
-            if raw.len() < self.frame_size {
+            let frame_data = read_frame_prefix(file, self.frame_size)
+                .map_err(|e| format!("Cannot read '{}': {}", path.display(), e))?;
+            if frame_data.len() < self.frame_size {
                 return Err(format!(
                     "Frame {idx}: file '{}' is too short: {} < {}",
                     path.display(),
-                    raw.len(),
+                    frame_data.len(),
                     self.frame_size
                 ));
             }
-            let frame_data = raw[..self.frame_size].to_vec();
             self.cache.put(idx, frame_data.clone());
             return Ok(frame_data);
         }
@@ -985,4 +1031,18 @@ fn rgb_to_ycbcr(rgb: &[u8], w: usize, h: usize) -> Option<(Vec<u8>, Vec<u8>, Vec
         cr[i] = (128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b).clamp(0.0, 255.0) as u8;
     }
     Some((y, cb, cr))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_frame_prefix;
+
+    #[test]
+    fn read_frame_prefix_stops_at_the_requested_size() {
+        let mut data = std::io::Cursor::new([1_u8, 2, 3, 4, 5, 6]);
+        let frame = read_frame_prefix(&mut data, 4).unwrap();
+
+        assert_eq!(frame, [1, 2, 3, 4]);
+        assert_eq!(data.position(), 4);
+    }
 }

@@ -1400,7 +1400,6 @@ impl VideoViewerApp {
 
     /// Open the unified Guess Size dialog in no-hint mode.
     /// User may type a frame count inside to switch into hint mode.
-    /// Used by both the View → Video Size menu and the status bar click.
     fn open_guess_size_dialog(&mut self) {
         let Some(ref path) = self.current_file else {
             return;
@@ -2372,22 +2371,42 @@ impl eframe::App for VideoViewerApp {
 
         // --- Auto-open from CLI args ---
         if let Some(path) = self.startup_input.take() {
-            let (detected_w, detected_h, detected_fmt, info) = self.resolve_raw_open_params(&path);
+            let (detected_w, detected_h, mut detected_fmt, mut info) =
+                self.resolve_raw_open_params(&path);
+            let dimensions_overridden =
+                self.startup_width.is_some() || self.startup_height.is_some();
             let w = self.startup_width.unwrap_or(detected_w);
             let h = self.startup_height.unwrap_or(detected_h);
-            let detected_fmt = if self.startup_format.is_none()
-                && (self.startup_width.is_some() || self.startup_height.is_some())
-                && !detected_fmt.is_empty()
-            {
-                crate::core::hints::resolve_raw_params_for_dimensions(&path, w, h).format
-            } else {
-                detected_fmt
-            };
+            if self.startup_format.is_none() && dimensions_overridden && !detected_fmt.is_empty() {
+                let resolved =
+                    crate::core::hints::resolve_raw_params_for_dimensions_with_default(
+                        &path,
+                        w,
+                        h,
+                        &self.settings.defaults.format,
+                    );
+                detected_fmt = resolved.format;
+                info = resolved.info;
+            }
+            if self.startup_format.is_some() {
+                info = if !dimensions_overridden && !detected_fmt.is_empty() {
+                    let hints = crate::core::hints::parse_filename_hints(&path);
+                    hints.width.is_none().then(|| {
+                        std::fs::metadata(&path)
+                            .ok()
+                            .and_then(|metadata| {
+                                crate::core::hints::guess_resolution_from_size(metadata.len())
+                            })
+                            .map(|guess| crate::core::hints::size_guess_info(&guess))
+                    })
+                    .flatten()
+                } else {
+                    None
+                };
+            }
             let fmt = self.startup_format.clone().unwrap_or(detected_fmt);
             self.open_file(ctx, path, w, h, &fmt);
-            if self.startup_width.is_none() && self.startup_height.is_none() {
-                self.status_info = info;
-            }
+            self.status_info = info;
         }
 
         // --- Auto-load bitstream telemetry from CLI (--catb) ---
@@ -3498,7 +3517,7 @@ impl eframe::App for VideoViewerApp {
                             egui::pos2(rect.min.x, rect.min.y),
                             egui::pos2(rect.min.x, rect.max.y),
                         ],
-                        egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
+                        egui::Stroke::new(1.0_f32, visuals.widgets.noninteractive.bg_stroke.color),
                     );
                     // Render the label rotated -90° (clockwise) so it reads
                     // top-to-bottom along the strip. egui's TextShape rotates
@@ -3805,7 +3824,7 @@ impl eframe::App for VideoViewerApp {
                             rect,
                             0.0,
                             egui::Stroke::new(
-                                1.5,
+                                1.5_f32,
                                 egui::Color32::from_rgba_unmultiplied(0, 230, 230, 150),
                             ),
                             egui::StrokeKind::Outside,
@@ -3927,8 +3946,10 @@ impl eframe::App for VideoViewerApp {
                 if self.dialog_state == DialogState::OpenFile {
                     if let Some(ref mut dlg) = self.open_file_dialog {
                         if let Some(result) = dlg.show(child_ctx) {
+                            let info = dlg.detected_info.clone();
                             if let Some((path, w, h, fmt)) = result {
                                 self.open_file(root_ctx, path, w, h, &fmt);
+                                self.status_info = info;
                             }
                             self.dialog_state = DialogState::None;
                             self.open_file_dialog = None;
@@ -3938,8 +3959,10 @@ impl eframe::App for VideoViewerApp {
                 if self.dialog_state == DialogState::OpenReference {
                     if let Some(ref mut dlg) = self.reference_file_dialog {
                         if let Some(result) = dlg.show(child_ctx) {
+                            let info = dlg.detected_info.clone();
                             if let Some((path, w, h, fmt)) = result {
                                 self.open_reference_file(root_ctx, path, w, h, &fmt);
+                                self.status_info = info;
                             }
                             self.dialog_state = DialogState::None;
                             self.reference_file_dialog = None;
@@ -4071,8 +4094,10 @@ impl VideoViewerApp {
         if self.dialog_state == DialogState::OpenFile && !self.comparison.is_open {
             if let Some(ref mut dlg) = self.open_file_dialog {
                 if let Some(result) = dlg.show(ctx) {
+                    let info = dlg.detected_info.clone();
                     if let Some((path, w, h, fmt)) = result {
                         self.open_file(ctx, path, w, h, &fmt);
+                        self.status_info = info;
                     }
                     self.dialog_state = DialogState::None;
                     self.open_file_dialog = None;
@@ -4083,8 +4108,10 @@ impl VideoViewerApp {
         if self.dialog_state == DialogState::OpenReference && !self.comparison.is_open {
             if let Some(ref mut dlg) = self.reference_file_dialog {
                 if let Some(result) = dlg.show(ctx) {
+                    let info = dlg.detected_info.clone();
                     if let Some((path, w, h, fmt)) = result {
                         self.open_reference_file(ctx, path, w, h, &fmt);
+                        self.status_info = info;
                     }
                     self.dialog_state = DialogState::None;
                     self.reference_file_dialog = None;

@@ -1,7 +1,9 @@
+use video_viewer::core::formats::get_format_by_name;
 use video_viewer::core::hints::{
     guess_all_resolutions_no_hint, guess_resolution_from_size,
     guess_resolutions_with_frame_count, parse_filename_hints, resolve_raw_params,
-    resolve_raw_params_for_dimensions, NAMED_RESOLUTIONS,
+    resolve_raw_params_for_dimensions, resolve_raw_params_for_dimensions_with_default,
+    FilenameHints, NAMED_RESOLUTIONS,
 };
 use video_viewer::ui::dialogs::{OpenFileDialog, ParametersDialog};
 use video_viewer::ui::navigation::FPS_OPTIONS;
@@ -81,6 +83,26 @@ fn test_fps_suffix() {
 fn test_bit_depth() {
     let hints = parse_filename_hints("video_10bit.yuv");
     assert_eq!(hints.bit_depth, Some(10));
+}
+
+#[test]
+fn test_unicode_prefix_before_fps_is_safe() {
+    let hints = parse_filename_hints("영상é30fps_10bit.yuv");
+    assert_eq!(hints.fps, Some(30.0));
+    assert_eq!(hints.bit_depth, Some(10));
+}
+
+#[test]
+fn test_filename_hints_keeps_the_public_struct_shape() {
+    let hints = FilenameHints {
+        width: Some(1280),
+        height: Some(720),
+        format: Some("I420".to_string()),
+        fps: Some(60.0),
+        bit_depth: Some(8),
+    };
+
+    assert_eq!(hints.width, Some(1280));
 }
 
 #[test]
@@ -267,6 +289,27 @@ fn test_resolve_defaults_when_no_hints_no_guess() {
 }
 
 #[test]
+fn test_resolve_uses_the_callers_viewable_default_without_format_evidence() {
+    let r = resolve_raw_params("clip_16x16.yuv", None, 640, 480, "NV12");
+
+    assert_eq!(r.format, "NV12");
+}
+
+#[test]
+fn test_explicit_dimensions_preserve_the_callers_format_default() {
+    let neutral = write_yuv420_probe("sample_16x16_", false, true);
+    let result = resolve_raw_params_for_dimensions_with_default(
+        neutral.path().to_str().unwrap(),
+        16,
+        16,
+        "NV12",
+    );
+
+    assert_eq!(result.format, "NV12");
+    assert_eq!(result.info.as_deref(), Some("Format unknown; using NV12"));
+}
+
+#[test]
 fn test_resolve_format_hint_survives_guess() {
     // Filename declares NV12 but no WxH; file size matches a candidate.
     // The filename format hint must take precedence over the guess's I420 default.
@@ -318,6 +361,24 @@ fn test_guess_no_hint_odd_size_yields_no_yuv_candidates() {
     // because all HINT_FORMATS produce frame sizes well above 7.
     let cands = guess_all_resolutions_no_hint(7);
     assert!(cands.is_empty(), "expected empty for prime-sized tiny file: {:?}", cands);
+}
+
+#[test]
+fn test_guess_size_candidates_are_all_viewable() {
+    let file_size = 1280_u64 * 720 * 2;
+    let parameters = ParametersDialog::new(1280, 720, "I420");
+    let candidates = guess_all_resolutions_no_hint(file_size)
+        .into_iter()
+        .chain(guess_resolutions_with_frame_count(file_size, 1));
+
+    for candidate in candidates {
+        let format = get_format_by_name(candidate.format).unwrap();
+        assert!(
+            parameters.format_names.contains(&format.name),
+            "Guess Size exposed unviewable format {}",
+            candidate.format
+        );
+    }
 }
 
 // --- Raw V4L2 FourCC support in filename hints (new in this change) ---
@@ -435,6 +496,21 @@ fn test_resolve_without_fourcc_size_guess_from_disk_prefers_i420() {
 }
 
 #[test]
+fn test_resolve_preserves_yuyv_format_from_file_size() {
+    let size = 1920_u64 * 1080 * 2;
+    let result = resolve_raw_params(
+        "unknown_raw_video.yuv",
+        Some(size),
+        640,
+        480,
+        "I420",
+    );
+
+    assert_eq!((result.width, result.height), (1920, 1080));
+    assert_eq!(result.format, "YUYV");
+}
+
+#[test]
 fn test_resolve_with_fourcc_and_file_size_guess() {
     // 4CC present (NV12), no WxH in name, but file size allows resolution guessing.
     // 4CC must be used for format; size comes from disk guess.
@@ -532,10 +608,42 @@ fn test_resolve_ambiguous_content_falls_back_to_i420() {
         Some(neutral.as_file().metadata().unwrap().len()),
         640,
         480,
-        "NV12",
+        "I420",
     );
 
     assert_eq!(result.format, "I420");
+    assert_eq!(
+        result.info.as_deref(),
+        Some("Format unknown; using I420")
+    );
+}
+
+#[test]
+fn test_resolve_ambiguous_content_preserves_the_configured_default() {
+    let neutral = write_yuv420_probe("sample_16x16_", false, true);
+    let result = resolve_raw_params(
+        neutral.path().to_str().unwrap(),
+        Some(neutral.as_file().metadata().unwrap().len()),
+        640,
+        480,
+        "NV12",
+    );
+
+    assert_eq!(result.format, "NV12");
+    assert_eq!(result.info.as_deref(), Some("Format unknown; using NV12"));
+}
+
+#[test]
+fn test_content_probe_rejects_pathological_dimensions_without_allocating() {
+    let neutral = write_yuv420_probe("sample_", false, true);
+    let result = resolve_raw_params_for_dimensions(
+        neutral.path().to_str().unwrap(),
+        u32::MAX - 1,
+        u32::MAX - 1,
+    );
+
+    assert_eq!(result.format, "I420");
+    assert_eq!(result.info, None);
 }
 
 #[test]
@@ -562,6 +670,20 @@ fn test_dialogs_resolve_short_i420_name_to_the_i420_entry() {
         "I420 (4:2:0)"
     );
     assert_eq!(open_file.format_names[open_file.format_idx], "I420 (4:2:0)");
+}
+
+#[test]
+fn test_open_dialog_preserves_its_selected_format_without_format_evidence() {
+    let neutral = write_yuv420_probe("sample_16x16_", false, true);
+    let mut dialog = OpenFileDialog::new(16, 16, "NV12", None);
+    dialog.path = neutral.path().to_string_lossy().into_owned();
+    let context = egui::Context::default();
+
+    let _ = context.run(egui::RawInput::default(), |ctx| {
+        let _ = dialog.show(ctx);
+    });
+
+    assert_eq!(dialog.format_names[dialog.format_idx], "NV12 (4:2:0)");
 }
 
 #[test]

@@ -121,11 +121,11 @@ impl ImageCanvas {
                             egui::Rect::from_min_max(uv_min, uv_max),
                             egui::Color32::WHITE,
                         );
-                        painter.rect_stroke(mag_rect, 2.0, egui::Stroke::new(1.0, egui::Color32::GRAY), egui::StrokeKind::Outside);
+                        painter.rect_stroke(mag_rect, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::GRAY), egui::StrokeKind::Outside);
                         // Crosshair in center.
                         let center = mag_rect.center();
                         let ch = 6.0;
-                        let ch_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(255, 255, 0, 180));
+                        let ch_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_premultiplied(255, 255, 0, 180));
                         painter.line_segment([egui::pos2(center.x - ch, center.y), egui::pos2(center.x + ch, center.y)], ch_stroke);
                         painter.line_segment([egui::pos2(center.x, center.y - ch), egui::pos2(center.x, center.y + ch)], ch_stroke);
                     }
@@ -168,7 +168,7 @@ impl ImageCanvas {
         if self.sub_grid_size > 0 {
             let step = self.sub_grid_size as f32 * self.zoom;
             let color = egui::Color32::from_rgb(200, 200, 0);
-            let stroke = egui::Stroke::new(0.5, color);
+            let stroke = egui::Stroke::new(0.5_f32, color);
             let mut x = step;
             while x < img_w {
                 painter.line_segment(
@@ -192,7 +192,7 @@ impl ImageCanvas {
         if self.grid_size > 0 {
             let step = self.grid_size as f32 * self.zoom;
             let color = egui::Color32::from_rgb(0, 200, 0);
-            let stroke = egui::Stroke::new(1.0, color);
+            let stroke = egui::Stroke::new(1.0_f32, color);
             let mut x = step;
             while x < img_w {
                 painter.line_segment(

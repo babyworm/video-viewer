@@ -1425,7 +1425,7 @@ impl BitstreamWindow {
                     painter.rect_stroke(
                         rect,
                         0.0,
-                        egui::Stroke::new(2.0, egui::Color32::from_rgb(60, 140, 240)),
+                        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(60, 140, 240)),
                         egui::StrokeKind::Inside,
                     );
                     painter.text(
@@ -2509,7 +2509,7 @@ impl BitstreamWindow {
             if self.view.grid {
                 let step = d.grid_lod.cell as f32;
                 let stroke =
-                    egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(0, 220, 0, 130));
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(0, 220, 0, 130));
                 let mut x = step;
                 while x < sw {
                     let sx0 = origin.x + x * zx;
@@ -2630,7 +2630,7 @@ impl BitstreamWindow {
                             painter.rect_stroke(
                                 rect,
                                 0.0,
-                                egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 220, 40)),
+                                egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 220, 40)),
                                 egui::StrokeKind::Outside,
                             );
                         }
@@ -2643,7 +2643,7 @@ impl BitstreamWindow {
                     painter.rect_stroke(
                         rect,
                         0.0,
-                        egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 220, 40)),
+                        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 220, 40)),
                         egui::StrokeKind::Outside,
                     );
                 }
@@ -2658,7 +2658,7 @@ impl BitstreamWindow {
                     rect,
                     0.0,
                     egui::Stroke::new(
-                        1.5,
+                        1.5_f32,
                         egui::Color32::from_rgba_unmultiplied(0, 230, 230, 150),
                     ),
                     egui::StrokeKind::Outside,
@@ -3553,7 +3553,7 @@ impl BitstreamWindow {
                                 painter.rect_stroke(
                                     cell.expand(1.0),
                                     1.0,
-                                    egui::Stroke::new(2.0, egui::Color32::WHITE),
+                                    egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
                                     egui::StrokeKind::Outside,
                                 );
                             }
@@ -3582,7 +3582,7 @@ impl BitstreamWindow {
                                             egui::pos2(cell.max.x, cell.min.y + 1.0),
                                         ],
                                         egui::Stroke::new(
-                                            2.0,
+                                            2.0_f32,
                                             egui::Color32::from_rgb(240, 200, 40),
                                         ),
                                     );
@@ -3621,17 +3621,17 @@ impl BitstreamWindow {
                                             [from, ctrl, to],
                                             false,
                                             egui::Color32::TRANSPARENT,
-                                            egui::Stroke::new(1.4, color),
+                                            egui::Stroke::new(1.4_f32, color),
                                         ),
                                     );
                                     // Chevron head at the referenced frame.
                                     painter.line_segment(
                                         [to, to + egui::vec2(-3.0, -4.0)],
-                                        egui::Stroke::new(1.4, color),
+                                        egui::Stroke::new(1.4_f32, color),
                                     );
                                     painter.line_segment(
                                         [to, to + egui::vec2(3.0, -4.0)],
-                                        egui::Stroke::new(1.4, color),
+                                        egui::Stroke::new(1.4_f32, color),
                                     );
                                 }
                             }
@@ -4392,13 +4392,13 @@ impl BitstreamWindow {
                 .show(ui, |plot_ui| {
                     plot_ui.points(
                         Points::new(PlotPoints::new(drawn))
-                            .radius(1.6)
+                            .radius(1.6_f32)
                             .color(egui::Color32::from_rgb(120, 190, 255)),
                     );
                     if let Some(pt) = sel_pt {
                         plot_ui.points(
                             Points::new(PlotPoints::new(vec![pt]))
-                                .radius(5.0)
+                                .radius(5.0_f32)
                                 .color(egui::Color32::from_rgb(255, 220, 40)),
                         );
                     }
@@ -4489,7 +4489,7 @@ impl BitstreamWindow {
                         plot_ui.vline(
                             VLine::new(snap.viewer_frame as f64)
                                 .color(egui::Color32::WHITE)
-                                .width(1.0),
+                                .width(1.0_f32),
                         );
                         for &sc in &snap.scene_changes {
                             plot_ui.vline(
@@ -5270,13 +5270,13 @@ impl BitstreamWindow {
                     .show(ui, |plot_ui| {
                         plot_ui.points(
                             Points::new(PlotPoints::new(l0))
-                                .radius(2.0)
+                                .radius(2.0_f32)
                                 .name("L0")
                                 .color(egui::Color32::from_rgb(255, 150, 20)),
                         );
                         plot_ui.points(
                             Points::new(PlotPoints::new(l1))
-                                .radius(2.0)
+                                .radius(2.0_f32)
                                 .name("L1")
                                 .color(egui::Color32::from_rgb(170, 90, 230)),
                         );
@@ -5524,7 +5524,7 @@ impl BitstreamWindow {
                     if let Some(d) = viewer_to_catb_display(snap.viewer_frame, snap.offset)
                     {
                         plot_ui.vline(
-                            VLine::new(d as f64).color(egui::Color32::WHITE).width(1.0),
+                            VLine::new(d as f64).color(egui::Color32::WHITE).width(1.0_f32),
                         );
                     }
                 });
@@ -5842,7 +5842,7 @@ fn draw_l1_loupe(
     painter.rect_stroke(
         loupe_rect.expand(2.0),
         3.0,
-        egui::Stroke::new(1.0, egui::Color32::GRAY),
+        egui::Stroke::new(1.0_f32, egui::Color32::GRAY),
         egui::StrokeKind::Outside,
     );
 
@@ -5903,7 +5903,7 @@ fn draw_l1_loupe(
     painter.rect_stroke(
         center_rect,
         0.0,
-        egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 220, 40)),
+        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 220, 40)),
         egui::StrokeKind::Inside,
     );
 }
@@ -5968,7 +5968,7 @@ fn draw_diff_loupe(
     painter.rect_stroke(
         loupe_rect.expand(2.0),
         3.0,
-        egui::Stroke::new(1.0, egui::Color32::GRAY),
+        egui::Stroke::new(1.0_f32, egui::Color32::GRAY),
         egui::StrokeKind::Outside,
     );
 
@@ -6039,7 +6039,7 @@ fn draw_diff_loupe(
     painter.rect_stroke(
         center_rect,
         0.0,
-        egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 220, 40)),
+        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 220, 40)),
         egui::StrokeKind::Inside,
     );
 }
